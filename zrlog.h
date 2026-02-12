@@ -617,21 +617,19 @@ namespace zrlog {
             uint32_t total_size = sizeof(LogEntryHeader) + args_size;
             char *ptr = buffer->alloc(total_size);
             if (ptr) {
-                LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(ptr);
+                LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
                 header->total_size  = total_size;
                 header->log_id      = log_id;
                 header->time        = TscClock::now_ns();
                 header->thread_id   = get_thread_id();
-                char* data_ptr = ptr + sizeof(LogEntryHeader);
+                char *data_ptr = ptr + sizeof(LogEntryHeader);
                 serialize_args(data_ptr, std::forward<Args>(args)...);
                 buffer->commit(total_size);
                
                 if (idle_wait_flag_.load()) {
                     idle_wait_flag_.store(false);
-                //if (idle_wait_flag_.exchange(false, std::memory_order::memory_order_relaxed)) {
                     idle_wait_condition_.notify_one();
                 }
-                
             }
 
             return true;
@@ -1128,12 +1126,13 @@ namespace zrlog {
 #define ZRLOG_INIT(filename, level) zrlog::NanoLogger::instance().init(filename, level)
 #define ZRLOG_FINI() zrlog::NanoLogger::instance().fini()
 
-#define ZRLOG_BODY(level, format, ...) \
-    do { \
-        if (zrlog::NanoLogger::instance().check_level(level)) { \
-            static uint32_t log_id = 0; \
-            zrlog::NanoLogger::instance().log(log_id, level, __FILE__, __LINE__, __func__, format, ##__VA_ARGS__); \
-        } \
+#define ZRLOG_BODY(level, format, ...)                                                      \
+    do {                                                                                    \
+        zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                          \
+        if (logger.check_level(level)) {                                                    \
+            static uint32_t log_id = 0;                                                     \
+            logger.log(log_id, level, __FILE__, __LINE__, __func__, format, ##__VA_ARGS__); \
+        }                                                                                   \
     } while (0)
 
 #define ZRLOG_TRACE(format, ...) ZRLOG_BODY(zrlog::LogLevel::TRACE, format, ##__VA_ARGS__)

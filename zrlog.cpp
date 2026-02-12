@@ -43,7 +43,6 @@ int main(int argc, char* argv[]) {
     for (int i = 0; i < thread_num; ++i) {
         threads.emplace_back(bench_thread, i, lines_per_thread);
     }
-
     for (auto& t : threads) {
         t.join();
     }
