@@ -613,7 +613,7 @@ namespace zrlog {
                 return false;
             }
 
-            uint32_t args_size = calculate_args_size(args...);
+            uint32_t args_size  = calculate_args_size(args...);
             uint32_t total_size = sizeof(LogEntryHeader) + args_size;
             char *ptr = buffer->alloc(total_size);
             if (ptr) {
@@ -625,11 +625,15 @@ namespace zrlog {
                 char* data_ptr = ptr + sizeof(LogEntryHeader);
                 serialize_args(data_ptr, std::forward<Args>(args)...);
                 buffer->commit(total_size);
-
-                if (idle_wait_flag_.exchange(false)) {
+               
+                if (idle_wait_flag_.load()) {
+                    idle_wait_flag_.store(false);
+                //if (idle_wait_flag_.exchange(false, std::memory_order::memory_order_relaxed)) {
                     idle_wait_condition_.notify_one();
                 }
+                
             }
+
             return true;
         }
 

@@ -2,9 +2,11 @@
 #include <vector>
 
 void bench_thread(int id, int times) {
+    ZRLOG_INFO("Thread %d begin...", id);
     auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < times; ++i) {
-        ZRLOG_INFO("Thread %d iteration %d value %.2f string %s", id, i, 3.14159, "test");
+        //ZRLOG_INFO("Thread %d iteration %d value %.2f string %s", id, i, 3.14159, "test");
+        ZRLOG_INFO("Thread %d ...", id);
     }
     auto end = std::chrono::steady_clock::now();
     auto diff_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(end - start).count();
@@ -23,8 +25,8 @@ int main(int argc, char* argv[]) {
     }
     if (argc > 2) {
         lines_per_thread = atoi(argv[2]);
-        if (lines_per_thread < 1000) {
-            lines_per_thread = 1000;
+        if (lines_per_thread < 1) {
+            lines_per_thread = 1;
         }
     }
 
