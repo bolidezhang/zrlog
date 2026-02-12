@@ -533,10 +533,10 @@ namespace zrlog {
             }
 
         private:
+            ILogAppender *appender_ = nullptr;
             std::vector<char> data_;
             size_t size_;
             size_t pos_ = 0;
-            ILogAppender *appender_ = nullptr;
         };
 
         static NanoLogger& instance() {
@@ -653,11 +653,15 @@ namespace zrlog {
         static uint32_t calculate_args_size(const char* val, const Rest&... rest) {
             return calculate_args_size(val) + calculate_args_size(rest...);
         }
-        static void serialize_args(char* ptr) {}
+
+        static void serialize_args(char* ptr) {
+        }
+
         template<typename T, typename... Rest>
         static void serialize_args(char* ptr, const T& val, Rest&&... rest) {
             std::memcpy(ptr, &val, sizeof(T)); serialize_args(ptr + sizeof(T), std::forward<Rest>(rest)...);
         }
+
         template<typename... Rest>
         static void serialize_args(char* ptr, const char* val, Rest&&... rest) {
             uint32_t len = val ? (uint32_t)strlen(val) + 1 : 1;
