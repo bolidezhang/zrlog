@@ -24,7 +24,7 @@ int main(int argc, char* argv[]) {
     if (argc > 2) {
         lines_per_thread = atoi(argv[2]);
         if (lines_per_thread < 1000) {
-            thread_num = 1000;
+            lines_per_thread = 1000;
         }
     }
 
