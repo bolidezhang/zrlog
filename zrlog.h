@@ -5,6 +5,7 @@
 #include <thread>
 #include <atomic>
 #include <mutex>
+#include <condition_variable>
 #include <string>
 #include <cstring>
 #include <tuple>
@@ -22,15 +23,14 @@
 // 平台差异处理 & 内部宏定义
 // ---------------------------------------------------------------------------
 #ifdef _WIN32
-#define WIN32_LEAN_AND_MEAN
 #include <Windows.h>
-#include <io.h>
 #include <fcntl.h>
+#include <io.h>
 #include <sys/stat.h>
 #include <share.h>
 #include <intrin.h>
 
-#define ZRLOG_OPEN(path, flags, mode)   _sopen(path, flags, _SH_DENYNO, mode)
+#define ZRLOG_OPEN(path, flags, mode)   _open(path, flags, mode)
 #define ZRLOG_WRITE(fd, data, len)      _write(fd, data, (unsigned int)len)
 #define ZRLOG_CLOSE(fd)                 _close(fd)
 #define ZRLOG_FLUSH_FILE(fd)            _commit(fd)
@@ -351,6 +351,7 @@ namespace zrlog {
         uint32_t io_buffer_size     = 1024 * 256;
         uint32_t thread_buffer_size = 1024 * 1024 * 4;
         uint32_t per_thread_quota   = 256;
+        uint32_t idle_wait_interval_us = 500;
     };
 
     // ---------------------------------------------------------------------------
@@ -585,9 +586,10 @@ namespace zrlog {
             if (log_thread_running_) {
                 log_thread_running_ = false;
                 if (log_thread_.joinable()) {
+                    idle_wait_condition_.notify_one();
                     log_thread_.join();
                 }
-                appender_.reset(); // 关闭文件
+                appender_.reset();
             }
         }
 
@@ -602,11 +604,11 @@ namespace zrlog {
         bool log(uint32_t& log_id, LogLevel level, const char* file, uint32_t line,
             const char* func, const char* format, Args&&... args) {
 
-            if (log_id == 0) {
+            if (0 == log_id) {
                 register_log_meta<Args...>(log_id, level, file, line, func, format);
             }
 
-            ThreadBuffer* buffer = get_thread_buffer();
+            ThreadBuffer *buffer = get_thread_buffer();
             if (!buffer) {
                 return false;
             }
@@ -620,11 +622,13 @@ namespace zrlog {
                 header->log_id      = log_id;
                 header->time        = TscClock::now_ns();
                 header->thread_id   = get_thread_id();
-
                 char* data_ptr = ptr + sizeof(LogEntryHeader);
                 serialize_args(data_ptr, std::forward<Args>(args)...);
-
                 buffer->commit(total_size);
+
+                if (idle_wait_flag_.exchange(false)) {
+                    idle_wait_condition_.notify_one();
+                }
             }
             return true;
         }
@@ -949,13 +953,12 @@ namespace zrlog {
             // =======================================================================
             // 成员变量
             // =======================================================================
-            uint32_t size_;                    // 缓冲区大小（2的幂）
-            uint32_t mask_;                    // 掩码，用于环绕计算
-            std::vector<char> buffer_;         // 缓冲区数据
 
             alignas(64) std::atomic<uint32_t> write_index_{ 0 };  // 写指针
             alignas(64) std::atomic<uint32_t> read_index_{ 0 };   // 读指针
-
+            uint32_t size_;                    // 缓冲区大小（2的幂）
+            uint32_t mask_;                    // 掩码，用于环绕计算
+            std::vector<char> buffer_;         // 缓冲区数据
             bool should_deallocate_ = false;   // 标记是否需要释放
         };
 
@@ -974,7 +977,7 @@ namespace zrlog {
         template<typename... Args>
         void register_log_meta(uint32_t &log_id, LogLevel level, const char* file, uint32_t line, const char* func, const char* format) {
             std::lock_guard<SpinMutex> lock(log_metas_mutex_);
-            if (log_id == 0) {
+            if (0 == log_id) {
                 log_id = static_cast<uint32_t>(global_log_metas_.size() + 1);
                 LogMeta new_log;
                 new_log.id = log_id;
@@ -1060,7 +1063,13 @@ namespace zrlog {
                 bool busy = consume_buffers_round_robin(local_log_metas, io_buf);
                 if (!busy) {
                     io_buf.flush_to_os();
-                    std::this_thread::sleep_for(std::chrono::microseconds(500));
+
+                    idle_wait_flag_.store(true);
+                    {
+                        std::unique_lock<std::mutex> lock(idle_wait_mutex_);
+                        idle_wait_condition_.wait_for(lock, std::chrono::microseconds(config_.idle_wait_interval_us));
+                    }
+                    idle_wait_flag_.store(false);
                 }
             }
 
@@ -1091,8 +1100,12 @@ namespace zrlog {
         // 使用 unique_ptr 管理生命周期
         std::unique_ptr<ILogAppender> appender_;
         std::thread log_thread_;
-
         volatile bool log_thread_running_ = false;
+
+        //idle wait
+        std::mutex              idle_wait_mutex_;
+        std::condition_variable idle_wait_condition_;
+        std::atomic_bool        idle_wait_flag_ = false;   //条件触发标识
     };
 
     ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
