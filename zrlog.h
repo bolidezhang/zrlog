@@ -192,16 +192,21 @@ namespace zrlog {
             return zrlog_rdtsc();
         }
 
-        // 获取当前时间（纳秒）
+        // 获取当前时间纳秒数
         static inline uint64_t now_ns() {
             return instance().current_time_ns();
+        }
+
+        // 获取当前时间纳秒数(不安全)
+        static inline uint64_t now_ns_i() {
+            return instance().current_time_ns_i();
         }
 
         // 核心函数：获取高精度时间
         inline uint64_t current_time_ns() const {
             uint64_t tsc = zrlog_rdtsc();
             uint32_t seq;
-            Anchor anc;
+            Anchor   anc;
 
             // SeqLock 读操作：无锁，通过版本号重试保证一致性
             do {
@@ -211,6 +216,11 @@ namespace zrlog {
             } while (seq != seq_.load(std::memory_order_relaxed) || (seq & 1));
 
             return anc.base_ns + tsc2ns(tsc - anc.base_tsc);
+        }
+
+        // 核心函数：获取高精度时间(不安全)
+        inline uint64_t current_time_ns_i() const {
+            return anchor_.base_ns + tsc2ns(zrlog_rdtsc() - anchor_.base_tsc);
         }
 
         // 将 TSC 差值转换为纳秒
@@ -270,7 +280,7 @@ namespace zrlog {
 #endif
 #endif
 
-        // 更新基准点
+            // 更新基准点
             sync_anchor_unlocked();
             seq_.store(seq + 2, std::memory_order_release); // 变为偶数，释放读者
 
@@ -296,12 +306,13 @@ namespace zrlog {
         void sync_anchor_unlocked() {
             // 获取高精度的系统时间作为基准
             auto t = std::chrono::system_clock::now();
-            anchor_.base_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+            anchor_.base_ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
             anchor_.base_tsc = zrlog_rdtsc();
         }
 
         static constexpr int shift_ = 32;
         uint64_t multiplier_ = 0;
+
 #if !defined(_MSC_VER) || !defined(_M_X64)
 #if !defined(__SIZEOF_INT128__)
         double multiplier_d_ = 1.0;
@@ -609,30 +620,30 @@ namespace zrlog {
             }
 
             ThreadBuffer *buffer = get_thread_buffer();
-            if (!buffer) {
-                return false;
-            }
+            if (nullptr != buffer) {
+                uint32_t args_size  = calculate_args_size(args...);
+                uint32_t total_size = sizeof(LogEntryHeader) + args_size;
+                char *ptr = buffer->alloc(total_size);
+                if (nullptr != ptr) {
+                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
+                    header->total_size = total_size;
+                    header->log_id = log_id;
+                    header->time = TscClock::now_ns_i();
+                    header->thread_id = get_thread_id();
+                    char *data_ptr = ptr + sizeof(LogEntryHeader);
+                    serialize_args(data_ptr, std::forward<Args>(args)...);
+                    buffer->commit(total_size);
 
-            uint32_t args_size  = calculate_args_size(args...);
-            uint32_t total_size = sizeof(LogEntryHeader) + args_size;
-            char *ptr = buffer->alloc(total_size);
-            if (ptr) {
-                LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
-                header->total_size  = total_size;
-                header->log_id      = log_id;
-                header->time        = TscClock::now_ns();
-                header->thread_id   = get_thread_id();
-                char *data_ptr = ptr + sizeof(LogEntryHeader);
-                serialize_args(data_ptr, std::forward<Args>(args)...);
-                buffer->commit(total_size);
-               
-                if (idle_wait_flag_.load()) {
-                    idle_wait_flag_.store(false);
-                    idle_wait_condition_.notify_one();
+                    if (idle_wait_flag_.load()) {
+                        idle_wait_flag_.store(false);
+                        idle_wait_condition_.notify_one();
+                    }
+
+                    return true;
                 }
             }
 
-            return true;
+            return false;
         }
 
     private:
@@ -802,7 +813,7 @@ namespace zrlog {
             // =======================================================================
             // commit() - 提交已分配的空间
             // =======================================================================
-            void commit(uint32_t len) {
+            inline void commit(uint32_t len) {
                 uint32_t write = write_index_.load(std::memory_order_relaxed);
                 uint32_t new_write = (write + len) & mask_;
                 write_index_.store(new_write, std::memory_order_release);
@@ -855,7 +866,7 @@ namespace zrlog {
             // =======================================================================
             // consume() - 消费已读取的数据
             // =======================================================================
-            void consume(uint32_t len) {
+            inline void consume(uint32_t len) {
                 uint32_t read     = read_index_.load(std::memory_order_relaxed);
                 uint32_t new_read = (read + len) & mask_;
                 read_index_.store(new_read, std::memory_order_release);
@@ -864,27 +875,27 @@ namespace zrlog {
             // =======================================================================
             // 状态查询
             // =======================================================================
-            bool should_deallocate() const {
+            inline bool should_deallocate() const {
                 return should_deallocate_;
             }
 
-            void mark_deallocate() {
+            inline void mark_deallocate() {
                 should_deallocate_ = true;
             }
 
-            uint32_t capacity() const {
+            inline uint32_t capacity() const {
                 return size_;
             }
 
             // 估算可用空间
-            uint32_t estimate_free_space() const {
+            inline uint32_t estimate_free_space() const {
                 uint32_t read  = read_index_.load(std::memory_order_acquire);
                 uint32_t write = write_index_.load(std::memory_order_acquire);
                 return calculate_free_space(read, write);
             }
 
             // 估算已用空间
-            uint32_t estimate_used_space() const {
+            inline uint32_t estimate_used_space() const {
                 uint32_t read  = read_index_.load(std::memory_order_acquire);
                 uint32_t write = write_index_.load(std::memory_order_acquire);
                 return calculate_used_space(read, write);
@@ -898,7 +909,7 @@ namespace zrlog {
             // =======================================================================
 
             // 计算可用空间
-            uint32_t calculate_free_space(uint32_t read, uint32_t write) const {
+            inline uint32_t calculate_free_space(uint32_t read, uint32_t write) const {
                 if (write >= read) {
                     // |------已读------|------未读------|------空闲------|
                     // 0               read            write           size
@@ -912,7 +923,7 @@ namespace zrlog {
             }
 
             // 计算已用空间
-            uint32_t calculate_used_space(uint32_t read, uint32_t write) const {
+            inline uint32_t calculate_used_space(uint32_t read, uint32_t write) const {
                 if (write >= read) {
                     return write - read;
                 }
@@ -1000,8 +1011,8 @@ namespace zrlog {
             }
         }
 
-        ThreadBuffer* get_thread_buffer() {
-            if (thread_buffer_ == nullptr) {
+        ThreadBuffer * get_thread_buffer() {
+            if (nullptr == thread_buffer_) {
                 thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size);
                 (void)thread_buffer_destroyer_;
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
