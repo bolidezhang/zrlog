@@ -621,14 +621,14 @@ namespace zrlog {
 
             ThreadBuffer *buffer = get_thread_buffer();
             if (nullptr != buffer) {
-                uint32_t args_size  = calculate_args_size(args...);
+                uint32_t args_size = calculate_args_size(args...);
                 uint32_t total_size = sizeof(LogEntryHeader) + args_size;
-                char *ptr = buffer->alloc(total_size);
+                char* ptr = buffer->alloc(total_size);
                 if (nullptr != ptr) {
                     LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(ptr);
                     header->total_size = total_size;
                     header->log_id = log_id;
-                    header->time   = TscClock::now_ns_i();
+                    header->time = TscClock::now_ns_i();
                     header->thread_id = get_thread_id();
                     char* data_ptr = ptr + sizeof(LogEntryHeader);
                     serialize_args(data_ptr, std::forward<Args>(args)...);
@@ -876,25 +876,48 @@ namespace zrlog {
                     return false;
                 }
 
-                LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(&buffer_[read]);
-                uint32_t claimed = header->total_size;
-                if (claimed < sizeof(LogEntryHeader) || claimed > size_) {
-                    read_index_.store(write, std::memory_order_release);
-                    return false;
-                }
-                if (header->log_id == PADDING_ID) {
-                    // With split/no-padding design we normally don't write padding; keep handling just in case
-                    uint32_t new_read = (read + claimed) & mask_;
-                    if (new_read == read) {
-                        read_index_.store(write, std::memory_order_release); 
-                        return false; 
-                    }
-                    read_index_.store(new_read, std::memory_order_release);
+                uint32_t read_index  = read_index_.load(std::memory_order_relaxed);
+                uint32_t write_index = write_index_.load(std::memory_order_acquire);
+
+                // 缓冲区为空
+                if (read_index == write_index) {
                     return false;
                 }
 
-                out_ptr = &buffer_[read];
-                return true;
+                // 循环处理可能遇到的padding
+                constexpr int MAX_PADDING_SKIPS = 3; // 最大跳过padding次数
+                int skips = 0;
+                while (skips < MAX_PADDING_SKIPS) {
+                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader*>(&buffer_[read_index]);
+                    uint32_t claimed = header->total_size;
+                    if (claimed < sizeof(LogEntryHeader) || claimed > size_) {
+                        read_index_.store(write, std::memory_order_release);
+                        return false;
+                    }
+
+                    // 如果遇到padding，跳过它
+                    if (header->log_id == PADDING_ID) {
+                        // 跳过padding，更新读指针
+                        uint32_t new_read_index = (read_index + claimed) & mask_;
+                        read_index_.store(new_read_index, std::memory_order_release);
+
+                        // 重新加载指针
+                        read_index = new_read_index;
+                        skips++;
+
+                        // 检查是否为空
+                        if (read_index == write_index) {
+                            return false;
+                        }
+                        continue;
+                    }
+
+                    // 有效数据
+                    out_ptr = &buffer_[read_index];
+                    return true;
+                }
+
+                return false;
             }
 
             inline void consume(uint32_t len) {
@@ -903,16 +926,16 @@ namespace zrlog {
                 read_index_.store(new_read, std::memory_order_release);
             }
 
-            inline bool should_deallocate() const { 
-                return should_deallocate_; 
+            inline bool should_deallocate() const {
+                return should_deallocate_;
             }
 
-            inline void mark_deallocate() { 
+            inline void mark_deallocate() {
                 should_deallocate_ = true;
             }
 
-            inline uint32_t capacity() const { 
-                return size_; 
+            inline uint32_t capacity() const {
+                return size_;
             }
 
             inline uint32_t estimate_free_space() const {
@@ -976,7 +999,7 @@ namespace zrlog {
                     return;
                 }
 
-                LogEntryHeader *padding = reinterpret_cast<LogEntryHeader*>(&buffer_[pos]);
+                LogEntryHeader* padding = reinterpret_cast<LogEntryHeader*>(&buffer_[pos]);
                 padding->log_id = PADDING_ID;
                 padding->total_size = pad_size;
                 padding->time = 0;
@@ -994,6 +1017,7 @@ namespace zrlog {
             alignas(64) std::atomic<uint32_t> write_index_{ 0 };
             alignas(64) std::atomic<uint32_t> read_index_{ 0 };
             uint32_t local_write_index_ = 0;
+
             uint32_t size_;
             uint32_t mask_;
             std::vector<char> buffer_;
@@ -1080,10 +1104,10 @@ namespace zrlog {
                     thread_active = true;
                     quota--;
 
-                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
+                    LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(ptr);
                     if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
                         const LogMeta& meta = local_log_metas[header->log_id - 1];
-                        char *args_ptr = ptr + sizeof(LogEntryHeader);
+                        char* args_ptr = ptr + sizeof(LogEntryHeader);
                         meta.decoder(args_ptr, meta, *header, io_buf);
                     }
                     tb->consume(header->total_size);
@@ -1132,7 +1156,7 @@ namespace zrlog {
             fini();
         }
 
-        static ZRLOG_FAST_THREAD_LOCAL ThreadBuffer *thread_buffer_;
+        static ZRLOG_FAST_THREAD_LOCAL ThreadBuffer* thread_buffer_;
         static thread_local ThreadBufferDestroyer thread_buffer_destroyer_;
 
         Config config_;
