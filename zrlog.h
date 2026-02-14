@@ -7,6 +7,7 @@
 #include <mutex>
 #include <condition_variable>
 #include <string>
+#include <string_view>
 #include <cstring>
 #include <tuple>
 #include <chrono>
@@ -17,7 +18,7 @@
 #include <cinttypes>
 #include <ctime>
 #include <charconv>
-#include <memory> // std::unique_ptr
+#include <memory>
 
 // ---------------------------------------------------------------------------
 // 平台差异处理 & 内部宏定义
@@ -31,7 +32,7 @@
 #include <intrin.h>
 
 #define ZRLOG_OPEN(path, flags, mode)   _open(path, flags, mode)
-#define ZRLOG_WRITE(fd, data, len)      _write(fd, data, (unsigned int)len)
+#define ZRLOG_WRITE(fd, data, len)      _write(fd, data, (unsigned int)(len))
 #define ZRLOG_CLOSE(fd)                 _close(fd)
 #define ZRLOG_FLUSH_FILE(fd)            _commit(fd)
 #define ZRLOG_O_FLAGS                   (_O_WRONLY | _O_CREAT | _O_APPEND | _O_BINARY)
@@ -104,23 +105,25 @@ namespace zrlog {
     // 内部细节
     // ---------------------------------------------------------------------------
     namespace detail {
+        // 优化：解码 string/string_view 时直接返回指向 buffer 内部的 const char*
+        // 实现零拷贝 (前端序列化时已保证以 \0 结尾)
         template <typename T>
-        typename std::enable_if<!std::is_same<T, const char*>::value, T>::type
-            decode_val(char*& ptr) {
-            T val;
-            std::memcpy(&val, ptr, sizeof(T));
-            ptr += sizeof(T);
-            return val;
-        }
-
-        template <typename T>
-        typename std::enable_if<std::is_same<T, const char*>::value, const char*>::type
-            decode_val(char*& ptr) {
-            uint32_t len;
-            std::memcpy(&len, ptr, sizeof(uint32_t));
-            const char* str = ptr + sizeof(uint32_t);
-            ptr += sizeof(uint32_t) + len;
-            return str;
+        auto decode_val(char*& ptr) {
+            if constexpr (std::is_same_v<T, const char*> ||
+                std::is_same_v<T, std::string> ||
+                std::is_same_v<T, std::string_view>) {
+                uint32_t len;
+                std::memcpy(&len, ptr, sizeof(uint32_t));
+                const char* str = ptr + sizeof(uint32_t);
+                ptr += sizeof(uint32_t) + len;
+                return str; // 直接返回地址
+            }
+            else {
+                T val;
+                std::memcpy(&val, ptr, sizeof(T));
+                ptr += sizeof(T);
+                return val;
+            }
         }
 
         template<typename... Ts>
@@ -128,10 +131,10 @@ namespace zrlog {
 
         template<typename Head, typename... Tail>
         struct TupleDeserializer<Head, Tail...> {
-            static std::tuple<Head, Tail...> apply(char*& ptr) {
-                using CleanHead = typename std::decay<Head>::type;
-                CleanHead head = decode_val<CleanHead>(ptr);
-                return std::tuple_cat(std::tuple<CleanHead>(head), TupleDeserializer<Tail...>::apply(ptr));
+            static auto apply(char*& ptr) {
+                using RawHead = typename std::decay<Head>::type;
+                auto head = decode_val<RawHead>(ptr);
+                return std::tuple_cat(std::make_tuple(head), TupleDeserializer<Tail...>::apply(ptr));
             }
         };
 
@@ -142,14 +145,49 @@ namespace zrlog {
             }
         };
 
-        template <std::size_t... Is> struct index_sequence {
-        };
+        template <std::size_t... Is> struct index_sequence {};
+        template <std::size_t N, std::size_t... Is> struct make_index_sequence : make_index_sequence<N - 1, N - 1, Is...> {};
+        template <std::size_t... Is> struct make_index_sequence<0, Is...> : index_sequence<Is...> {};
 
-        template <std::size_t N, std::size_t... Is> struct make_index_sequence : make_index_sequence<N - 1, N - 1, Is...> {
-        };
+        // 快速转换 2 位数字 (00-99)
+        inline void fast_u32_to_2digits(char* buf, uint32_t val) {
+            static const char digits[201] =
+                "00010203040506070809"
+                "10111213141516171819"
+                "20212223242526272829"
+                "30313233343536373839"
+                "40414243444546474849"
+                "50515253545556575859"
+                "60616263646566676869"
+                "70717273747576777879"
+                "80818283848586878889"
+                "90919293949596979899";
+            uint32_t off = val * 2;
+            buf[0] = digits[off];
+            buf[1] = digits[off + 1];
+        }
 
-        template <std::size_t... Is> struct make_index_sequence<0, Is...> : index_sequence<Is...> {
-        };
+        // 快速转换 4 位数字
+        inline void fast_u32_to_4digits(char* buf, uint32_t val) {
+            if (val >= 10000) {
+                val = 9999;
+            }
+            fast_u32_to_2digits(buf, val / 100);
+            fast_u32_to_2digits(buf + 2, val % 100);
+        }
+
+        // 快速转换 9 位纳秒 (补零)
+        inline void fast_u64_to_9digits(char* buf, uint64_t val) {
+            // 从后往前填充
+            if (val > 999999999) {
+                val = 999999999;
+            }
+            char *p = buf + 8;
+            for (int i = 0; i < 9; ++i) {
+                *p-- = (char)('0' + (val % 10));
+                val /= 10;
+            }
+        }
     }
 
     // ---------------------------------------------------------------------------
@@ -169,7 +207,6 @@ namespace zrlog {
         std::atomic_flag flag_ = ATOMIC_FLAG_INIT;
     };
 
-    //基于OS的tsc计时器的时钟
     class TscClock {
     public:
         TscClock(const TscClock&) = delete;
@@ -178,8 +215,8 @@ namespace zrlog {
         TscClock& operator=(TscClock&&) = delete;
 
         struct Anchor {
-            uint64_t base_ns = 0;  //系统时间基准
-            uint64_t base_tsc = 0;  //TSC基准值
+            uint64_t base_ns = 0;
+            uint64_t base_tsc = 0;
         };
 
         static TscClock& instance() {
@@ -187,60 +224,47 @@ namespace zrlog {
             return t;
         }
 
-        // 当前rdtsc
         static inline uint64_t rdtsc() {
             return zrlog_rdtsc();
         }
 
-        // 获取当前时间纳秒数
         static inline uint64_t now_ns() {
             return instance().current_time_ns();
         }
 
-        // 获取当前时间纳秒数(不安全)
         static inline uint64_t now_ns_i() {
             return instance().current_time_ns_i();
         }
 
-        // 核心函数：获取高精度时间
         inline uint64_t current_time_ns() const {
             uint64_t tsc = zrlog_rdtsc();
             uint32_t seq;
             Anchor   anc;
-
-            // SeqLock 读操作：无锁，通过版本号重试保证一致性
             do {
                 seq = seq_.load(std::memory_order_acquire);
                 anc = anchor_;
-                std::atomic_thread_fence(std::memory_order_acquire); // 保证读取 anchor 在读取 seq 之后
+                std::atomic_thread_fence(std::memory_order_acquire);
             } while (seq != seq_.load(std::memory_order_relaxed) || (seq & 1));
 
             return anc.base_ns + tsc2ns(tsc - anc.base_tsc);
         }
 
-        // 核心函数：获取高精度时间(不安全)
         inline uint64_t current_time_ns_i() const {
             return anchor_.base_ns + tsc2ns(zrlog_rdtsc() - anchor_.base_tsc);
         }
 
-        // 将 TSC 差值转换为纳秒
         inline uint64_t tsc2ns(uint64_t tsc_diff) const {
 #if defined(_MSC_VER) && defined(_M_X64)
-            // MSVC x64 优化路径
             unsigned __int64 high;
             unsigned __int64 low = _umul128(tsc_diff, multiplier_, &high);
             return (high << (64 - shift_)) | (low >> shift_);
 #elif defined(__SIZEOF_INT128__)
-            // GCC/Clang 128位整数路径
             return (uint64_t)((unsigned __int128)tsc_diff * multiplier_ >> shift_);
 #else
-            // 32位系统或旧编译器回退路径：使用浮点数（会有性能损失，但在32位机上通常可接受）
-            // 或者拆分乘法。这里为了代码简洁使用 double，如果需要极致性能需手写32位拆分乘法
             return static_cast<uint64_t>(tsc_diff * multiplier_d_);
 #endif
         }
 
-        // 重新校准（通常不需要频繁调用）
         bool calibrate(int rounds = 5, int interval_ms = 20) {
             std::vector<double> rates;
             rates.reserve(rounds);
@@ -265,29 +289,24 @@ namespace zrlog {
                 return false;
             }
 
-            // 取中位数
             std::sort(rates.begin(), rates.end());
             double rate = rates[rates.size() / 2];
 
-            // 写入保护
             uint32_t seq = seq_.load(std::memory_order_relaxed);
-            seq_.store(seq + 1, std::memory_order_release); // 变为奇数，阻塞读者
+            seq_.store(seq + 1, std::memory_order_release);
 
             multiplier_ = static_cast<uint64_t>(rate * (1ULL << shift_));
 #if !defined(_MSC_VER) || !defined(_M_X64)
 #if !defined(__SIZEOF_INT128__)
-            multiplier_d_ = rate; // 32位环境备用
+            multiplier_d_ = rate;
 #endif
 #endif
-
-            // 更新基准点
             sync_anchor_unlocked();
-            seq_.store(seq + 2, std::memory_order_release); // 变为偶数，释放读者
+            seq_.store(seq + 2, std::memory_order_release);
 
             return true;
         }
 
-        // 同步系统时间锚点
         void sync_system_time() {
             uint32_t seq = seq_.load(std::memory_order_relaxed);
             seq_.store(seq + 1, std::memory_order_release);
@@ -298,29 +317,23 @@ namespace zrlog {
     private:
         TscClock() {
             if (!calibrate()) {
-                // 如果校准彻底失败，设置一个保底值（假设 1GHz）
                 multiplier_ = 1ULL << shift_;
             }
         }
 
         void sync_anchor_unlocked() {
-            // 获取高精度的系统时间作为基准
             auto t = std::chrono::system_clock::now();
-            anchor_.base_ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+            anchor_.base_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
             anchor_.base_tsc = zrlog_rdtsc();
         }
 
         static constexpr int shift_ = 32;
         uint64_t multiplier_ = 0;
-
 #if !defined(_MSC_VER) || !defined(_M_X64)
 #if !defined(__SIZEOF_INT128__)
         double multiplier_d_ = 1.0;
 #endif
 #endif
-
-        // 使用 SeqLock 替代 atomic<Anchor>
-        // seq_ 为偶数时表示数据稳定，奇数时表示正在写入
         std::atomic<uint32_t> seq_{ 0 };
         Anchor anchor_{ 0, 0 };
     };
@@ -347,9 +360,6 @@ namespace zrlog {
         return (idx <= 5) ? names[idx] : "UNKNOWN";
     }
 
-    // ---------------------------------------------------------------------------
-    // 配置结构体
-    // ---------------------------------------------------------------------------
     enum class AppenderType {
         File,
         Console
@@ -359,15 +369,12 @@ namespace zrlog {
         AppenderType appender = AppenderType::File;
         std::string filename;
         LogLevel level = LogLevel::DEBUG;
-        uint32_t io_buffer_size     = 1024 * 256;
+        uint32_t io_buffer_size = 1024 * 256;
         uint32_t thread_buffer_size = 1024 * 1024 * 4;
-        uint32_t per_thread_quota   = 256;
+        uint32_t per_thread_quota = 256;
         uint32_t idle_wait_interval_us = 500;
     };
 
-    // ---------------------------------------------------------------------------
-    // LogAppender 接口体系
-    // ---------------------------------------------------------------------------
     class ILogAppender {
     public:
         virtual ~ILogAppender() = default;
@@ -421,8 +428,6 @@ namespace zrlog {
 
     class NanoLogger {
     public:
-        static constexpr const char* HEAD_FORMATS = "%04d-%02d-%02d %02d:%02d:%02d.%09llu %s %llu %s:%u ";
-
         class IOBuffer;
         struct LogMeta;
         struct LogEntryHeader;
@@ -435,7 +440,6 @@ namespace zrlog {
             uint32_t    line;
             const char* func;
             std::string format;
-            std::string full_format;
             DecoderFn   decoder;
         };
 
@@ -446,9 +450,6 @@ namespace zrlog {
             uint64_t thread_id;
         };
 
-        // -----------------------------------------------------------------------
-        // IOBuffer (使用 ILogAppender)
-        // -----------------------------------------------------------------------
         class IOBuffer {
         public:
             IOBuffer(ILogAppender* appender, uint32_t size)
@@ -464,7 +465,9 @@ namespace zrlog {
                     flush_to_os();
                 }
                 if (len > size_) {
-                    if (appender_) appender_->write(src, len);
+                    if (appender_) {
+                        appender_->write(src, len);
+                    }
                     return;
                 }
                 std::memcpy(data_.data() + pos_, src, len);
@@ -480,20 +483,21 @@ namespace zrlog {
 
             void flush_force() {
                 flush_to_os();
-                if (appender_) appender_->flush();
+                if (appender_) {
+                    appender_->flush();
+                }
             }
 
-            char* current_ptr() { 
-                return data_.data() + pos_; 
+            char* current_ptr() {
+                return data_.data() + pos_;
             }
-            size_t available_size() const { 
-                return size_ - pos_; 
+            size_t available_size() const {
+                return size_ - pos_;
             }
-            void advance(size_t len) { 
-                pos_ += len; 
+            void advance(size_t len) {
+                pos_ += len;
             }
 
-            // Stream Operators
             IOBuffer& operator<<(char c) {
                 if (available_size() < 1) {
                     flush_to_os();
@@ -544,7 +548,7 @@ namespace zrlog {
             }
 
         private:
-            ILogAppender *appender_ = nullptr;
+            ILogAppender* appender_ = nullptr;
             std::vector<char> data_;
             size_t size_;
             size_t pos_ = 0;
@@ -555,14 +559,10 @@ namespace zrlog {
             return logger;
         }
 
-        // -----------------------------------------------------------------------
-        // 初始化
-        // -----------------------------------------------------------------------
         bool init(const Config& config) {
             config_ = config;
 
             if (!log_thread_running_) {
-                // 根据配置创建 Appender
                 if (config_.appender == AppenderType::File) {
                     if (config_.filename.empty()) {
                         fprintf(stderr, "NanoLogger: File appender requires filename.\n");
@@ -584,7 +584,6 @@ namespace zrlog {
             return true;
         }
 
-        // 兼容旧接口
         bool init(const std::string& filename, LogLevel level) {
             Config cfg;
             cfg.filename = filename;
@@ -612,11 +611,12 @@ namespace zrlog {
         // Frontend
         // ========================================================================
         template<typename... Args>
-        bool log(uint32_t& log_id, LogLevel level, const char* file, uint32_t line,
+        bool log(std::atomic<uint32_t>& log_id_atom, LogLevel level, const char* file, uint32_t line,
             const char* func, const char* format, Args&&... args) {
 
+            uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
             if (0 == log_id) {
-                register_log_meta<Args...>(log_id, level, file, line, func, format);
+                log_id = register_log_meta<Args...>(log_id_atom, level, file, line, func, format);
             }
 
             ThreadBuffer *buffer = get_thread_buffer();
@@ -625,17 +625,17 @@ namespace zrlog {
                 uint32_t total_size = sizeof(LogEntryHeader) + args_size;
                 char *ptr = buffer->alloc(total_size);
                 if (nullptr != ptr) {
-                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
+                    LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(ptr);
                     header->total_size = total_size;
                     header->log_id = log_id;
-                    header->time = TscClock::now_ns_i();
+                    header->time   = TscClock::now_ns_i();
                     header->thread_id = get_thread_id();
-                    char *data_ptr = ptr + sizeof(LogEntryHeader);
+                    char* data_ptr = ptr + sizeof(LogEntryHeader);
                     serialize_args(data_ptr, std::forward<Args>(args)...);
                     buffer->commit(total_size);
 
-                    if (idle_wait_flag_.load()) {
-                        idle_wait_flag_.store(false);
+                    if (idle_wait_flag_.load(std::memory_order_relaxed)) {
+                        idle_wait_flag_.store(false, std::memory_order_relaxed);
                         idle_wait_condition_.notify_one();
                     }
 
@@ -647,10 +647,9 @@ namespace zrlog {
         }
 
     private:
-        static uint32_t calculate_args_size() { 
-            return 0; 
+        static uint32_t calculate_args_size() {
+            return 0;
         }
-
         template<typename T, typename... Rest>
         static uint32_t calculate_args_size(const T& val, const Rest&... rest) {
             return sizeof(T) + calculate_args_size(rest...);
@@ -662,15 +661,28 @@ namespace zrlog {
         static uint32_t calculate_args_size(const char* val, const Rest&... rest) {
             return calculate_args_size(val) + calculate_args_size(rest...);
         }
+        static uint32_t calculate_args_size(const std::string& val) {
+            return sizeof(uint32_t) + (uint32_t)val.size() + 1;
+        }
+        template<typename... Rest>
+        static uint32_t calculate_args_size(const std::string& val, const Rest&... rest) {
+            return calculate_args_size(val) + calculate_args_size(rest...);
+        }
+        static uint32_t calculate_args_size(std::string_view val) {
+            return sizeof(uint32_t) + (uint32_t)val.size() + 1;
+        }
+        template<typename... Rest>
+        static uint32_t calculate_args_size(std::string_view val, const Rest&... rest) {
+            return calculate_args_size(val) + calculate_args_size(rest...);
+        }
 
         static void serialize_args(char* ptr) {
         }
-
         template<typename T, typename... Rest>
         static void serialize_args(char* ptr, const T& val, Rest&&... rest) {
-            std::memcpy(ptr, &val, sizeof(T)); serialize_args(ptr + sizeof(T), std::forward<Rest>(rest)...);
+            std::memcpy(ptr, &val, sizeof(T));
+            serialize_args(ptr + sizeof(T), std::forward<Rest>(rest)...);
         }
-
         template<typename... Rest>
         static void serialize_args(char* ptr, const char* val, Rest&&... rest) {
             uint32_t len = val ? (uint32_t)strlen(val) + 1 : 1;
@@ -681,6 +693,24 @@ namespace zrlog {
             else {
                 *reinterpret_cast<char*>(ptr + sizeof(uint32_t)) = '\0';
             }
+            serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
+        }
+        template<typename... Rest>
+        static void serialize_args(char* ptr, const std::string& val, Rest&&... rest) {
+            uint32_t len = (uint32_t)val.size() + 1;
+            std::memcpy(ptr, &len, sizeof(uint32_t));
+            std::memcpy(ptr + sizeof(uint32_t), val.data(), len - 1);
+            *(ptr + sizeof(uint32_t) + len - 1) = '\0';
+            serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
+        }
+        template<typename... Rest>
+        static void serialize_args(char* ptr, std::string_view val, Rest&&... rest) {
+            uint32_t len = (uint32_t)val.size() + 1;
+            std::memcpy(ptr, &len, sizeof(uint32_t));
+            if (len > 1) {
+                std::memcpy(ptr + sizeof(uint32_t), val.data(), len - 1);
+            }
+            *(ptr + sizeof(uint32_t) + len - 1) = '\0';
             serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
         }
 
@@ -696,7 +726,8 @@ namespace zrlog {
                 space = out.available_size();
             }
 
-            char *ptr = out.current_ptr();
+            char* ptr = out.current_ptr();
+            // Tuple 元素中的 string/string_view 已被 decode_val 转换为 const char*
             int len = snprintf(ptr, space, fmt, std::get<Is>(t)...);
             if (len < 0) {
                 return;
@@ -718,183 +749,178 @@ namespace zrlog {
             out << "\n";
         }
 
+
+        static void format_timestamp(IOBuffer& out, uint64_t ns_time) {
+            // 缓存秒级字符串: "YYYY-MM-DD HH:MM:SS" (19 chars)
+            static thread_local time_t cache_sec = 0;
+            static thread_local char cache_str[20] = { 0 }; // 19 + 1(\0)
+
+            time_t sec = static_cast<time_t>(ns_time / 1000000000);
+            if (sec != cache_sec) {
+                struct tm t;
+                zrlog_gmtime(&sec, &t);
+
+                // 手动格式化，移除 snprintf
+                // format: YYYY-MM-DD HH:MM:SS
+                detail::fast_u32_to_4digits(cache_str, t.tm_year + 1900);
+                cache_str[4] = '-';
+                detail::fast_u32_to_2digits(cache_str + 5, t.tm_mon + 1);
+                cache_str[7] = '-';
+                detail::fast_u32_to_2digits(cache_str + 8, t.tm_mday);
+                cache_str[10] = ' ';
+                detail::fast_u32_to_2digits(cache_str + 11, t.tm_hour);
+                cache_str[13] = ':';
+                detail::fast_u32_to_2digits(cache_str + 14, t.tm_min);
+                cache_str[16] = ':';
+                detail::fast_u32_to_2digits(cache_str + 17, t.tm_sec);
+                cache_str[19] = '\0'; // 虽然后面是 append(ptr, len) 不依赖 \0，但保留是个好习惯
+
+                cache_sec = sec;
+            }
+            out.append(cache_str, 19);
+            out << '.';
+
+            // 纳秒部分: 9位补零
+            uint64_t nano = ns_time % 1000000000;
+            char nano_buf[10]; // 9 + 1
+            detail::fast_u64_to_9digits(nano_buf, nano);
+            out.append(nano_buf, 9);
+            out << ' ';
+        }
+
         template<typename... Args>
         static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, IOBuffer& out) {
+            // 1. 解码用户参数 (只包含日志内容参数，不包含头部)
             auto args_tuple = detail::TupleDeserializer<typename std::decay<Args>::type...>::apply(buffer);
-            time_t seconds = static_cast<time_t>(header.time / 1000000000);
-            uint64_t nanoseconds = header.time % 1000000000;
-            struct tm t;
-            zrlog_gmtime(&seconds, &t);
 
-            auto head_tuple = std::make_tuple(
-                t.tm_year + 1900, t.tm_mon + 1, t.tm_mday,
-                t.tm_hour, t.tm_min, t.tm_sec,
-                (unsigned long long)nanoseconds,
-                loglevel_to_string(meta.level),
-                (uint64_t)header.thread_id,
-                meta.file,
-                meta.line
-            );
-            auto full_tuple = std::tuple_cat(head_tuple, args_tuple);
-            format_log_impl(out, meta.full_format.c_str(), full_tuple,
-                detail::make_index_sequence<std::tuple_size<decltype(full_tuple)>::value>{});
+            // 2. 格式化时间戳
+            format_timestamp(out, header.time);
+
+            // 3. 格式化固定头部 (Level, ThreadID, File:Line)
+            out << loglevel_to_string(meta.level) << " "
+                << header.thread_id << " "
+                << meta.file << ":" << meta.line << " ";
+
+            // 4. 格式化用户日志内容
+            format_log_impl(out, meta.format.c_str(), args_tuple,
+                detail::make_index_sequence<std::tuple_size<decltype(args_tuple)>::value>{});
         }
 
         class ThreadBuffer {
         public:
-            ThreadBuffer(uint32_t size) : size_(size) {
-                // 确保大小是2的幂，便于环绕计算
-                if ((size_ & (size_ - 1)) != 0) {
-                    // 找到下一个2的幂
-                    size_--;
-                    size_ |= size_ >> 1;
-                    size_ |= size_ >> 2;
-                    size_ |= size_ >> 4;
-                    size_ |= size_ >> 8;
-                    size_ |= size_ >> 16;
-                    size_++;
-                }
+            ThreadBuffer(uint32_t size) : size_(normalize_size(size)) {
                 mask_ = size_ - 1;
                 buffer_.resize(size_);
             }
 
             ~ThreadBuffer() = default;
 
-            // =======================================================================
-            // alloc() - 分配空间（非递归）
-            // =======================================================================
             char* alloc(uint32_t len) {
-                // 需要总空间：日志头 + 数据 + 1字节（区分满/空状态）
-                uint32_t required = len + 1;
-
-                // 预加载读写索引
                 uint32_t read  = read_index_.load(std::memory_order_acquire);
-                uint32_t write = write_index_.load(std::memory_order_relaxed);
+                uint32_t write = local_write_index_;
 
-                // 计算可用空间
                 uint32_t free_space = calculate_free_space(read, write);
-
-                // 检查是否有足够空间
-                if (required > free_space) {
+                if (len > free_space) {
                     return nullptr;
                 }
 
-                // 检查尾部是否有足够的连续空间
-                uint32_t available_till_end = size_ - write;
-
-                if (len <= available_till_end) {
-                    // 尾部有足够连续空间
-                    // 检查是否需要写入padding（如果尾部空间不足以放下下一个LogEntryHeader）
-                    if (available_till_end - len < sizeof(LogEntryHeader) + 1) {
-                        // 尾部剩余空间太小，需要写入padding
-                        if (available_till_end >= sizeof(LogEntryHeader)) {
-                            write_padding(write, available_till_end);
-                        }
-                        write_index_.store(0, std::memory_order_release);
-                        return alloc_from_start(len);
-                    }
-                    return &buffer_[write];
+                uint32_t tail_free;
+                if (write >= read) {
+                    tail_free = size_ - write;
                 }
                 else {
-                    // 需要环绕
-                    // 在尾部写入padding（如果空间足够）
-                    if (available_till_end >= sizeof(LogEntryHeader)) {
-                        write_padding(write, available_till_end);
+                    tail_free = read - write - 1;
+                }
+
+                constexpr uint32_t LOGENTRY_HEAD_SIZE = static_cast<uint32_t>(sizeof(LogEntryHeader));
+                if (len <= tail_free) {
+                    uint32_t leftover = tail_free - len;
+                    if (leftover >= LOGENTRY_HEAD_SIZE) {
+                        return &buffer_[write];
                     }
 
-                    // 更新写指针到头部
-                    write_index_.store(0, std::memory_order_release);
-
-                    // 从头部开始分配
-                    return alloc_from_start(len);
+                    //若剩余空间不够放 header, 放弃在尾部写入，则尝试写 padding(前提 tail_free >= header_sz)
                 }
+
+                //尾部不够(或leftover < header_sz), 则尝试写padding(必须能写完整 header)
+                if (tail_free >= LOGENTRY_HEAD_SIZE) {
+                    write_padding_local(write, tail_free);
+                    local_write_index_ = 0;
+                    uint32_t tail_end = (write + tail_free) & mask_;
+                    write_index_.store(tail_end, std::memory_order_release);
+                    return alloc_from_start(len, read);
+                }
+
+                return nullptr;
             }
 
-            // =======================================================================
-            // commit() - 提交已分配的空间
-            // =======================================================================
             inline void commit(uint32_t len) {
-                uint32_t write = write_index_.load(std::memory_order_relaxed);
-                uint32_t new_write = (write + len) & mask_;
-                write_index_.store(new_write, std::memory_order_release);
+                uint32_t new_local = (local_write_index_ + len) & mask_;
+                local_write_index_ = new_local;
+                write_index_.store(new_local, std::memory_order_release);
             }
 
-            // =======================================================================
-            // try_read() - 尝试读取数据（非递归）
-            // =======================================================================
             bool try_read(char*& out_ptr) {
                 uint32_t read  = read_index_.load(std::memory_order_relaxed);
                 uint32_t write = write_index_.load(std::memory_order_acquire);
-
-                // 缓冲区为空
                 if (read == write) {
                     return false;
                 }
 
-                // 循环处理可能遇到的padding
-                constexpr int MAX_PADDING_SKIPS = 3; // 最大跳过padding次数
-                int skips = 0;
-                while (skips < MAX_PADDING_SKIPS) {
-                    LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(&buffer_[read]);
-
-                    // 如果遇到padding，跳过它
-                    if (header->log_id == PADDING_ID) {
-                        // 跳过padding，更新读指针
-                        uint32_t padding_size = header->total_size;
-                        uint32_t new_read = (read + padding_size) & mask_;
-                        read_index_.store(new_read, std::memory_order_release);
-
-                        // 重新加载指针
-                        read = new_read;
-                        skips++;
-
-                        // 检查是否为空
-                        if (read == write) {
-                            return false;
-                        }
-                        continue;
-                    }
-
-                    // 有效数据
-                    out_ptr = &buffer_[read];
-                    return true;
+                // 检查剩余空间是否足够读出一个 Header
+                // 注意：SPSC中，write 可能 wrap 到了 0，而 read 在末尾
+                // 此时 write < read。
+                uint32_t space_to_end = size_ - read;
+                if (space_to_end < sizeof(LogEntryHeader)) {
+                    read_index_.store(0, std::memory_order_release);
+                    return false;
                 }
 
-                return false;
+                LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(&buffer_[read]);
+                uint32_t claimed = header->total_size;
+                if (claimed < sizeof(LogEntryHeader) || claimed > size_) {
+                    read_index_.store(write, std::memory_order_release);
+                    return false;
+                }
+                if (header->log_id == PADDING_ID) {
+                    // With split/no-padding design we normally don't write padding; keep handling just in case
+                    uint32_t new_read = (read + claimed) & mask_;
+                    if (new_read == read) {
+                        read_index_.store(write, std::memory_order_release); 
+                        return false; 
+                    }
+                    read_index_.store(new_read, std::memory_order_release);
+                    return false;
+                }
+
+                out_ptr = &buffer_[read];
+                return true;
             }
 
-            // =======================================================================
-            // consume() - 消费已读取的数据
-            // =======================================================================
             inline void consume(uint32_t len) {
-                uint32_t read     = read_index_.load(std::memory_order_relaxed);
+                uint32_t read = read_index_.load(std::memory_order_relaxed);
                 uint32_t new_read = (read + len) & mask_;
                 read_index_.store(new_read, std::memory_order_release);
             }
 
-            // =======================================================================
-            // 状态查询
-            // =======================================================================
-            inline bool should_deallocate() const {
-                return should_deallocate_;
+            inline bool should_deallocate() const { 
+                return should_deallocate_; 
             }
 
-            inline void mark_deallocate() {
+            inline void mark_deallocate() { 
                 should_deallocate_ = true;
             }
 
-            inline uint32_t capacity() const {
-                return size_;
+            inline uint32_t capacity() const { 
+                return size_; 
             }
 
-            // 估算可用空间
             inline uint32_t estimate_free_space() const {
                 uint32_t read  = read_index_.load(std::memory_order_acquire);
                 uint32_t write = write_index_.load(std::memory_order_acquire);
                 return calculate_free_space(read, write);
             }
 
-            // 估算已用空间
             inline uint32_t estimate_used_space() const {
                 uint32_t read  = read_index_.load(std::memory_order_acquire);
                 uint32_t write = write_index_.load(std::memory_order_acquire);
@@ -904,79 +930,74 @@ namespace zrlog {
         private:
             static const uint32_t PADDING_ID = 0xFFFFFFFF;
 
-            // =======================================================================
-            // 内部辅助方法
-            // =======================================================================
+            static uint32_t normalize_size(uint32_t n) {
+                constexpr uint32_t MIN_SIZE = 1024;
+                constexpr uint32_t MAX_POW2 = 1u << 30;
+                if (n < MIN_SIZE) {
+                    n = MIN_SIZE;
+                }
+                n--;
+                n |= n >> 1;
+                n |= n >> 2;
+                n |= n >> 4;
+                n |= n >> 8;
+                n |= n >> 16;
+                n++;
+                if (n == 0) {
+                    n = MIN_SIZE;
+                }
+                if (n > MAX_POW2) {
+                    n = MAX_POW2;
+                }
+                return n;
+            }
 
-            // 计算可用空间
             inline uint32_t calculate_free_space(uint32_t read, uint32_t write) const {
                 if (write >= read) {
-                    // |------已读------|------未读------|------空闲------|
-                    // 0               read            write           size
-                    return (size_ - write) + read - 1; // -1 用于区分满/空状态
+                    return (size_ - (write - read) - 1);
                 }
                 else {
-                    // |------未读------|------空闲------|------已读------|
-                    // 0               write           read            size
-                    return read - write - 1;
+                    return (read - write - 1);
                 }
             }
 
-            // 计算已用空间
             inline uint32_t calculate_used_space(uint32_t read, uint32_t write) const {
                 if (write >= read) {
                     return write - read;
                 }
-                else {
-                    return size_ - read + write;
-                }
+                return size_ - read + write;
             }
 
-            // 写入padding
-            void write_padding(uint32_t pos, uint32_t size) {
+            inline void write_padding_local(uint32_t pos, uint32_t pad_size) {
+                if (pad_size < sizeof(LogEntryHeader) || pad_size >= size_) {
+                    return;
+                }
                 if (pos + sizeof(LogEntryHeader) > size_) {
-                    return; // 位置无效
+                    return;
                 }
 
                 LogEntryHeader *padding = reinterpret_cast<LogEntryHeader*>(&buffer_[pos]);
                 padding->log_id = PADDING_ID;
-                padding->total_size = size;
+                padding->total_size = pad_size;
                 padding->time = 0;
                 padding->thread_id = 0;
             }
 
-            // 从头部开始分配空间
-            char* alloc_from_start(uint32_t len) {
-                uint32_t write = write_index_.load(std::memory_order_relaxed);
-                uint32_t read  = read_index_.load(std::memory_order_acquire);
-
-                // 检查头部空间是否足够
-                if (write >= read) {
-                    // 写指针在读指针之后，头部空间就是read-1
-                    if (len < read - 1) { // -1 确保不覆盖读指针
-                        return &buffer_[0];
-                    }
+            inline char* alloc_from_start(uint32_t len, uint32_t read) {
+                uint32_t head_free = (read == 0) ? (size_ - 1) : (read - 1);
+                if (len <= head_free) {
+                    return &buffer_[0];
                 }
-                else {
-                    // 写指针在读指针之前，头部空间是read-write-1
-                    if (len < read - write - 1) {
-                        return &buffer_[write];
-                    }
-                }
-
                 return nullptr;
             }
-            
-            // =======================================================================
-            // 成员变量
-            // =======================================================================
 
-            alignas(64) std::atomic<uint32_t> write_index_{ 0 };  // 写指针
-            alignas(64) std::atomic<uint32_t> read_index_{ 0 };   // 读指针
-            uint32_t size_;                    // 缓冲区大小（2的幂）
-            uint32_t mask_;                    // 掩码，用于环绕计算
-            std::vector<char> buffer_;         // 缓冲区数据
-            bool should_deallocate_ = false;   // 标记是否需要释放
+            alignas(64) std::atomic<uint32_t> write_index_{ 0 };
+            alignas(64) std::atomic<uint32_t> read_index_{ 0 };
+            uint32_t local_write_index_ = 0;
+            uint32_t size_;
+            uint32_t mask_;
+            std::vector<char> buffer_;
+            bool should_deallocate_ = false;
         };
 
         class ThreadBufferDestroyer {
@@ -992,26 +1013,34 @@ namespace zrlog {
         // Management
         // ========================================================================
         template<typename... Args>
-        void register_log_meta(uint32_t &log_id, LogLevel level, const char* file, uint32_t line, const char* func, const char* format) {
-            std::lock_guard<SpinMutex> lock(log_metas_mutex_);
-            if (0 == log_id) {
-                log_id = static_cast<uint32_t>(global_log_metas_.size() + 1);
-                LogMeta new_log;
-                new_log.id = log_id;
-                new_log.level = level;
-                new_log.file = file;
-                new_log.line = line;
-                new_log.func = func;
-                new_log.format = format;
-                new_log.full_format.reserve(256);
-                new_log.full_format.append(HEAD_FORMATS);
-                new_log.full_format.append(format);
-                new_log.decoder = &generated_decoder<Args...>;
-                global_log_metas_.push_back(std::move(new_log));
+        uint32_t register_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, const char* file, uint32_t line, const char* func, const char* format) {
+            uint32_t id = log_id_atom.load(std::memory_order_acquire);
+            if (id != 0) {
+                return id;
             }
+
+            std::lock_guard<SpinMutex> lock(log_metas_mutex_);
+            id = log_id_atom.load(std::memory_order_relaxed);
+            if (id != 0) {
+                return id;
+            }
+
+            uint32_t new_id = static_cast<uint32_t>(global_log_metas_.size() + 1);
+            LogMeta new_log;
+            new_log.id = new_id;
+            new_log.level = level;
+            new_log.file = file;
+            new_log.line = line;
+            new_log.func = func;
+            new_log.format = format;
+            new_log.decoder = &generated_decoder<Args...>;
+            global_log_metas_.push_back(std::move(new_log));
+
+            log_id_atom.store(new_id, std::memory_order_release);
+            return new_id;
         }
 
-        ThreadBuffer * get_thread_buffer() {
+        ThreadBuffer* get_thread_buffer() {
             if (nullptr == thread_buffer_) {
                 thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size);
                 (void)thread_buffer_destroyer_;
@@ -1051,7 +1080,7 @@ namespace zrlog {
                     thread_active = true;
                     quota--;
 
-                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader*>(ptr);
+                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
                     if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
                         const LogMeta& meta = local_log_metas[header->log_id - 1];
                         char *args_ptr = ptr + sizeof(LogEntryHeader);
@@ -1081,17 +1110,16 @@ namespace zrlog {
                 if (!busy) {
                     io_buf.flush_to_os();
 
-                    idle_wait_flag_.store(true);
+                    idle_wait_flag_.store(true, std::memory_order_relaxed);
                     {
                         std::unique_lock<std::mutex> lock(idle_wait_mutex_);
                         idle_wait_condition_.wait_for(lock, std::chrono::microseconds(config_.idle_wait_interval_us));
                     }
-                    idle_wait_flag_.store(false);
+                    idle_wait_flag_.store(false, std::memory_order_relaxed);
                 }
             }
 
             while (consume_buffers_round_robin(local_log_metas, io_buf)) {
-                // Drain loop
             }
             io_buf.flush_force();
         }
@@ -1104,7 +1132,7 @@ namespace zrlog {
             fini();
         }
 
-        static ZRLOG_FAST_THREAD_LOCAL ThreadBuffer* thread_buffer_;
+        static ZRLOG_FAST_THREAD_LOCAL ThreadBuffer *thread_buffer_;
         static thread_local ThreadBufferDestroyer thread_buffer_destroyer_;
 
         Config config_;
@@ -1114,15 +1142,13 @@ namespace zrlog {
         std::list<ThreadBuffer*> thread_buffers_;
         std::list<ThreadBuffer*> thread_buffers_bg_;
 
-        // 使用 unique_ptr 管理生命周期
         std::unique_ptr<ILogAppender> appender_;
         std::thread log_thread_;
         volatile bool log_thread_running_ = false;
 
-        //idle wait
         std::mutex              idle_wait_mutex_;
         std::condition_variable idle_wait_condition_;
-        std::atomic_bool        idle_wait_flag_ = false;   //条件触发标识
+        std::atomic_bool        idle_wait_flag_ = false;
     };
 
     ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
@@ -1141,7 +1167,7 @@ namespace zrlog {
     do {                                                                                    \
         zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                          \
         if (logger.check_level(level)) {                                                    \
-            static uint32_t log_id = 0;                                                     \
+            static std::atomic<uint32_t> log_id{0};                                         \
             logger.log(log_id, level, __FILE__, __LINE__, __func__, format, ##__VA_ARGS__); \
         }                                                                                   \
     } while (0)

@@ -2,8 +2,10 @@
 #include <vector>
 
 void bench_thread(int id, int times) {
-    ZRLOG_INFO("Thread:%d begin...", id);
-    ZRLOG_INFO("Thread:%d times:%d value:%.2f string:%s", id, times, 3.14159, "test");
+    std::string str = "abcdefghijklmnopqrstwyz";
+    ZRLOG_INFO("Thread:%d times:%d value:%.2f string:%s", id, times, 3.14159, str);
+    //ZRLOG_INFO("Thread:%d begin...", id);
+    //ZRLOG_INFO("Thread:%d iteration:%d value:%.2f string:%s", id, i, 3.14159, "test");
     auto start = std::chrono::steady_clock::now();
     for (int i = 0; i < times; ++i) {
         //ZRLOG_INFO("Thread:%d iteration:%d value:%.2f string:%s", id, i, 3.14159, "test");
