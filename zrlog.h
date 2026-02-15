@@ -876,19 +876,11 @@ namespace zrlog {
                     return false;
                 }
 
-                uint32_t read_index  = read_index_.load(std::memory_order_relaxed);
-                uint32_t write_index = write_index_.load(std::memory_order_acquire);
-
-                // 缓冲区为空
-                if (read_index == write_index) {
-                    return false;
-                }
-
                 // 循环处理可能遇到的padding
                 constexpr int MAX_PADDING_SKIPS = 3; // 最大跳过padding次数
                 int skips = 0;
                 while (skips < MAX_PADDING_SKIPS) {
-                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader*>(&buffer_[read_index]);
+                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader*>(&buffer_[read]);
                     uint32_t claimed = header->total_size;
                     if (claimed < sizeof(LogEntryHeader) || claimed > size_) {
                         read_index_.store(write, std::memory_order_release);
@@ -898,22 +890,22 @@ namespace zrlog {
                     // 如果遇到padding，跳过它
                     if (header->log_id == PADDING_ID) {
                         // 跳过padding，更新读指针
-                        uint32_t new_read_index = (read_index + claimed) & mask_;
-                        read_index_.store(new_read_index, std::memory_order_release);
+                        uint32_t new_read = (read + claimed) & mask_;
+                        read_index_.store(new_read, std::memory_order_release);
 
                         // 重新加载指针
-                        read_index = new_read_index;
+                        read = new_read;
                         skips++;
 
                         // 检查是否为空
-                        if (read_index == write_index) {
+                        if (read == write) {
                             return false;
                         }
                         continue;
                     }
 
                     // 有效数据
-                    out_ptr = &buffer_[read_index];
+                    out_ptr = &buffer_[read];
                     return true;
                 }
 
