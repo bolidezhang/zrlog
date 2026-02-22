@@ -18,6 +18,7 @@
 #include <cinttypes>
 #include <ctime>
 #include <charconv>
+#include <new>
 #include <memory>
 
 // ---------------------------------------------------------------------------
@@ -548,7 +549,7 @@ namespace zrlog {
             }
 
         private:
-            ILogAppender* appender_ = nullptr;
+            ILogAppender *appender_ = nullptr;
             std::vector<char> data_;
             size_t size_;
             size_t pos_ = 0;
@@ -836,7 +837,7 @@ namespace zrlog {
                 if (len <= tail_free) {
                     uint32_t leftover = tail_free - len;
                     if (leftover >= LOGENTRY_HEAD_SIZE) {
-                        return &buffer_[write];
+                        return buffer_.data() + write;
                     }
 
                     //若剩余空间不够放 header, 放弃在尾部写入，则尝试写 padding(前提 tail_free >= header_sz)
@@ -846,7 +847,7 @@ namespace zrlog {
                 if (tail_free >= LOGENTRY_HEAD_SIZE) {
                     write_padding_local(write, tail_free);
                     local_write_index_ = 0;
-                    uint32_t tail_end = (write + tail_free) & mask_;
+                    uint32_t tail_end  = (write + tail_free) & mask_;
                     write_index_.store(tail_end, std::memory_order_release);
                     return alloc_from_start(len, read);
                 }
@@ -868,8 +869,7 @@ namespace zrlog {
                 }
 
                 // 检查剩余空间是否足够读出一个 Header
-                // 注意：SPSC中，write 可能 wrap 到了 0，而 read 在末尾
-                // 此时 write < read。
+                // 注意: SPSC中，write 可能 wrap 到了 0，而 read 在末尾,此时 write < read
                 uint32_t space_to_end = size_ - read;
                 if (space_to_end < sizeof(LogEntryHeader)) {
                     read_index_.store(0, std::memory_order_release);
@@ -905,7 +905,7 @@ namespace zrlog {
                     }
 
                     // 有效数据
-                    out_ptr = &buffer_[read];
+                    out_ptr = buffer_.data() + read;
                     return true;
                 }
 
@@ -991,7 +991,7 @@ namespace zrlog {
                     return;
                 }
 
-                LogEntryHeader* padding = reinterpret_cast<LogEntryHeader*>(&buffer_[pos]);
+                LogEntryHeader *padding = reinterpret_cast<LogEntryHeader *>(buffer_.data() + pos);
                 padding->log_id = PADDING_ID;
                 padding->total_size = pad_size;
                 padding->time = 0;
@@ -1001,13 +1001,13 @@ namespace zrlog {
             inline char* alloc_from_start(uint32_t len, uint32_t read) {
                 uint32_t head_free = (read == 0) ? (size_ - 1) : (read - 1);
                 if (len <= head_free) {
-                    return &buffer_[0];
+                    return buffer_.data();
                 }
                 return nullptr;
             }
 
-            alignas(64) std::atomic<uint32_t> write_index_{ 0 };
-            alignas(64) std::atomic<uint32_t> read_index_{ 0 };
+            alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> write_index_{ 0 };
+            alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> read_index_{ 0 };
             uint32_t local_write_index_ = 0;
 
             uint32_t size_;
