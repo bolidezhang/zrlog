@@ -837,7 +837,7 @@ namespace zrlog {
                 if (len <= tail_free) {
                     uint32_t leftover = tail_free - len;
                     if (leftover >= LOGENTRY_HEAD_SIZE) {
-                        return buffer_.data() + write;
+                        return &buffer_[write];
                     }
 
                     //若剩余空间不够放 header, 放弃在尾部写入，则尝试写 padding(前提 tail_free >= header_sz)
@@ -905,7 +905,7 @@ namespace zrlog {
                     }
 
                     // 有效数据
-                    out_ptr = buffer_.data() + read;
+                    out_ptr = &buffer_[read];
                     return true;
                 }
 
@@ -991,7 +991,7 @@ namespace zrlog {
                     return;
                 }
 
-                LogEntryHeader *padding = reinterpret_cast<LogEntryHeader *>(buffer_.data() + pos);
+                LogEntryHeader *padding = reinterpret_cast<LogEntryHeader *>(&buffer_[pos]);
                 padding->log_id = PADDING_ID;
                 padding->total_size = pad_size;
                 padding->time = 0;
@@ -1001,7 +1001,7 @@ namespace zrlog {
             inline char* alloc_from_start(uint32_t len, uint32_t read) {
                 uint32_t head_free = (read == 0) ? (size_ - 1) : (read - 1);
                 if (len <= head_free) {
-                    return buffer_.data();
+                    return &buffer_[0];
                 }
                 return nullptr;
             }
