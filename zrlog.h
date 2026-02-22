@@ -619,7 +619,7 @@ namespace zrlog {
                 log_id = register_log_meta<Args...>(log_id_atom, level, file, line, func, format);
             }
 
-            ThreadBuffer* buffer = get_thread_buffer();
+            ThreadBuffer *buffer = get_thread_buffer();
             if (nullptr != buffer) {
                 uint32_t args_size = calculate_args_size(args...);
                 uint32_t total_size = sizeof(LogEntryHeader) + args_size;
@@ -861,18 +861,26 @@ namespace zrlog {
             }
 
             bool try_read(char*& out_ptr) {
-                uint32_t read  = read_index_.load(std::memory_order_relaxed);
+                uint32_t read = read_index_.load(std::memory_order_relaxed);
                 uint32_t write = write_index_.load(std::memory_order_acquire);
-
-                // 缓冲区为空
                 if (read == write) {
                     return false;
                 }
+
                 // 检查剩余空间是否足够读出一个 Header
-                // 注意：SPSC中，write 可能 wrap 到了 0，而 read 在末尾.此时 write < read。
+                // 注意：SPSC中，write 可能 wrap 到了 0，而 read 在末尾
+                // 此时 write < read。
                 uint32_t space_to_end = size_ - read;
                 if (space_to_end < sizeof(LogEntryHeader)) {
                     read_index_.store(0, std::memory_order_release);
+                    return false;
+                }
+
+                uint32_t read_index  = read_index_.load(std::memory_order_relaxed);
+                uint32_t write_index = write_index_.load(std::memory_order_acquire);
+
+                // 缓冲区为空
+                if (read_index == write_index) {
                     return false;
                 }
 
@@ -880,7 +888,7 @@ namespace zrlog {
                 constexpr int MAX_PADDING_SKIPS = 3; // 最大跳过padding次数
                 int skips = 0;
                 while (skips < MAX_PADDING_SKIPS) {
-                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(&buffer_[read]);
+                    LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(&buffer_[read_index]);
                     uint32_t claimed = header->total_size;
                     if (claimed < sizeof(LogEntryHeader) || claimed > size_) {
                         read_index_.store(write, std::memory_order_release);
@@ -890,28 +898,27 @@ namespace zrlog {
                     // 如果遇到padding，跳过它
                     if (header->log_id == PADDING_ID) {
                         // 跳过padding，更新读指针
-                        uint32_t new_read = (read + claimed) & mask_;
-                        read_index_.store(new_read, std::memory_order_release);
+                        uint32_t new_read_index = (read_index + claimed) & mask_;
+                        read_index_.store(new_read_index, std::memory_order_release);
 
                         // 重新加载指针
-                        read = new_read;
+                        read_index = new_read_index;
                         skips++;
 
                         // 检查是否为空
-                        if (read == write) {
+                        if (read_index == write_index) {
                             return false;
                         }
                         continue;
                     }
 
                     // 有效数据
-                    out_ptr = &buffer_[read];
+                    out_ptr = &buffer_[read_index];
                     return true;
                 }
 
                 return false;
             }
-
             inline void consume(uint32_t len) {
                 uint32_t read = read_index_.load(std::memory_order_relaxed);
                 uint32_t new_read = (read + len) & mask_;
@@ -1098,8 +1105,8 @@ namespace zrlog {
 
                     LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(ptr);
                     if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
-                        const LogMeta& meta = local_log_metas[header->log_id - 1];
-                        char* args_ptr = ptr + sizeof(LogEntryHeader);
+                        const LogMeta &meta = local_log_metas[header->log_id - 1];
+                        char *args_ptr = ptr + sizeof(LogEntryHeader);
                         meta.decoder(args_ptr, meta, *header, io_buf);
                     }
                     tb->consume(header->total_size);
