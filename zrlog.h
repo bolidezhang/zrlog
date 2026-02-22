@@ -1006,8 +1006,8 @@ namespace zrlog {
                 return nullptr;
             }
 
-            alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> write_index_{ 0 };
-            alignas(std::hardware_destructive_interference_size) std::atomic<uint32_t> read_index_{ 0 };
+            alignas(64) std::atomic<uint32_t> write_index_{ 0 };
+            alignas(64) std::atomic<uint32_t> read_index_{ 0 };
             uint32_t local_write_index_ = 0;
 
             uint32_t size_;
