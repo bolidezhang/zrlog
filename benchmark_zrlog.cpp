@@ -248,7 +248,15 @@ void benchmark_clock() {
     std::cout << "Speedup:      " << (sys_ns / tsc_ns) << "x" << std::endl;
 }
 
-int main() {
+int main(int argc, char* argv[]) {
+    double thread_buffer_size = 1.0;   //default value: 1 MB
+    if (argc > 1) {
+        thread_buffer_size = atof(argv[1]);
+        if (thread_buffer_size < 0) {
+            thread_buffer_size = 1.0;
+        }
+    }
+
     std::cout << "============================================" << std::endl;
     std::cout << "        zrlog Performance Benchmark        "  << std::endl;
     std::cout << "============================================" << std::endl;
@@ -260,8 +268,9 @@ int main() {
     zrlog::Config config;
     config.filename = "benchmark_zrlog.log";
     config.level = zrlog::LogLevel::INFO;
-    config.thread_buffer_size = 16 * 1024 * 1024;  // 16MB per thread
-    config.io_buffer_size = 1024 * 512;  // 512KB IO buffer
+    config.thread_buffer_size = static_cast< uint32_t>(1024 * 1024 * thread_buffer_size);
+    config.io_buffer_size = 1024 * 512;             // 512KB IO buffer
+    std::cout << "config.thread_buffer_size:" << config.thread_buffer_size << std::endl;
 
     if (!zrlog::NanoLogger::instance().init(config)) {
         std::cerr << "Failed to initialize logger" << std::endl;

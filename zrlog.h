@@ -278,7 +278,7 @@ namespace zrlog {
 
                 uint64_t ns0 = std::chrono::duration_cast<std::chrono::nanoseconds>(t0.time_since_epoch()).count();
                 uint64_t ns1 = std::chrono::duration_cast<std::chrono::nanoseconds>(t1.time_since_epoch()).count();
-                double ns_delta = static_cast<double>(ns1 - ns0);
+                double ns_delta  = static_cast<double>(ns1 - ns0);
                 double tsc_delta = static_cast<double>(tsc1 - tsc0);
                 if (tsc_delta > 0) {
                     rates.push_back(ns_delta / tsc_delta);
@@ -323,7 +323,7 @@ namespace zrlog {
 
         void sync_anchor_unlocked() {
             auto t = std::chrono::system_clock::now();
-            anchor_.base_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
+            anchor_.base_ns  = std::chrono::duration_cast<std::chrono::nanoseconds>(t.time_since_epoch()).count();
             anchor_.base_tsc = zrlog_rdtsc();
         }
 
@@ -369,10 +369,10 @@ namespace zrlog {
         AppenderType appender = AppenderType::File;
         std::string filename;
         LogLevel level = LogLevel::DEBUG;
-        uint32_t io_buffer_size = 1024 * 256;
-        uint32_t thread_buffer_size = 1024 * 1024 * 4;
-        uint32_t per_thread_quota = 256;
-        uint32_t idle_wait_interval_us = 500;
+        uint32_t io_buffer_size = 1024 * 256;           //io缓冲大小(也即日志格式化缓冲, 全局唯一)
+        uint32_t thread_buffer_size = 1024 * 1024 * 1;  //每个线程的缓冲大小(前端二进制序列化缓冲 测试发现越大如16M,时延也变大)
+        uint32_t per_thread_quota = 256;                //每个线程的格式化日志的配额(防止线程产生日志太快,公平处理每个线程日志)
+        uint32_t idle_wait_interval_us = 500;           //空闲等待间隔(微妙)
     };
 
     class ILogAppender {
@@ -816,7 +816,7 @@ namespace zrlog {
             ~ThreadBuffer() = default;
 
             char* alloc(uint32_t len) {
-                uint32_t read = read_index_.load(std::memory_order_acquire);
+                uint32_t read  = read_index_.load(std::memory_order_acquire);
                 uint32_t write = local_write_index_;
 
                 uint32_t free_space = calculate_free_space(read, write);
@@ -836,7 +836,7 @@ namespace zrlog {
                 if (len <= tail_free) {
                     uint32_t leftover = tail_free - len;
                     if (leftover >= LOGENTRY_HEAD_SIZE) {
-                        return &buffer_[write];
+                        return buffer_.data() + write;
                     }
 
                     //若剩余空间不够放 header, 放弃在尾部写入，则尝试写 padding(前提 tail_free >= LOGENTRY_HEAD_SIZE)
@@ -860,11 +860,11 @@ namespace zrlog {
                 write_index_.store(new_local, std::memory_order_release);
             }
 
-            bool try_read(char*& out_ptr) {
-                uint32_t read = read_index_.load(std::memory_order_relaxed);
+            LogEntryHeader* try_read() {
+                uint32_t read  = read_index_.load(std::memory_order_relaxed);
                 uint32_t write = write_index_.load(std::memory_order_acquire);
                 if (read == write) {
-                    return false;
+                    return nullptr;
                 }
 
                 // 检查剩余空间是否足够读出一个 Header
@@ -873,54 +873,46 @@ namespace zrlog {
                 uint32_t space_to_end = size_ - read;
                 if (space_to_end < sizeof(LogEntryHeader)) {
                     read_index_.store(0, std::memory_order_release);
-                    return false;
-                }
-
-                uint32_t read_index  = read_index_.load(std::memory_order_relaxed);
-                uint32_t write_index = write_index_.load(std::memory_order_acquire);
-
-                // 缓冲区为空
-                if (read_index == write_index) {
-                    return false;
+                    return nullptr;
                 }
 
                 // 循环处理可能遇到的padding
                 constexpr int MAX_PADDING_SKIPS = 3; // 最大跳过padding次数
                 int skips = 0;
+                LogEntryHeader *header = nullptr;
                 while (skips < MAX_PADDING_SKIPS) {
-                    LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(&buffer_[read_index]);
+                    header = reinterpret_cast<LogEntryHeader *>(buffer_.data() + read);
                     uint32_t claimed = header->total_size;
                     if (claimed < sizeof(LogEntryHeader) || claimed > size_) {
                         read_index_.store(write, std::memory_order_release);
-                        return false;
+                        return nullptr;
                     }
 
                     // 如果遇到padding，跳过它
                     if (header->log_id == PADDING_ID) {
                         // 跳过padding，更新读指针
-                        uint32_t new_read_index = (read_index + claimed) & mask_;
-                        read_index_.store(new_read_index, std::memory_order_release);
+                        uint32_t new_read = (read + claimed) & mask_;
+                        read_index_.store(new_read, std::memory_order_release);
 
                         // 重新加载指针
-                        read_index = new_read_index;
-                        skips++;
+                        read = new_read;
+                        ++skips;
 
                         // 检查是否为空
-                        if (read_index == write_index) {
-                            return false;
+                        if (read == write) {
+                            return nullptr;
                         }
                         continue;
                     }
 
                     // 有效数据
-                    out_ptr = &buffer_[read_index];
-                    return true;
+                    return header;
                 }
 
-                return false;
+                return nullptr;
             }
             inline void consume(uint32_t len) {
-                uint32_t read = read_index_.load(std::memory_order_relaxed);
+                uint32_t read     = read_index_.load(std::memory_order_relaxed);
                 uint32_t new_read = (read + len) & mask_;
                 read_index_.store(new_read, std::memory_order_release);
             }
@@ -938,13 +930,13 @@ namespace zrlog {
             }
 
             inline uint32_t estimate_free_space() const {
-                uint32_t read = read_index_.load(std::memory_order_acquire);
+                uint32_t read  = read_index_.load(std::memory_order_acquire);
                 uint32_t write = write_index_.load(std::memory_order_acquire);
                 return calculate_free_space(read, write);
             }
 
             inline uint32_t estimate_used_space() const {
-                uint32_t read = read_index_.load(std::memory_order_acquire);
+                uint32_t read  = read_index_.load(std::memory_order_acquire);
                 uint32_t write = write_index_.load(std::memory_order_acquire);
                 return calculate_used_space(read, write);
             }
@@ -998,7 +990,7 @@ namespace zrlog {
                     return;
                 }
 
-                LogEntryHeader* padding = reinterpret_cast<LogEntryHeader*>(&buffer_[pos]);
+                LogEntryHeader *padding = reinterpret_cast<LogEntryHeader *>(buffer_.data() + pos);
                 padding->log_id = PADDING_ID;
                 padding->total_size = pad_size;
                 padding->time = 0;
@@ -1008,7 +1000,7 @@ namespace zrlog {
             inline char* alloc_from_start(uint32_t len, uint32_t read) {
                 uint32_t head_free = (read == 0) ? (size_ - 1) : (read - 1);
                 if (len <= head_free) {
-                    return &buffer_[0];
+                    return buffer_.data();
                 }
                 return nullptr;
             }
@@ -1091,22 +1083,21 @@ namespace zrlog {
                 }
             }
 
+            LogEntryHeader *header = nullptr;
             auto it = thread_buffers_bg_.begin();
             while (it != thread_buffers_bg_.end()) {
-                ThreadBuffer* tb = *it;
-                char* ptr = nullptr;
+                ThreadBuffer *tb = *it;
                 bool thread_active = false;
                 uint32_t quota = config_.per_thread_quota;
 
-                while (quota > 0 && tb->try_read(ptr)) {
+                while ((quota > 0) && (header = tb->try_read())) {
                     any_data_processed = true;
                     thread_active = true;
                     quota--;
 
-                    LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(ptr);
                     if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
-                        const LogMeta &meta = local_log_metas[header->log_id - 1];
-                        char *args_ptr = ptr + sizeof(LogEntryHeader);
+                        const LogMeta& meta = local_log_metas[header->log_id - 1];
+                        char *args_ptr = reinterpret_cast<char *>(header) + sizeof(LogEntryHeader);
                         meta.decoder(args_ptr, meta, *header, io_buf);
                     }
                     tb->consume(header->total_size);
@@ -1120,6 +1111,7 @@ namespace zrlog {
                     ++it;
                 }
             }
+
             return any_data_processed;
         }
 
