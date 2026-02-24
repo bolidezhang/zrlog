@@ -1093,7 +1093,7 @@ namespace zrlog {
                 while ((quota > 0) && (header = tb->try_read())) {
                     any_data_processed = true;
                     thread_active = true;
-                    quota--;
+                    --quota;
 
                     if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
                         const LogMeta& meta = local_log_metas[header->log_id - 1];
