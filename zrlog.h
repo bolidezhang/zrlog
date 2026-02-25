@@ -1017,10 +1017,16 @@ namespace zrlog {
 
         class ThreadBufferDestroyer {
         public:
+            explicit ThreadBufferDestroyer() {
+            }
+
             ~ThreadBufferDestroyer() {
-                if (NanoLogger::thread_buffer_) {
+                if (nullptr != NanoLogger::thread_buffer_) {
                     NanoLogger::thread_buffer_->mark_deallocate();
                 }
+            }
+
+            void init() {
             }
         };
 
@@ -1058,7 +1064,7 @@ namespace zrlog {
         ThreadBuffer* get_thread_buffer() {
             if (nullptr == thread_buffer_) {
                 thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size);
-                (void)thread_buffer_destroyer_;
+                thread_buffer_destroyer_.init();
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
                 thread_buffers_.push_back(thread_buffer_);
             }
@@ -1147,7 +1153,7 @@ namespace zrlog {
             fini();
         }
 
-        static ZRLOG_FAST_THREAD_LOCAL ThreadBuffer* thread_buffer_;
+        static ZRLOG_FAST_THREAD_LOCAL ThreadBuffer *thread_buffer_;
         static thread_local ThreadBufferDestroyer thread_buffer_destroyer_;
 
         Config config_;
@@ -1166,7 +1172,7 @@ namespace zrlog {
         std::atomic_bool        idle_wait_flag_ = false;
     };
 
-    ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
+    ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer *NanoLogger::thread_buffer_ = nullptr;
     thread_local NanoLogger::ThreadBufferDestroyer NanoLogger::thread_buffer_destroyer_;
 }
 
