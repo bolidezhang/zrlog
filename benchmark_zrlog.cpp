@@ -32,10 +32,10 @@ void benchmark_frontend_latency(int iterations = 1000000) {
     std::vector<uint64_t> latencies;
     latencies.reserve(iterations);
 
-    // Warm up
-    for (int i = 0; i < 1000; ++i) {
-        ZRLOG_INFO("Warmup message %d", i);
-    }
+     //Warm up
+    //for (int i = 0; i < 1000; ++i) {
+    //    ZRLOG_INFO("Warmup message %d", i);
+    //}
 
     // Measure
     for (int i = 0; i < iterations; ++i) {
@@ -221,7 +221,7 @@ void benchmark_message_types(int iterations = 100000) {
 void benchmark_clock() {
     std::cout << "\n=== Clock Performance Test ===" << std::endl;
 
-    const int iterations = 1000000;
+    const int iterations = 10000;
 
     // TSC clock
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -250,10 +250,18 @@ void benchmark_clock() {
 
 int main(int argc, char* argv[]) {
     double thread_buffer_size = 1.0;   //default value: 1 MB
+    zrlog::BufferFullPolicy buffer_full_policy = zrlog::BufferFullPolicy::Discard;
     if (argc > 1) {
         thread_buffer_size = atof(argv[1]);
         if (thread_buffer_size < 0) {
             thread_buffer_size = 1.0;
+        }
+    }
+
+    if (argc > 2) {
+        uint32_t policy = atoi(argv[2]);
+        if (policy <= static_cast<uint32_t>(zrlog::BufferFullPolicy::Retry)) {
+            buffer_full_policy = static_cast<zrlog::BufferFullPolicy>(policy);
         }
     }
 
@@ -264,15 +272,19 @@ int main(int argc, char* argv[]) {
     // Remove old log file
     std::remove("benchmark_zrlog.log");
 
+    zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();
+
     // Initialize logger
     zrlog::Config config;
     config.filename = "benchmark_zrlog.log";
     config.level = zrlog::LogLevel::INFO;
-    config.thread_buffer_size = static_cast< uint32_t>(1024 * 1024 * thread_buffer_size);
+    config.thread_buffer_size = static_cast<uint32_t>(1024 * 1024 * thread_buffer_size);
     config.io_buffer_size = 1024 * 512;             // 512KB IO buffer
-    std::cout << "config.thread_buffer_size:" << config.thread_buffer_size << std::endl;
+    config.buffer_full_policy = buffer_full_policy;
+    std::cout << "config.thread_buffer_size:" << config.thread_buffer_size 
+        <<" buffer_full_policy:" << static_cast<uint32_t>(buffer_full_policy) << std::endl;
 
-    if (!zrlog::NanoLogger::instance().init(config)) {
+    if (!logger.init(config)) {
         std::cerr << "Failed to initialize logger" << std::endl;
         return 1;
     }
@@ -291,6 +303,10 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n=== Benchmark Complete ===" << std::endl;
     std::cout << "Log file: benchmark_zrlog.log" << std::endl;
+    std::cout << "stat_produce_count:" << logger.stat_produce_count_.load(std::memory_order_relaxed) << " stat_consumed_count:" 
+        << logger.stat_consume_count_.load(std::memory_order_relaxed) << std::endl;
+    std::cout << "stat_produce_valid_count:" << logger.stat_produce_valid_count_.load(std::memory_order_relaxed) 
+        << " stat_consume_valid_count:" << logger.stat_consume_valid_count_.load(std::memory_order_relaxed) << std::endl;
 
     return 0;
 }
