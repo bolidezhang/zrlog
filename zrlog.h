@@ -1216,7 +1216,7 @@ namespace zrlog {
             IOBuffer io_buf(appender_.get(), config_.io_buffer_size);
 
             while (log_thread_running_.load(std::memory_order_relaxed)) {
-                uint32_t process_count = consume_buffers_round_robin(local_log_metas, io_buf, false);
+                size_t process_count = consume_buffers_round_robin(local_log_metas, io_buf, false);
                 if (process_count < 1) {  //idle
                     io_buf.flush_to_os();
                     TscClock::instance().sync_system_time();

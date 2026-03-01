@@ -33,9 +33,9 @@ void benchmark_frontend_latency(int iterations = 1000000) {
     latencies.reserve(iterations);
 
      //Warm up
-    //for (int i = 0; i < 1000; ++i) {
-    //    ZRLOG_INFO("Warmup message %d", i);
-    //}
+    for (int i = 0; i < 1000; ++i) {
+        ZRLOG_INFO("Warmup message %d", i);
+    }
 
     // Measure
     for (int i = 0; i < iterations; ++i) {
