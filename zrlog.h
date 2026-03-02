@@ -40,6 +40,15 @@
 #define ZRLOG_CPU_PAUSE()               _mm_pause()
 #define ZRLOG_FAST_THREAD_LOCAL         __declspec(thread)
 
+//标准输入 keyboard(defaut)
+#define STDIN_FILENO  0
+
+//标准输出 screen(defaut)
+#define STDOUT_FILENO 1
+
+//标准错误输出 screen(defaut)
+#define STDERR_FILENO 2
+
 inline void zrlog_gmtime(const time_t* timer, struct tm* buf) {
     gmtime_s(buf, timer);
 }
@@ -460,9 +469,6 @@ namespace zrlog {
         int flush() override {
             return ZRLOG_FLUSH_FILE(STDOUT_FILENO);
         }
-
-        //使用标准的文件描述符ID
-        static constexpr int STDOUT_FILENO = 1;
     };
 
     class NanoLogger {
