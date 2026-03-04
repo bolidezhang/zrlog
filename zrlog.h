@@ -654,6 +654,8 @@ namespace zrlog {
         bool log(std::atomic<uint32_t>& log_id_atom, LogLevel level, const char* file, uint32_t line,
             const char* func, const char* format, Args&&... args) {
 
+            stat_produce_count_.fetch_add(1, std::memory_order_relaxed);
+
             uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
             if (0 == log_id) {
                 log_id = register_log_meta<Args...>(log_id_atom, level, file, line, func, format);
@@ -661,13 +663,13 @@ namespace zrlog {
 
             ThreadBuffer* buffer = get_thread_buffer();
             if (nullptr != buffer) {
-                //stat_produce_count_.fetch_add(1, std::memory_order_relaxed);
                 uint32_t args_size = calculate_args_size(args...);
                 uint32_t total_size = sizeof(LogEntryHeader) + args_size;
                 char *ptr = buffer->alloc(total_size);
                 if (nullptr == ptr) {
                     switch (config_.buffer_full_policy) {
                     case BufferFullPolicy::Discard:
+                        stat_produce_drop_count_.fetch_add(1, std::memory_order_relaxed);
                         return false;
 
                     case BufferFullPolicy::Block: {
@@ -678,6 +680,7 @@ namespace zrlog {
                             do {
                                 // 如果后端线程已经停止，避免死循环
                                 if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                                    stat_produce_drop_count_.fetch_add(1, std::memory_order_relaxed);
                                     return false;
                                 }
 
@@ -703,10 +706,12 @@ namespace zrlog {
                             do {
                                 // 如果后端线程已经停止，避免死循环
                                 if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                                    stat_produce_drop_count_.fetch_add(1, std::memory_order_relaxed);
                                     return false;
                                 }
 
                                 if (spin_count >= config_.buffer_full_retry_count) {
+                                    stat_produce_drop_count_.fetch_add(1, std::memory_order_relaxed);
                                     return false; // 策略3：超过重试次数，最终丢弃
                                 }
 
@@ -725,6 +730,7 @@ namespace zrlog {
                         break;
 
                     default:
+                        stat_produce_drop_count_.fetch_add(1, std::memory_order_relaxed);
                         return false;
 
                     }
@@ -738,12 +744,13 @@ namespace zrlog {
                 header->thread_id = get_thread_id();
                 serialize_args(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
                 buffer->commit(total_size);
-                //stat_produce_valid_count_.fetch_add(1, std::memory_order_relaxed);
+                stat_produce_valid_count_.fetch_add(1, std::memory_order_relaxed);
                 notify_consumer();
 
                 return true;
             }
 
+            stat_produce_drop_count_.fetch_add(1, std::memory_order_relaxed);
             return false;
         }
 
@@ -1279,6 +1286,7 @@ namespace zrlog {
         //statistics
         std::atomic<uint64_t>  stat_produce_count_{ 0 };
         std::atomic<uint64_t>  stat_produce_valid_count_{ 0 };
+        std::atomic<uint64_t>  stat_produce_drop_count_{ 0 };
         std::atomic<uint64_t>  stat_consume_count_{ 0 };
         std::atomic<uint64_t>  stat_consume_valid_count_{ 0 };
     };

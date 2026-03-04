@@ -88,16 +88,16 @@ CXXFLAGS := ${CXXFLAGS} ${DEFS}
 # Targets of the build
 #****************************************************************************
 
-OUTPUT := benchmark_zrlog
+OUTPUTS := benchmark_zrlog benchmark_zrlog_v2
 
-all: ${OUTPUT}
+all: ${OUTPUTS}
 
 
 #****************************************************************************
 # Source files
 #****************************************************************************
 
-SRCS := benchmark_zrlog.cpp 
+SRCS := benchmark_zrlog.cpp benchmark_zrlog_v2.cpp
 
 # Add on the sources for libraries
 SRCS := ${SRCS}
@@ -108,8 +108,11 @@ OBJS := $(addsuffix .o,$(basename ${SRCS}))
 # Output
 #****************************************************************************
 
-${OUTPUT}: ${OBJS}
-	${LD} -o $@ ${LDFLAGS} ${OBJS} ${LIBS} ${EXTRA_LIBS}
+benchmark_zrlog: benchmark_zrlog.o
+	${LD} -o $@ ${LDFLAGS} $^ ${LIBS} ${EXTRA_LIBS}
+
+benchmark_zrlog_v2: benchmark_zrlog_v2.o
+	${LD} -o $@ ${LDFLAGS} $^ ${LIBS} ${EXTRA_LIBS}
 #****************************************************************************
 # common rules
 #****************************************************************************
@@ -125,7 +128,7 @@ dist:
 	bash makedistlinux
 
 clean:
-	${RM} core ${OBJS} ${OUTPUT}
+	${RM} core ${OBJS} ${OUTPUTS}
 
 depend:
 	#makedepend ${INCS} ${SRCS}
