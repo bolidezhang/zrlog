@@ -19,6 +19,14 @@
 #include <ctime>
 #include <charconv>
 #include <memory>
+#include <new>
+
+// 获取当前 CPU 架构的 L1 Cache Line 大小 (C++17)
+#ifdef __cpp_lib_hardware_interference_size
+    constexpr size_t CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
+#else
+    constexpr size_t CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
+#endif
 
 // ---------------------------------------------------------------------------
 // 平台差异处理 & 内部宏定义
@@ -909,107 +917,129 @@ namespace zrlog {
             format_log_impl(out, meta.format.c_str(), args_tuple,
                 detail::make_index_sequence<std::tuple_size<decltype(args_tuple)>::value>{});
         }
-
-
+        
         class ThreadBuffer {
         public:
             explicit ThreadBuffer(uint32_t size) : size_(normalize_size(size)) {
                 mask_ = size_ - 1;
                 buffer_.resize(size_);
+
+                // 【核心黑科技 1：消除 Max 级毛刺】
+                // 内存预热 (Pre-faulting)：强制操作系统立即分配并映射真实的物理内存页。
+                // 彻底杜绝在极速打印日志时触发 Page Fault (缺页中断) 导致的巨大抖动。
+                std::memset(buffer_.data(), 0, size_);
             }
 
             ~ThreadBuffer() = default;
 
-            // 分配内存供写入
+            // ------------------------------------------------------------------------
+            // 前端（生产者）接口
+            // ------------------------------------------------------------------------
             char* alloc(uint32_t len) {
-                // 单写者：write_index_ 用 relaxed 即可；需 acquire read_index_ 获取消费者最新进度
                 uint64_t w = write_index_.load(std::memory_order_relaxed);
-                uint64_t r = read_index_.load(std::memory_order_acquire);
 
-                // 1. 全局防线：检查总逻辑剩余空间是否足够
-                if (w + len - r > size_) {
-                    return nullptr;
+                // 【核心黑科技 2：消除 P99 抖动】
+                // 使用非原子的本地缓存游标 `cached_read_index_` 判断空间。
+                // 在 99% 的情况下，直接 0 成本过检，彻底避免跨核心总线通信！
+                if (w + len - cached_read_index_ > size_) {
+                    // 本地认为空间不够时，才付出代价去同步消费者最新的实际进度
+                    cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                    if (w + len - cached_read_index_ > size_) {
+                        return nullptr;
+                    }
                 }
 
-                uint32_t phys_w    = w & mask_;
+                uint32_t phys_w = w & mask_;
                 uint32_t tail_free = size_ - phys_w;
 
-                // 2. 如果尾部物理空间连续且足够，直接分配
+                // 1. 物理尾部连续空间足够，直接分配
                 if (len <= tail_free) {
                     return buffer_.data() + phys_w;
                 }
 
-                // 3. 尾部空间不够，需要绕回 (Wrap around)
-                // 再次检查：算上为了绕回而产生的 padding 浪费，总空间还够不够？
-                if (w + tail_free + len - r > size_) {
-                    return nullptr;
+                // 2. 物理尾部空间不够，必须绕回 (Wrap around)
+                // 再次检查逻辑空间 (加上绕回产生的 padding 浪费后) 是否够用
+                if (w + tail_free + len - cached_read_index_ > size_) {
+                    cached_read_index_ = read_index_.load(std::memory_order_acquire);
+                    if (w + tail_free + len - cached_read_index_ > size_) {
+                        return nullptr;
+                    }
                 }
 
                 constexpr uint32_t HEADER_SIZE = sizeof(LogEntryHeader);
 
-                // 写入 Padding（如果尾部连一个 Header 都放不下，就不写，依赖消费端的隐式跳过）
+                // 写入 Padding 占位符
                 if (tail_free >= HEADER_SIZE) {
                     write_padding_local(phys_w, tail_free);
                 }
 
-                // 推进逻辑写下标，补齐到物理 0 处
+                // 推进逻辑写下标，补齐到下一圈的物理 0 处
                 w += tail_free;
 
-                // 提前提交 padding 给消费者可见 (Release 语义)
+                // 提前发布 Padding，让消费者可以看到绕回动作
                 write_index_.store(w, std::memory_order_release);
 
-                // 绕回后，从头部物理 0 处分配
                 return buffer_.data();
             }
 
-            // 提交数据，使其对消费者可见
             inline void commit(uint32_t len) {
                 uint64_t w = write_index_.load(std::memory_order_relaxed);
-                w += len; // 逻辑下标单调递增
+                w += len;
                 write_index_.store(w, std::memory_order_release);
             }
 
-            // 尝试读取数据
+            // ------------------------------------------------------------------------
+            // 后台（消费者）接口
+            // ------------------------------------------------------------------------
             LogEntryHeader* try_read() {
-                // 单读者：read_index_ 用 relaxed；需 acquire write_index_ 获取生产者最新提交
-                uint64_t r = read_index_.load(std::memory_order_relaxed);
-                uint64_t w = write_index_.load(std::memory_order_acquire);
+                // 【核心黑科技 3：消费者全本地化】
+                // 消费者直接使用本地游标 local_read_index_，完全避开 atomic load
+                uint64_t r = local_read_index_;
+
+                if (r >= cached_write_index_) {
+                    cached_write_index_ = write_index_.load(std::memory_order_acquire);
+                    if (r >= cached_write_index_) {
+                        return nullptr;
+                    }
+                }
 
                 constexpr int MAX_SKIPS = 8;
                 int skips = 0;
 
-                while (skips < MAX_SKIPS && r < w) {
+                while (skips < MAX_SKIPS && r < cached_write_index_) {
                     uint32_t phys_r = r & mask_;
                     uint32_t tail_avail = size_ - phys_r;
                     constexpr uint32_t HEADER_SIZE = sizeof(LogEntryHeader);
 
-                    // 1. 隐式 Padding 处理：如果尾部连 Header 都读不全，说明生产者直接绕回了
+                    // 1. 隐式 Padding：尾部连 Header 都读不全
                     if (tail_avail < HEADER_SIZE) {
-                        r += tail_avail; // 逻辑推进到下一圈的 0
+                        r += tail_avail;
+                        local_read_index_ = r;
+                        // 绕回时为了防止生产者卡死，强制推送一次游标
                         read_index_.store(r, std::memory_order_release);
-                        continue; // 重新评估 r < w
+                        continue;
                     }
 
                     LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(buffer_.data() + phys_r);
 
-                    // 2. 显式 Padding 处理
+                    // 2. 显式 Padding
                     if (header->log_id == PADDING_ID) {
                         uint32_t claimed = header->total_size;
-                        // 安全校验，防止脏数据死循环
-                        if (claimed < HEADER_SIZE || claimed > tail_avail) {
-                            return nullptr;
-                        }
+                        if (claimed < HEADER_SIZE || claimed > tail_avail) return nullptr;
                         r += claimed;
+                        local_read_index_ = r;
+                        // 遇到大块 padding 强制推送，迅速释放空间
                         read_index_.store(r, std::memory_order_release);
                         ++skips;
                         continue;
                     }
 
-                    // 3. 拦截未 Commit 的数据 (极其重要)
-                    // 虽然生产者写入了 Header，但可能还没调用 commit(len)，
-                    // 此时 `w` 还没有包容整个 message 的长度。必须等待 commit 推进 `w`。
-                    if (r + header->total_size > w) {
-                        return nullptr;
+                    // 3. 拦截未完全 Commit 的块
+                    if (r + header->total_size > cached_write_index_) {
+                        cached_write_index_ = write_index_.load(std::memory_order_acquire);
+                        if (r + header->total_size > cached_write_index_) {
+                            return nullptr;
+                        }
                     }
 
                     return header;
@@ -1018,30 +1048,41 @@ namespace zrlog {
                 return nullptr;
             }
 
-            // 消费完毕，推进读游标
             inline void consume(uint32_t len) {
-                uint64_t r = read_index_.load(std::memory_order_relaxed);
-                r += len; // 逻辑下标单调递增
-                read_index_.store(r, std::memory_order_release);
+                local_read_index_ += len;
+
+                // 【核心黑科技 4：游标批量提交 (Batch Commit)】
+                // 避免消费者疯狂 store 导致生产者 L1 Cache 失效。
+                // 每积攒 4096 字节（4KB）才提交一次给生产者看。
+                // 利用极速位运算判断是否跨越了 4096 边界 (0xFFF = 4095)。
+                if ((local_read_index_ & 0xFFF) < len) {
+                    read_index_.store(local_read_index_, std::memory_order_release);
+                }
             }
 
+            // 在消费者准备休眠、或者退出前必须调用，确保存留的进度被完全推送给生产者
+            inline void flush_consume() {
+                if (read_index_.load(std::memory_order_relaxed) != local_read_index_) {
+                    read_index_.store(local_read_index_, std::memory_order_release);
+                }
+            }
+
+            // ------------------------------------------------------------------------
+            // 杂项与监控接口
+            // ------------------------------------------------------------------------
             inline bool should_deallocate() const { 
                 return should_deallocate_; 
             }
-
             inline void mark_deallocate() { 
                 should_deallocate_ = true; 
             }
-
             inline uint32_t capacity() const { 
                 return size_; 
             }
 
-            // O(1) 的空间预估
             inline uint32_t estimate_used_space() const {
                 uint64_t w = write_index_.load(std::memory_order_acquire);
                 uint64_t r = read_index_.load(std::memory_order_acquire);
-                // 防止多线程下 r 和 w 的瞬间错位导致负数
                 return (w > r) ? static_cast<uint32_t>(w - r) : 0;
             }
 
@@ -1081,17 +1122,28 @@ namespace zrlog {
                 p->thread_id = 0;
             }
 
-            // ----------------- 内存对齐，防止伪共享 (False Sharing) -----------------
-            alignas(64) std::atomic<uint64_t> write_index_{ 0 };
-            char pad1[64 - sizeof(std::atomic<uint64_t>)];
+            // =========================================================================
+            // 【核心黑科技 5：极其严格的缓存行物理隔离】
+            // C++17 alignas 将自动填充字节，彻底杜绝 False Sharing
+            // =========================================================================
 
-            alignas(64) std::atomic<uint64_t> read_index_{ 0 };
-            char pad2[64 - sizeof(std::atomic<uint64_t>)];
+            // --- 生产者独占缓存行 (写入端) ---
+            // 内存对齐并独占一行，只有前端线程会高频读写这里的变量
+            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_ = 0;
+            uint64_t                 cached_read_index_ = 0;
 
-            uint32_t size_;
-            uint32_t mask_;
-            std::vector<char> buffer_;
-            bool should_deallocate_ = false;
+            // --- 消费者独占缓存行 (读取端) ---
+            // 物理隔离！只有后台消费者线程会高频读写这里的变量
+            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_ = 0;
+            uint64_t                 cached_write_index_ = 0;
+            uint64_t                 local_read_index_ = 0;
+
+            // --- 其他共享元数据 ---
+            // 独立在一行，防止被游标的高频变动波及
+            alignas(CACHE_LINE_SIZE) uint32_t size_;
+            uint32_t                 mask_;
+            std::vector<char>        buffer_;
+            bool                     should_deallocate_ = false;
         };
 
         class ThreadBufferDestroyer {
@@ -1204,6 +1256,9 @@ namespace zrlog {
                     tb->consume(header->total_size);
                 }
 
+                // 一轮消费完了，如果是最后的数据，强制把游标更新出去
+                tb->flush_consume();
+
                 if (tb->should_deallocate() && tb->estimate_used_space() == 0) {
                     delete tb;
                     it = thread_buffers_bg_.erase(it);
@@ -1273,17 +1328,18 @@ namespace zrlog {
 
         std::mutex              idle_wait_mutex_;
         std::condition_variable idle_wait_condition_;
-        std::atomic<bool>       idle_wait_flag_ = false;
+        // 强制独占一个缓存行，不和 mutex 沾边
+        alignas(CACHE_LINE_SIZE) std::atomic<bool> idle_wait_flag_ = false;
 
     public:
         //statistics
-        std::atomic<uint64_t>  stat_produce_count_{ 0 };
-        std::atomic<uint64_t>  stat_produce_valid_count_{ 0 };
-        std::atomic<uint64_t>  stat_consume_count_{ 0 };
-        std::atomic<uint64_t>  stat_consume_valid_count_{ 0 };
+        std::atomic<uint64_t>  stat_produce_count_ = 0;
+        std::atomic<uint64_t>  stat_produce_valid_count_ = 0;
+        std::atomic<uint64_t>  stat_consume_count_ = 0;
+        std::atomic<uint64_t>  stat_consume_valid_count_ = 0;
     };
 
-    ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer *NanoLogger::thread_buffer_ = nullptr;
+    ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
     thread_local NanoLogger::ThreadBufferDestroyer NanoLogger::thread_buffer_destroyer_;
 }
 
