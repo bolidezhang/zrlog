@@ -1,5 +1,9 @@
 ﻿#pragma once
 
+// The zrlog library version in the form major * 10000 + minor * 100 + patch.
+// 如：2.0.2 
+#define ZRLOG_VERSION 20002
+
 // ============================================================================
 // 引入 fmtlib (Header-Only 模式 & 编译期优化支持)
 // ============================================================================
@@ -1264,6 +1268,8 @@ namespace zrlog {
         NanoLogger() {
             TscClock::instance();
             global_log_metas_.reserve(1000);
+            thread_buffers_.reserve(100);
+            thread_buffers_bg_.reserve(100);
         }
         ~NanoLogger() {
             fini();
