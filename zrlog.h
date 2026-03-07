@@ -1,5 +1,9 @@
 ﻿#pragma once
 
+// The zrlog library version in the form major * 10000 + minor * 100 + patch.
+// 如：1.6.2 
+#define ZRLOG_VERSION 10602
+
 #include <vector>
 #include <list>
 #include <thread>
@@ -484,7 +488,8 @@ namespace zrlog {
         class IOBuffer;
         struct LogMeta;
         struct LogEntryHeader;
-        using DecoderFn = void(*)(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, IOBuffer& out);
+        // Decoder 签名新增 thread_id 参数，避免在每条 Header 中重复存储
+        using DecoderFn = void(*)(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out);
 
         struct LogMeta {
             uint32_t    id;
@@ -496,11 +501,11 @@ namespace zrlog {
             DecoderFn   decoder;
         };
 
+        // 【极限压缩】将 LogEntryHeader 压缩至 16 字节，大幅提升缓存命中率与容量
         struct LogEntryHeader {
             uint32_t total_size;
             uint32_t log_id;
             uint64_t time;
-            uint64_t thread_id;
         };
 
         class IOBuffer {
@@ -743,7 +748,6 @@ namespace zrlog {
                 header->total_size = total_size;
                 header->log_id = log_id;
                 header->time = TscClock::now_ns_i();
-                header->thread_id = get_thread_id();
                 serialize_args(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
                 buffer->commit(total_size);
                 //stat_produce_valid_count_.fetch_add(1, std::memory_order_relaxed);
@@ -857,7 +861,6 @@ namespace zrlog {
             else {
                 out.advance(len);
             }
-            //out << "\n";
             out << '\n';
         }
 
@@ -901,7 +904,7 @@ namespace zrlog {
         }
 
         template<typename... Args>
-        static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, IOBuffer& out) {
+        static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
             // 1. 解码用户参数 (只包含日志内容参数，不包含头部)
             auto args_tuple = detail::TupleDeserializer<typename std::decay<Args>::type...>::apply(buffer);
 
@@ -910,7 +913,7 @@ namespace zrlog {
 
             // 3. 格式化固定头部 (Level, ThreadID, File:Line)
             out << loglevel_to_string(meta.level) << " "
-                << header.thread_id << " "
+                << thread_id << " "
                 << meta.file << ":" << meta.line << " ";
 
             // 4. 格式化用户日志内容
@@ -920,17 +923,28 @@ namespace zrlog {
         
         class ThreadBuffer {
         public:
-            explicit ThreadBuffer(uint32_t size) : size_(normalize_size(size)) {
+            explicit ThreadBuffer(uint32_t size, uint64_t tid) : size_(normalize_size(size)), thread_id_(tid) {
                 mask_ = size_ - 1;
                 buffer_.resize(size_);
 
                 // 【核心黑科技 1：消除 Max 级毛刺】
                 // 内存预热 (Pre-faulting)：强制操作系统立即分配并映射真实的物理内存页。
                 // 彻底杜绝在极速打印日志时触发 Page Fault (缺页中断) 导致的巨大抖动。
-                std::memset(buffer_.data(), 0, size_);
+                //std::memset(buffer_.data(), 0, size_);
+
+                // 【核心黑科技：按页预热 Fast Page Pre-faulting】
+                // 每 4096 字节写一个 0，强迫操作系统映射所有物理页，比全量 memset 快几倍
+                volatile char *p = buffer_.data();
+                for (size_t i = 0; i < size_; i += 4096) {
+                    p[i] = 0;
+                }
             }
 
             ~ThreadBuffer() = default;
+
+            inline uint64_t thread_id() const {
+                return thread_id_;
+            }
 
             // ------------------------------------------------------------------------
             // 前端（生产者）接口
@@ -1119,7 +1133,6 @@ namespace zrlog {
                 p->log_id = PADDING_ID;
                 p->total_size = pad_size;
                 p->time = 0;
-                p->thread_id = 0;
             }
 
             // =========================================================================
@@ -1129,21 +1142,22 @@ namespace zrlog {
 
             // --- 生产者独占缓存行 (写入端) ---
             // 内存对齐并独占一行，只有前端线程会高频读写这里的变量
-            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_ = 0;
-            uint64_t                 cached_read_index_ = 0;
+            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
+            uint64_t                 cached_read_index_{ 0 };
 
             // --- 消费者独占缓存行 (读取端) ---
             // 物理隔离！只有后台消费者线程会高频读写这里的变量
-            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_ = 0;
-            uint64_t                 cached_write_index_ = 0;
-            uint64_t                 local_read_index_ = 0;
+            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
+            uint64_t                 cached_write_index_{ 0 };
+            uint64_t                 local_read_index_{ 0 };
 
             // --- 其他共享元数据 ---
             // 独立在一行，防止被游标的高频变动波及
             alignas(CACHE_LINE_SIZE) uint32_t size_;
             uint32_t                 mask_;
+            uint64_t                 thread_id_;
             std::vector<char>        buffer_;
-            bool                     should_deallocate_ = false;
+            bool                     should_deallocate_{ false };
         };
 
         class ThreadBufferDestroyer {
@@ -1190,7 +1204,7 @@ namespace zrlog {
 
             ThreadBuffer* get_thread_buffer() {
             if (nullptr == thread_buffer_) {
-                thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size);
+                thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size, get_thread_id());
                 thread_buffer_destroyer_.init();
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
                 thread_buffers_.push_back(thread_buffer_);
@@ -1211,18 +1225,20 @@ namespace zrlog {
                 }
             }
             {
-                //追加ThreadBuffer到后台集合thread_buffers_bg_
+                // 【连续内存预取】将新增的 Buffer 高效转移到后台集合
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
                 if (!thread_buffers_.empty()) {
-                    thread_buffers_bg_.splice(thread_buffers_bg_.end(), thread_buffers_);
+                    thread_buffers_bg_.insert(thread_buffers_bg_.end(), thread_buffers_.begin(), thread_buffers_.end());
+                    thread_buffers_.clear();
                 }
             }
 
             LogEntryHeader *header;
-            auto it = thread_buffers_bg_.begin();
-            while (it != thread_buffers_bg_.end()) {
-                ThreadBuffer *tb = *it;
+            // 【O(1) 遍历与删除】利用 vector 和 swap-and-pop 提升 CPU 预取命中率
+            for (size_t i = 0; i < thread_buffers_bg_.size(); ) {
+                ThreadBuffer *tb = thread_buffers_bg_[i];
                 uint32_t quota = full_drain ? UINT32_MAX : config_.per_thread_quota;
+
                 while ((quota > 0) && (header = tb->try_read())) {
                     stat_consume_count_.fetch_add(1, std::memory_order_relaxed);
                     ++processed_count;
@@ -1231,7 +1247,7 @@ namespace zrlog {
                     if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
                         const LogMeta& meta = local_log_metas[header->log_id - 1];
                         char *args_ptr = (char *)header + sizeof(LogEntryHeader);
-                        meta.decoder(args_ptr, meta, *header, io_buf);
+                        meta.decoder(args_ptr, meta, *header, tb->thread_id(), io_buf);
                         stat_consume_valid_count_.fetch_add(1, std::memory_order_relaxed);
                     } 
                     else {  //header->log_id 无效时
@@ -1248,7 +1264,7 @@ namespace zrlog {
                         if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
                             const LogMeta& meta = local_log_metas[header->log_id - 1];
                             char *args_ptr = (char *)header + sizeof(LogEntryHeader);
-                            meta.decoder(args_ptr, meta, *header, io_buf);
+                            meta.decoder(args_ptr, meta, *header, tb->thread_id(), io_buf);
                             stat_consume_valid_count_.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
@@ -1261,10 +1277,16 @@ namespace zrlog {
 
                 if (tb->should_deallocate() && tb->estimate_used_space() == 0) {
                     delete tb;
-                    it = thread_buffers_bg_.erase(it);
+
+                    // 用尾部元素覆盖当前元素，然后 pop_back，避免 vector 整体搬移！
+                    if (i != thread_buffers_bg_.size() - 1) {
+                        thread_buffers_bg_[i] = thread_buffers_bg_.back();
+                    }
+                    thread_buffers_bg_.pop_back();
+                    // 注意这里不 ++i，因为当前位置 i 已经被塞入了新的尾部元素，下一轮还要检查它
                 }
                 else {
-                    ++it;
+                    ++i;
                 }
             }
 
@@ -1281,6 +1303,7 @@ namespace zrlog {
                 if (process_count < 1) {  //idle
                     io_buf.flush_to_os();
                     TscClock::instance().sync_system_time();
+
                     idle_wait_flag_.store(true, std::memory_order_relaxed);
                     {
                         std::unique_lock<std::mutex> lock(idle_wait_mutex_);
@@ -1307,6 +1330,8 @@ namespace zrlog {
         NanoLogger() {
             TscClock::instance();
             global_log_metas_.reserve(1000);
+            thread_buffers_.reserve(100);
+            thread_buffers_bg_.reserve(100);
         }
         ~NanoLogger() {
             fini();
@@ -1319,24 +1344,24 @@ namespace zrlog {
         SpinMutex log_metas_mutex_;
         std::vector<LogMeta> global_log_metas_;
         SpinMutex thread_buffers_mutex_;
-        std::list<ThreadBuffer*> thread_buffers_;
-        std::list<ThreadBuffer*> thread_buffers_bg_;
+        std::vector<ThreadBuffer*> thread_buffers_;
+        std::vector<ThreadBuffer*> thread_buffers_bg_;
 
         std::unique_ptr<ILogAppender> appender_;
         std::thread log_thread_;
-        std::atomic<bool> log_thread_running_ = false;
+        std::atomic<bool> log_thread_running_ { false };
 
         std::mutex              idle_wait_mutex_;
         std::condition_variable idle_wait_condition_;
         // 强制独占一个缓存行，不和 mutex 沾边
-        alignas(CACHE_LINE_SIZE) std::atomic<bool> idle_wait_flag_ = false;
+        alignas(CACHE_LINE_SIZE) std::atomic<bool> idle_wait_flag_{ false };
 
     public:
         //statistics
-        std::atomic<uint64_t>  stat_produce_count_ = 0;
-        std::atomic<uint64_t>  stat_produce_valid_count_ = 0;
-        std::atomic<uint64_t>  stat_consume_count_ = 0;
-        std::atomic<uint64_t>  stat_consume_valid_count_ = 0;
+        std::atomic<uint64_t>  stat_produce_count_{ 0 };
+        std::atomic<uint64_t>  stat_produce_valid_count_{ 0 };
+        std::atomic<uint64_t>  stat_consume_count_{ 0 };
+        std::atomic<uint64_t>  stat_consume_valid_count_{ 0 };
     };
 
     ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;

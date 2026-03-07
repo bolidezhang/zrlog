@@ -291,6 +291,7 @@ int main(int argc, char* argv[]) {
 
     // Run benchmarks
     benchmark_clock();
+    //benchmark_frontend_latency(10);
     benchmark_frontend_latency(500000);
     benchmark_message_types(100000);
     benchmark_throughput(5000000);
