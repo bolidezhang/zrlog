@@ -75,7 +75,7 @@ endif
 #INCS := -I/usr/include/g++-2 -I/usr/local/include
 INCS := -I./ -I./fmt/include -I/usr/local/include
 
-LIBS := -L/usr/lib -lpthread -lrt 
+LIBS := -L/usr/lib -lpthread
 
 #****************************************************************************
 # Makefile code common to all platforms
