@@ -1,5 +1,12 @@
 ﻿#pragma once
 
+// ============================================================================
+// 引入 fmtlib (Header-Only 模式 & 编译期优化支持)
+// ============================================================================
+#define FMT_HEADER_ONLY
+#include <fmt/format.h>
+#include <fmt/compile.h>  // 必须引入，以支持 FMT_COMPILE 宏
+
 #include <vector>
 #include <list>
 #include <thread>
@@ -23,9 +30,9 @@
 
 // 获取当前 CPU 架构的 L1 Cache Line 大小 (C++17)
 #ifdef __cpp_lib_hardware_interference_size
-    constexpr size_t CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
+constexpr size_t CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
 #else
-    constexpr size_t CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
+constexpr size_t CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 #endif
 
 // ---------------------------------------------------------------------------
@@ -228,8 +235,6 @@ namespace zrlog {
     public:
         TscClock(const TscClock&) = delete;
         TscClock& operator=(const TscClock&) = delete;
-        TscClock(TscClock&&) = delete;
-        TscClock& operator=(TscClock&&) = delete;
 
         struct Anchor {
             uint64_t base_ns = 0;
@@ -407,7 +412,7 @@ namespace zrlog {
         virtual ~ILogAppender() = default;
 
         int writen(const char* data, size_t len) {
-            char *ptr = const_cast<char*>(data);
+            char* ptr = const_cast<char*>(data);
             size_t nleft = len;
             int ret;
 
@@ -484,7 +489,8 @@ namespace zrlog {
         class IOBuffer;
         struct LogMeta;
         struct LogEntryHeader;
-        using DecoderFn = void(*)(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, IOBuffer& out);
+        // Decoder 签名新增 thread_id 参数，避免在每条 Header 中重复存储
+        using DecoderFn = void(*)(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out);
 
         struct LogMeta {
             uint32_t    id;
@@ -492,15 +498,14 @@ namespace zrlog {
             const char* file;
             uint32_t    line;
             const char* func;
-            std::string format;
-            DecoderFn   decoder;
+            DecoderFn   decoder; // 格式化字符串已被 FMT_COMPILE 吸收，无需 std::string format
         };
 
+        // 【极限压缩】将 LogEntryHeader 压缩至 16 字节，大幅提升缓存命中率与容量
         struct LogEntryHeader {
             uint32_t total_size;
             uint32_t log_id;
             uint64_t time;
-            uint64_t thread_id;
         };
 
         class IOBuffer {
@@ -544,55 +549,6 @@ namespace zrlog {
             }
             void advance(size_t len) {
                 pos_ += len;
-            }
-
-            IOBuffer& operator<<(char c) {
-                if (available_size() < 1) {
-                    flush_to_os();
-                }
-                data_[pos_++] = c;
-                return *this;
-            }
-            IOBuffer& operator<<(const char* str) {
-                if (str) {
-                    append(str, std::strlen(str));
-                }
-                return *this;
-            }
-            IOBuffer& operator<<(const std::string& str) {
-                append(str.data(), str.size());
-                return *this;
-            }
-            template <typename T>
-            typename std::enable_if<std::is_integral<T>::value, IOBuffer&>::type operator<<(T val) {
-                if (available_size() < 32) {
-                    flush_to_os();
-                }
-                auto res = std::to_chars(current_ptr(), data_.data() + size_, val);
-                if (res.ec == std::errc()) {
-                    advance(res.ptr - current_ptr());
-                }
-                return *this;
-            }
-            IOBuffer& operator<<(float val) {
-                if (available_size() < 64) {
-                    flush_to_os();
-                }
-                auto res = std::to_chars(current_ptr(), data_.data() + size_, val);
-                if (res.ec == std::errc()) {
-                    advance(res.ptr - current_ptr());
-                }
-                return *this;
-            }
-            IOBuffer& operator<<(double val) {
-                if (available_size() < 64) {
-                    flush_to_os();
-                }
-                auto res = std::to_chars(current_ptr(), data_.data() + size_, val);
-                if (res.ec == std::errc()) {
-                    advance(res.ptr - current_ptr());
-                }
-                return *this;
             }
 
         private:
@@ -656,81 +612,83 @@ namespace zrlog {
         }
 
         // ========================================================================
-        // Frontend
+        // Frontend: 接收由宏传入的 FmtProvider (包含编译期的 FMT_COMPILE 结构)
         // ========================================================================
-        template<typename... Args>
+        template<typename FmtProvider, typename... Args>
         bool log(std::atomic<uint32_t>& log_id_atom, LogLevel level, const char* file, uint32_t line,
-            const char* func, const char* format, Args&&... args) {
+            const char* func, Args&&... args) {
 
             uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
             if (0 == log_id) {
-                log_id = register_log_meta<Args...>(log_id_atom, level, file, line, func, format);
+                // 将 FmtProvider 一同注入模板实例化
+                log_id = register_log_meta<FmtProvider, typename std::decay<Args>::type...>(
+                    log_id_atom, level, file, line, func);
             }
 
             ThreadBuffer* buffer = get_thread_buffer();
             if (nullptr != buffer) {
-                //stat_produce_count_.fetch_add(1, std::memory_order_relaxed);
                 uint32_t args_size = calculate_args_size(args...);
                 uint32_t total_size = sizeof(LogEntryHeader) + args_size;
-                char *ptr = buffer->alloc(total_size);
+                char* ptr = buffer->alloc(total_size);
+
                 if (nullptr == ptr) {
                     switch (config_.buffer_full_policy) {
                     case BufferFullPolicy::Discard:
                         return false;
 
                     case BufferFullPolicy::Block: {
-                            // 兜底：如果后台消费者线程碰巧在休眠，强制唤醒它赶紧消费腾出空间
-                            notify_consumer();
+                        // 兜底：如果后台消费者线程碰巧在休眠，强制唤醒它赶紧消费腾出空间
+                        notify_consumer();
 
-                            uint32_t spin_count = 0;
-                            do {
-                                // 如果后端线程已经停止，避免死循环
-                                if (!log_thread_running_.load(std::memory_order_relaxed)) {
-                                    return false;
-                                }
+                        uint32_t spin_count = 0;
+                        do {
+                            // 如果后端线程已经停止，避免死循环
+                            if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                                return false;
+                            }
 
-                                // 智能退避算法 (Adaptive Backoff)
-                                if (spin_count < 256) {
-                                    ZRLOG_CPU_PAUSE(); // 前256次仅做CPU级自旋，避免上下文切换的重负载
-                                }
-                                else {
-                                    std::this_thread::yield(); // 之后让出线程时间片，防止前端线程把CPU跑满100%导致消费者饿死
-                                }
+                            // 智能退避算法 (Adaptive Backoff)
+                            if (spin_count < 256) {
+                                ZRLOG_CPU_PAUSE(); // 前256次仅做CPU级自旋，避免上下文切换的重负载
+                            }
+                            else {
+                                std::this_thread::yield(); // 之后让出线程时间片，防止前端线程把CPU跑满100%导致消费者饿死
+                            }
 
-                                ++spin_count;
-                                ptr = buffer->alloc(total_size); // 重新尝试分配
-                            } while (nullptr == ptr);
-                        }
-                        break;
+                            ++spin_count;
+                            ptr = buffer->alloc(total_size); // 重新尝试分配
+                        } while (nullptr == ptr);
+                    }
+                    break;
 
                     case BufferFullPolicy::Retry: {
-                            // 兜底：如果后台消费者线程碰巧在休眠，强制唤醒它赶紧消费腾出空间
-                            notify_consumer();
+                        // 兜底：如果后台消费者线程碰巧在休眠，强制唤醒它赶紧消费腾出空间
+                        notify_consumer();
 
-                            uint32_t spin_count = 0;
-                            do {
-                                // 如果后端线程已经停止，避免死循环
-                                if (!log_thread_running_.load(std::memory_order_relaxed)) {
-                                    return false;
-                                }
+                        uint32_t spin_count = 0;
+                        do {
+                            // 如果后端线程已经停止，避免死循环
+                            if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                                return false;
+                            }
 
-                                if (spin_count >= config_.buffer_full_retry_count) {
-                                    return false; // 策略3：超过重试次数，最终丢弃
-                                }
+                            if (spin_count >= config_.buffer_full_retry_count) {
+                                return false; // 策略3：超过重试次数，最终丢弃
+                            }
 
-                                // 智能退避算法 (Adaptive Backoff)
-                                if (spin_count < 256) {
-                                    ZRLOG_CPU_PAUSE(); // 前256次仅做CPU级自旋，避免上下文切换的重负载
-                                }
-                                else {
-                                    std::this_thread::yield(); // 之后让出线程时间片，防止前端线程把CPU跑满100%导致消费者饿死
-                                }
+                            // 智能退避算法 (Adaptive Backoff)
+                            if (spin_count < 256) {
+                                ZRLOG_CPU_PAUSE(); // 前256次仅做CPU级自旋，避免上下文切换的重负载
+                            }
+                            else {
+                                std::this_thread::yield(); // 之后让出线程时间片，防止前端线程把CPU跑满100%导致消费者饿死
+                            }
 
-                                ++spin_count;
-                                ptr = buffer->alloc(total_size); // 重新尝试分配
-                            } while (nullptr == ptr);
-                        }
-                        break;
+                            ++spin_count;
+                            ptr = buffer->alloc(total_size); // 重新尝试分配
+                        } while (nullptr == ptr);
+                    }
+                    break;
 
                     default:
                         return false;
@@ -739,14 +697,12 @@ namespace zrlog {
                 }
 
                 // 如果走到这里，说明 ptr 必然不为 nullptr (分配成功)
-                LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
+                LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(ptr);
                 header->total_size = total_size;
                 header->log_id = log_id;
                 header->time = TscClock::now_ns_i();
-                header->thread_id = get_thread_id();
                 serialize_args(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
                 buffer->commit(total_size);
-                //stat_produce_valid_count_.fetch_add(1, std::memory_order_relaxed);
                 notify_consumer();
 
                 return true;
@@ -802,7 +758,7 @@ namespace zrlog {
             else {
                 *reinterpret_cast<char*>(ptr + sizeof(uint32_t)) = '\0';
             }
-           serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
+            serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
         }
         template<typename... Rest>
         static void serialize_args(char* ptr, const std::string& val, Rest&&... rest) {
@@ -826,111 +782,104 @@ namespace zrlog {
         }
 
         // ========================================================================
-        // Backend
+        // Backend: 彻底替换 snprintf，并实现无分支连续格式化流
         // ========================================================================
+        template<typename FmtProvider, typename Tuple, std::size_t... Is>
+        static void format_log_impl(IOBuffer& out,
+            fmt::string_view time_str, uint32_t nano,
+            const char* level_str, uint64_t tid,
+            const char* file, uint32_t line,
+            const Tuple& t, detail::index_sequence<Is...>) {
 
-        template<typename Tuple, std::size_t... Is>
-        static void format_log_impl(IOBuffer& out, const char* fmt, const Tuple& t, detail::index_sequence<Is...>) {
             size_t space = out.available_size();
-            if (space < 256) {
+            if (space < 1024) {
                 out.flush_to_os();
                 space = out.available_size();
             }
+            char* p = out.current_ptr();
 
-            char* ptr = out.current_ptr();
-            // Tuple 元素中的 string/string_view 已被 decode_val 转换为 const char*
-            int len = snprintf(ptr, space, fmt, std::get<Is>(t)...);
-            if (len < 0) {
-                return;
-            }
+            // 【究极形态】：1 次极速调用，前缀参数和用户参数 std::get<Is>(t)... 完美融合！
+            auto res = fmt::format_to_n(p, space - 1, FmtProvider::compile(),
+                time_str, nano, level_str, tid, file, line,
+                std::get<Is>(t)...);
 
-            if (static_cast<size_t>(len) >= space) {
+            if (res.size >= space - 1) {
                 out.flush_to_os();
                 space = out.available_size();
-                ptr = out.current_ptr();
-                int retry_len = snprintf(ptr, space, fmt, std::get<Is>(t)...);
-                if (retry_len > 0) {
-                    size_t written = (static_cast<size_t>(retry_len) < space) ? static_cast<size_t>(retry_len) : (space - 1);
-                    out.advance(written);
-                }
+                p = out.current_ptr();
+
+                res = fmt::format_to_n(p, space - 1, FmtProvider::compile(),
+                    time_str, nano, level_str, tid, file, line,
+                    std::get<Is>(t)...);
+
+                size_t written = (res.size < space - 1) ? res.size : (space - 1);
+                p[written] = '\n';
+                out.advance(written + 1);
             }
             else {
-                out.advance(len);
+                // 安全追加换行符并推进指针
+                p[res.size] = '\n';
+                out.advance(res.size + 1);
             }
-            //out << "\n";
-            out << '\n';
         }
 
+        template<typename FmtProvider, typename... Args>
+        static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
 
-        static void format_timestamp(IOBuffer& out, uint64_t ns_time) {
-            // 缓存秒级字符串: "YYYY-MM-DD HH:MM:SS" (19 chars)
+            // 1. 获取缓存的秒级时间字符串 (19 bytes)
             static thread_local time_t cache_sec = 0;
-            static thread_local char cache_str[20] = { 0 }; // 19 + 1(\0)
-
-            time_t sec = static_cast<time_t>(ns_time / 1000000000);
+            static thread_local char cache_str[20] = { 0 };
+            time_t sec = static_cast<time_t>(header.time / 1000000000);
             if (sec != cache_sec) {
-                struct tm t;
-                zrlog_gmtime(&sec, &t);
-
-                // 手动格式化，移除 snprintf
-                // format: YYYY-MM-DD HH:MM:SS
-                detail::fast_u32_to_4digits(cache_str, t.tm_year + 1900);
+                struct tm tm_buf;
+                zrlog_gmtime(&sec, &tm_buf);
+                detail::fast_u32_to_4digits(cache_str, tm_buf.tm_year + 1900); 
                 cache_str[4] = '-';
-                detail::fast_u32_to_2digits(cache_str + 5, t.tm_mon + 1);
+                detail::fast_u32_to_2digits(cache_str + 5, tm_buf.tm_mon + 1); 
                 cache_str[7] = '-';
-                detail::fast_u32_to_2digits(cache_str + 8, t.tm_mday);
+                detail::fast_u32_to_2digits(cache_str + 8, tm_buf.tm_mday);    
                 cache_str[10] = ' ';
-                detail::fast_u32_to_2digits(cache_str + 11, t.tm_hour);
+                detail::fast_u32_to_2digits(cache_str + 11, tm_buf.tm_hour);   
                 cache_str[13] = ':';
-                detail::fast_u32_to_2digits(cache_str + 14, t.tm_min);
+                detail::fast_u32_to_2digits(cache_str + 14, tm_buf.tm_min);    
                 cache_str[16] = ':';
-                detail::fast_u32_to_2digits(cache_str + 17, t.tm_sec);
-                cache_str[19] = '\0'; // 虽然后面是 append(ptr, len) 不依赖 \0，但保留是个好习惯
-
+                detail::fast_u32_to_2digits(cache_str + 17, tm_buf.tm_sec);
+                cache_str[19] = '\0';
                 cache_sec = sec;
             }
-            out.append(cache_str, 19);
-            out << '.';
+            uint32_t nano = header.time % 1000000000;
 
-            // 纳秒部分: 9位补零
-            uint64_t nano = ns_time % 1000000000;
-            char nano_buf[10]; // 9 + 1
-            detail::fast_u64_to_9digits(nano_buf, nano);
-            out.append(nano_buf, 9);
-            out << ' ';
-        }
-
-        template<typename... Args>
-        static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, IOBuffer& out) {
-            // 1. 解码用户参数 (只包含日志内容参数，不包含头部)
+            // 2. 解码用户参数 (只包含日志内容参数，不包含头部)
             auto args_tuple = detail::TupleDeserializer<typename std::decay<Args>::type...>::apply(buffer);
 
-            // 2. 格式化时间戳
-            format_timestamp(out, header.time);
-
-            // 3. 格式化固定头部 (Level, ThreadID, File:Line)
-            out << loglevel_to_string(meta.level) << " "
-                << header.thread_id << " "
-                << meta.file << ":" << meta.line << " ";
-
-            // 4. 格式化用户日志内容
-            format_log_impl(out, meta.format.c_str(), args_tuple,
+            // 3. 传入前缀所需的所有实际参数
+            format_log_impl<FmtProvider>(out,
+                fmt::string_view(cache_str, 19), nano,
+                loglevel_to_string(meta.level), thread_id,
+                meta.file, meta.line,
+                args_tuple,
                 detail::make_index_sequence<std::tuple_size<decltype(args_tuple)>::value>{});
         }
-        
+
         class ThreadBuffer {
         public:
-            explicit ThreadBuffer(uint32_t size) : size_(normalize_size(size)) {
+            explicit ThreadBuffer(uint32_t size, uint64_t tid) : size_(normalize_size(size)), thread_id_(tid) {
                 mask_ = size_ - 1;
                 buffer_.resize(size_);
 
-                // 【核心黑科技 1：消除 Max 级毛刺】
-                // 内存预热 (Pre-faulting)：强制操作系统立即分配并映射真实的物理内存页。
-                // 彻底杜绝在极速打印日志时触发 Page Fault (缺页中断) 导致的巨大抖动。
-                std::memset(buffer_.data(), 0, size_);
+                // 【核心黑科技：按页预热 Fast Page Pre-faulting】
+                // 每 4096 字节写一个 0，强迫操作系统映射所有物理页，比全量 memset 快几倍
+                volatile char* p = buffer_.data();
+                for (size_t i = 0; i < size_; i += 4096) {
+                    p[i] = 0;
+                }
             }
 
             ~ThreadBuffer() = default;
+
+            inline uint64_t thread_id() const { 
+                return thread_id_; 
+            }
 
             // ------------------------------------------------------------------------
             // 前端（生产者）接口
@@ -938,7 +887,7 @@ namespace zrlog {
             char* alloc(uint32_t len) {
                 uint64_t w = write_index_.load(std::memory_order_relaxed);
 
-                // 【核心黑科技 2：消除 P99 抖动】
+                // 【核心黑科技：消除 P99 抖动】
                 // 使用非原子的本地缓存游标 `cached_read_index_` 判断空间。
                 // 在 99% 的情况下，直接 0 成本过检，彻底避免跨核心总线通信！
                 if (w + len - cached_read_index_ > size_) {
@@ -992,7 +941,7 @@ namespace zrlog {
             // 后台（消费者）接口
             // ------------------------------------------------------------------------
             LogEntryHeader* try_read() {
-                // 【核心黑科技 3：消费者全本地化】
+                // 【核心黑科技：消费者全本地化】
                 // 消费者直接使用本地游标 local_read_index_，完全避开 atomic load
                 uint64_t r = local_read_index_;
 
@@ -1051,7 +1000,7 @@ namespace zrlog {
             inline void consume(uint32_t len) {
                 local_read_index_ += len;
 
-                // 【核心黑科技 4：游标批量提交 (Batch Commit)】
+                // 【核心黑科技：游标批量提交 (Batch Commit)】
                 // 避免消费者疯狂 store 导致生产者 L1 Cache 失效。
                 // 每积攒 4096 字节（4KB）才提交一次给生产者看。
                 // 利用极速位运算判断是否跨越了 4096 边界 (0xFFF = 4095)。
@@ -1070,14 +1019,14 @@ namespace zrlog {
             // ------------------------------------------------------------------------
             // 杂项与监控接口
             // ------------------------------------------------------------------------
-            inline bool should_deallocate() const { 
-                return should_deallocate_; 
+            inline bool should_deallocate() const {
+                return should_deallocate_;
             }
-            inline void mark_deallocate() { 
-                should_deallocate_ = true; 
+            inline void mark_deallocate() {
+                should_deallocate_ = true;
             }
-            inline uint32_t capacity() const { 
-                return size_; 
+            inline uint32_t capacity() const {
+                return size_;
             }
 
             inline uint32_t estimate_used_space() const {
@@ -1098,12 +1047,12 @@ namespace zrlog {
                 if (n < MIN_SIZE) {
                     n = MIN_SIZE;
                 }
-                n--; 
-                n |= n >> 1; 
-                n |= n >> 2; 
+                n--;
+                n |= n >> 1;
+                n |= n >> 2;
                 n |= n >> 4;
-                n |= n >> 8; 
-                n |= n >> 16; 
+                n |= n >> 8;
+                n |= n >> 16;
                 n++;
                 if (n == 0) {
                     n = MIN_SIZE;
@@ -1119,31 +1068,31 @@ namespace zrlog {
                 p->log_id = PADDING_ID;
                 p->total_size = pad_size;
                 p->time = 0;
-                p->thread_id = 0;
             }
 
             // =========================================================================
-            // 【核心黑科技 5：极其严格的缓存行物理隔离】
+            // 【核心黑科技：极其严格的缓存行物理隔离】
             // C++17 alignas 将自动填充字节，彻底杜绝 False Sharing
             // =========================================================================
 
             // --- 生产者独占缓存行 (写入端) ---
             // 内存对齐并独占一行，只有前端线程会高频读写这里的变量
-            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_ = 0;
-            uint64_t                 cached_read_index_ = 0;
+            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
+            uint64_t                 cached_read_index_{ 0 };
 
             // --- 消费者独占缓存行 (读取端) ---
             // 物理隔离！只有后台消费者线程会高频读写这里的变量
-            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_ = 0;
-            uint64_t                 cached_write_index_ = 0;
-            uint64_t                 local_read_index_ = 0;
+            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
+            uint64_t                 cached_write_index_{ 0 };
+            uint64_t                 local_read_index_{ 0 };
 
             // --- 其他共享元数据 ---
             // 独立在一行，防止被游标的高频变动波及
             alignas(CACHE_LINE_SIZE) uint32_t size_;
             uint32_t                 mask_;
+            uint64_t                 thread_id_;
             std::vector<char>        buffer_;
-            bool                     should_deallocate_ = false;
+            bool                     should_deallocate_{ false };
         };
 
         class ThreadBufferDestroyer {
@@ -1165,8 +1114,8 @@ namespace zrlog {
         // ========================================================================
         // Management
         // ========================================================================
-        template<typename... Args>
-        uint32_t register_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, const char* file, uint32_t line, const char* func, const char* format) {
+        template<typename FmtProvider, typename... Args>
+        uint32_t register_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, const char* file, uint32_t line, const char* func) {
             std::lock_guard<SpinMutex> lock(log_metas_mutex_);
             uint32_t id = log_id_atom.load(std::memory_order_relaxed);
             if (id != 0) {
@@ -1180,17 +1129,16 @@ namespace zrlog {
             new_log.file = file;
             new_log.line = line;
             new_log.func = func;
-            new_log.format = format;
-            new_log.decoder = &generated_decoder<Args...>;
+            new_log.decoder = &generated_decoder<FmtProvider, Args...>;
             global_log_metas_.push_back(std::move(new_log));
 
             log_id_atom.store(new_id, std::memory_order_relaxed);
             return new_id;
         }
 
-            ThreadBuffer* get_thread_buffer() {
+        ThreadBuffer* get_thread_buffer() {
             if (nullptr == thread_buffer_) {
-                thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size);
+                thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size, get_thread_id());
                 thread_buffer_destroyer_.init();
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
                 thread_buffers_.push_back(thread_buffer_);
@@ -1211,18 +1159,20 @@ namespace zrlog {
                 }
             }
             {
-                //追加ThreadBuffer到后台集合thread_buffers_bg_
+                // 【连续内存预取】将新增的 Buffer 高效转移到后台集合
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
                 if (!thread_buffers_.empty()) {
-                    thread_buffers_bg_.splice(thread_buffers_bg_.end(), thread_buffers_);
+                    thread_buffers_bg_.insert(thread_buffers_bg_.end(), thread_buffers_.begin(), thread_buffers_.end());
+                    thread_buffers_.clear();
                 }
             }
 
-            LogEntryHeader *header;
-            auto it = thread_buffers_bg_.begin();
-            while (it != thread_buffers_bg_.end()) {
-                ThreadBuffer *tb = *it;
+            LogEntryHeader* header;
+            // 【O(1) 遍历与删除】利用 vector 和 swap-and-pop 提升 CPU 预取命中率
+            for (size_t i = 0; i < thread_buffers_bg_.size(); ) {
+                ThreadBuffer* tb = thread_buffers_bg_[i];
                 uint32_t quota = full_drain ? UINT32_MAX : config_.per_thread_quota;
+
                 while ((quota > 0) && (header = tb->try_read())) {
                     stat_consume_count_.fetch_add(1, std::memory_order_relaxed);
                     ++processed_count;
@@ -1230,10 +1180,10 @@ namespace zrlog {
 
                     if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
                         const LogMeta& meta = local_log_metas[header->log_id - 1];
-                        char *args_ptr = (char *)header + sizeof(LogEntryHeader);
-                        meta.decoder(args_ptr, meta, *header, io_buf);
+                        char* args_ptr = (char*)header + sizeof(LogEntryHeader);
+                        meta.decoder(args_ptr, meta, *header, tb->thread_id(), io_buf);
                         stat_consume_valid_count_.fetch_add(1, std::memory_order_relaxed);
-                    } 
+                    }
                     else {  //header->log_id 无效时
                         {
                             //追加日志元数据到本地集合
@@ -1247,8 +1197,8 @@ namespace zrlog {
 
                         if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
                             const LogMeta& meta = local_log_metas[header->log_id - 1];
-                            char *args_ptr = (char *)header + sizeof(LogEntryHeader);
-                            meta.decoder(args_ptr, meta, *header, io_buf);
+                            char* args_ptr = (char*)header + sizeof(LogEntryHeader);
+                            meta.decoder(args_ptr, meta, *header, tb->thread_id(), io_buf);
                             stat_consume_valid_count_.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
@@ -1261,10 +1211,16 @@ namespace zrlog {
 
                 if (tb->should_deallocate() && tb->estimate_used_space() == 0) {
                     delete tb;
-                    it = thread_buffers_bg_.erase(it);
+
+                    // 用尾部元素覆盖当前元素，然后 pop_back，避免 vector 整体搬移！
+                    if (i != thread_buffers_bg_.size() - 1) {
+                        thread_buffers_bg_[i] = thread_buffers_bg_.back();
+                    }
+                    thread_buffers_bg_.pop_back();
+                    // 注意这里不 ++i，因为当前位置 i 已经被塞入了新的尾部元素，下一轮还要检查它
                 }
                 else {
-                    ++it;
+                    ++i;
                 }
             }
 
@@ -1281,6 +1237,7 @@ namespace zrlog {
                 if (process_count < 1) {  //idle
                     io_buf.flush_to_os();
                     TscClock::instance().sync_system_time();
+
                     idle_wait_flag_.store(true, std::memory_order_relaxed);
                     {
                         std::unique_lock<std::mutex> lock(idle_wait_mutex_);
@@ -1319,24 +1276,24 @@ namespace zrlog {
         SpinMutex log_metas_mutex_;
         std::vector<LogMeta> global_log_metas_;
         SpinMutex thread_buffers_mutex_;
-        std::list<ThreadBuffer*> thread_buffers_;
-        std::list<ThreadBuffer*> thread_buffers_bg_;
+        std::vector<ThreadBuffer*> thread_buffers_;
+        std::vector<ThreadBuffer*> thread_buffers_bg_;
 
         std::unique_ptr<ILogAppender> appender_;
         std::thread log_thread_;
-        std::atomic<bool> log_thread_running_ = false;
+        std::atomic<bool> log_thread_running_{ false };
 
         std::mutex              idle_wait_mutex_;
         std::condition_variable idle_wait_condition_;
         // 强制独占一个缓存行，不和 mutex 沾边
-        alignas(CACHE_LINE_SIZE) std::atomic<bool> idle_wait_flag_ = false;
+        alignas(CACHE_LINE_SIZE) std::atomic<bool> idle_wait_flag_{ false };
 
     public:
         //statistics
-        std::atomic<uint64_t>  stat_produce_count_ = 0;
-        std::atomic<uint64_t>  stat_produce_valid_count_ = 0;
-        std::atomic<uint64_t>  stat_consume_count_ = 0;
-        std::atomic<uint64_t>  stat_consume_valid_count_ = 0;
+        std::atomic<uint64_t>  stat_produce_count_{ 0 };
+        std::atomic<uint64_t>  stat_produce_valid_count_{ 0 };
+        std::atomic<uint64_t>  stat_consume_count_{ 0 };
+        std::atomic<uint64_t>  stat_consume_valid_count_{ 0 };
     };
 
     ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
@@ -1344,20 +1301,26 @@ namespace zrlog {
 }
 
 // ---------------------------------------------------------------------------
-// 宏定义更新
+// 宏定义更新：注入局部的 FmtProvider 结构体以捕获编译期字面量
 // ---------------------------------------------------------------------------
 
 #define ZRLOG_INIT_CONF(config) zrlog::NanoLogger::instance().init(config)
 #define ZRLOG_INIT(filename, level) zrlog::NanoLogger::instance().init(filename, level)
 #define ZRLOG_FINI() zrlog::NanoLogger::instance().fini()
 
-#define ZRLOG_BODY(level, format, ...)                                                      \
-    do {                                                                                    \
-        zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                          \
-        if (logger.check_level(level)) {                                                    \
-            static std::atomic<uint32_t> log_id{0};                                         \
-            logger.log(log_id, level, __FILE__, __LINE__, __func__, format, ##__VA_ARGS__); \
-        }                                                                                   \
+#define ZRLOG_BODY(level, format_str, ...)                                                          \
+    do {                                                                                            \
+        zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                                  \
+        if (logger.check_level(level)) {                                                            \
+            static std::atomic<uint32_t> log_id{0};                                                 \
+            struct FmtProvider {                                                                    \
+                /* 魔法发生在这里：利用预处理器将前缀和用户的 format_str 完美拼接！*/               \
+                static constexpr auto compile() {                                                   \
+                    return FMT_COMPILE("{}.{:09d} {} {} {}:{} " format_str);                        \
+                }                                                                                   \
+            };                                                                                      \
+            logger.log<FmtProvider>(log_id, level, __FILE__, __LINE__, __func__, ##__VA_ARGS__);    \
+        }                                                                                           \
     } while (0)
 
 #define ZRLOG_TRACE(format, ...) ZRLOG_BODY(zrlog::LogLevel::TRACE, format, ##__VA_ARGS__)

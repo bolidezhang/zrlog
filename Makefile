@@ -73,7 +73,7 @@ endif
 #****************************************************************************
 
 #INCS := -I/usr/include/g++-2 -I/usr/local/include
-INCS := -I/usr/local/include -I../../../include -I./
+INCS := -I/usr/local/include -I../../../include -I./ -I./fmt/include
 
 LIBS := -L/usr/lib -lpthread -lrt 
 

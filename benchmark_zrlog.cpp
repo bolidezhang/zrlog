@@ -1,5 +1,5 @@
-// ZrLog Benchmark Test
-// Compile: g++ -O3 -std=c++17 -pthread benchmark_zrlog.cpp -o benchmark_zrlog
+﻿// ZrLog Benchmark Test
+// Compile: g++ -O3 -std=c++17 -pthread -I/path/to/fmt/include benchmark_zrlog.cpp -o benchmark_zrlog
 
 #include "zrlog.h"
 #include <iostream>
@@ -31,16 +31,18 @@ void benchmark_frontend_latency(int iterations = 1000000) {
 
     std::vector<uint64_t> latencies;
     latencies.reserve(iterations);
+    //std::string str = "Warmup message {}";
+    //const char* msg = str.data();
 
-     //Warm up
+    //Warm up
     for (int i = 0; i < 1000; ++i) {
-        ZRLOG_INFO("Warmup message %d", i);
+        ZRLOG_INFO("Warmup message {}", i);
     }
 
     // Measure
     for (int i = 0; i < iterations; ++i) {
         uint64_t t0 = zrlog_rdtsc();
-        ZRLOG_INFO("Test message %d", i);
+        ZRLOG_INFO("Test message {}", i);
         uint64_t t1 = zrlog_rdtsc();
         if (i > 0) {
             latencies.push_back(t1 - t0);
@@ -81,12 +83,12 @@ void benchmark_throughput(int total_logs = 10000000) {
 
     // Warm up
     for (int i = 0; i < 1000; ++i) {
-        ZRLOG_INFO("Warmup %d", i);
+        ZRLOG_INFO("Warmup {}", i);
     }
 
     auto start = std::chrono::high_resolution_clock::now();
-    for (int i = 0; i < total_logs; ++i) {        
-        ZRLOG_INFO("Throughput test message %d", i);
+    for (int i = 0; i < total_logs; ++i) {
+        ZRLOG_INFO("Throughput test message {}", i);
     }
     auto end = std::chrono::high_resolution_clock::now();
 
@@ -109,7 +111,7 @@ void benchmark_multi_thread(int num_threads, int logs_per_thread) {
     auto worker = [&](int thread_id) {
         // Warm up
         for (int i = 0; i < 100; ++i) {
-            ZRLOG_INFO("Warmup thread %d msg %d", thread_id, i);
+            ZRLOG_INFO("Warmup thread {} msg {}", thread_id, i);
         }
 
         ready.fetch_add(1);
@@ -118,7 +120,7 @@ void benchmark_multi_thread(int num_threads, int logs_per_thread) {
         }
 
         for (int i = 0; i < logs_per_thread; ++i) {
-            ZRLOG_INFO("Thread %d message %d", thread_id, i);
+            ZRLOG_INFO("Thread {} message {}", thread_id, i);
         }
     };
 
@@ -160,9 +162,9 @@ void benchmark_message_types(int iterations = 100000) {
 
     // Warm up
     for (int i = 0; i < 1000; ++i) {
-        ZRLOG_INFO("%d", i);
-        ZRLOG_INFO("%s", "string");
-        ZRLOG_INFO("%d %s %d", i, "test", i * 2);
+        ZRLOG_INFO("{}", i);
+        ZRLOG_INFO("{}", "string");
+        ZRLOG_INFO("{} {} {}", i, "test", i * 2);
     }
 
     double tsc_ghz = get_tsc_freq_ghz();
@@ -171,7 +173,7 @@ void benchmark_message_types(int iterations = 100000) {
     // Integer only
     for (int i = 0; i < iterations; ++i) {
         uint64_t t0 = zrlog_rdtsc();
-        ZRLOG_INFO("Integer value: %d", i);
+        ZRLOG_INFO("Integer value: {}", i);
         uint64_t t1 = zrlog_rdtsc();
         if (i > 0) {
             int_latencies.push_back(t1 - t0);
@@ -181,7 +183,7 @@ void benchmark_message_types(int iterations = 100000) {
     // String
     for (int i = 0; i < iterations; ++i) {
         uint64_t t0 = zrlog_rdtsc();
-        ZRLOG_INFO("String value: %s", "benchmark_test_string");
+        ZRLOG_INFO("String value: {}", "benchmark_test_string");
         uint64_t t1 = zrlog_rdtsc();
         if (i > 0) {
             str_latencies.push_back(t1 - t0);
@@ -191,7 +193,7 @@ void benchmark_message_types(int iterations = 100000) {
     // Mixed
     for (int i = 0; i < iterations; ++i) {
         uint64_t t0 = zrlog_rdtsc();
-        ZRLOG_INFO("Mixed: %d %f %s %d", i, 3.14, "text", i * 100);
+        ZRLOG_INFO("Mixed: {} {} {} {}", i, 3.14, "text", i * 100);
         uint64_t t1 = zrlog_rdtsc();
         if (i > 0) {
             mixed_latencies.push_back(t1 - t0);
@@ -266,13 +268,13 @@ int main(int argc, char* argv[]) {
     }
 
     std::cout << "============================================" << std::endl;
-    std::cout << "        zrlog Performance Benchmark        "  << std::endl;
+    std::cout << "        zrlog Performance Benchmark        " << std::endl;
     std::cout << "============================================" << std::endl;
 
     // Remove old log file
     std::remove("benchmark_zrlog.log");
 
-    zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();
+    zrlog::NanoLogger& logger = zrlog::NanoLogger::instance();
 
     // Initialize logger
     zrlog::Config config;
@@ -281,8 +283,8 @@ int main(int argc, char* argv[]) {
     config.thread_buffer_size = static_cast<uint32_t>(1024 * 1024 * thread_buffer_size);
     config.io_buffer_size = 1024 * 512;             // 512KB IO buffer
     config.buffer_full_policy = buffer_full_policy;
-    std::cout << "config.thread_buffer_size:" << config.thread_buffer_size 
-        <<" buffer_full_policy:" << static_cast<uint32_t>(buffer_full_policy) << std::endl;
+    std::cout << "config.thread_buffer_size:" << config.thread_buffer_size
+        << " buffer_full_policy:" << static_cast<uint32_t>(buffer_full_policy) << std::endl;
 
     if (!logger.init(config)) {
         std::cerr << "Failed to initialize logger" << std::endl;
@@ -291,21 +293,22 @@ int main(int argc, char* argv[]) {
 
     // Run benchmarks
     benchmark_clock();
+    //benchmark_frontend_latency(10);
     benchmark_frontend_latency(500000);
-    benchmark_message_types(100000);
-    benchmark_throughput(5000000);
-    benchmark_multi_thread(2, 1000000);
-    benchmark_multi_thread(4, 1000000);
-    benchmark_multi_thread(8, 500000);
+    //benchmark_message_types(100000);
+    //benchmark_throughput(5000000);
+    //benchmark_multi_thread(2, 1000000);
+    //benchmark_multi_thread(4, 1000000);
+    //benchmark_multi_thread(8, 500000);
 
     // Shutdown
     ZRLOG_FINI();
 
     std::cout << "\n=== Benchmark Complete ===" << std::endl;
     std::cout << "Log file: benchmark_zrlog.log" << std::endl;
-    std::cout << "stat_produce_count:" << logger.stat_produce_count_.load(std::memory_order_relaxed) << " stat_consumed_count:" 
+    std::cout << "stat_produce_count:" << logger.stat_produce_count_.load(std::memory_order_relaxed) << " stat_consumed_count:"
         << logger.stat_consume_count_.load(std::memory_order_relaxed) << std::endl;
-    std::cout << "stat_produce_valid_count:" << logger.stat_produce_valid_count_.load(std::memory_order_relaxed) 
+    std::cout << "stat_produce_valid_count:" << logger.stat_produce_valid_count_.load(std::memory_order_relaxed)
         << " stat_consume_valid_count:" << logger.stat_consume_valid_count_.load(std::memory_order_relaxed) << std::endl;
 
     return 0;
