@@ -1,8 +1,8 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：1.6.2 
-#define ZRLOG_VERSION 10602
+// 如：1.6.3
+#define ZRLOG_VERSION 10603
 
 #include <vector>
 #include <list>
@@ -197,17 +197,19 @@ namespace zrlog {
             fast_u32_to_2digits(buf + 2, val % 100);
         }
 
-        // 快速转换 9 位纳秒 (补零)
-        inline void fast_u64_to_9digits(char* buf, uint64_t val) {
-            // 从后往前填充
-            if (val > 999999999) {
-                val = 999999999;
-            }
-            char* p = buf + 8;
-            for (int i = 0; i < 9; ++i) {
-                *p-- = (char)('0' + (val % 10));
-                val /= 10;
-            }
+        // 快速转换 9 位纳秒，消除除以10的耗时循环，直接查表批量处理
+        inline void fast_u32_to_9digits(char* buf, uint32_t val) {
+            if (val > 999999999) val = 999999999;
+            uint32_t d1 = val / 100000000; val %= 100000000;
+            uint32_t d2 = val / 1000000;   val %= 1000000;
+            uint32_t d3 = val / 10000;     val %= 10000;
+            uint32_t d4 = val / 100;       val %= 100;
+            uint32_t d5 = val;
+            buf[0] = (char)('0' + d1);
+            fast_u32_to_2digits(buf + 1, d2);
+            fast_u32_to_2digits(buf + 3, d3);
+            fast_u32_to_2digits(buf + 5, d4);
+            fast_u32_to_2digits(buf + 7, d5);
         }
     }
 
@@ -675,7 +677,7 @@ namespace zrlog {
             ThreadBuffer* buffer = get_thread_buffer();
             if (nullptr != buffer) {
                 //stat_produce_count_.fetch_add(1, std::memory_order_relaxed);
-                uint32_t args_size = calculate_args_size(args...);
+                uint32_t args_size = calculate_args_size_all(args...);
                 uint32_t total_size = sizeof(LogEntryHeader) + args_size;
                 char *ptr = buffer->alloc(total_size);
                 if (nullptr == ptr) {
@@ -748,7 +750,7 @@ namespace zrlog {
                 header->total_size = total_size;
                 header->log_id = log_id;
                 header->time = TscClock::now_ns_i();
-                serialize_args(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
+                serialize_args_all(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
                 buffer->commit(total_size);
                 //stat_produce_valid_count_.fetch_add(1, std::memory_order_relaxed);
                 notify_consumer();
@@ -760,73 +762,79 @@ namespace zrlog {
         }
 
     private:
-        static uint32_t calculate_args_size() {
-            return 0;
-        }
-        template<typename T, typename... Rest>
-        static uint32_t calculate_args_size(const T& val, const Rest&... rest) {
-            return sizeof(T) + calculate_args_size(rest...);
-        }
-        static uint32_t calculate_args_size(const char* val) {
-            return sizeof(uint32_t) + (val ? (uint32_t)strlen(val) + 1 : 1);
-        }
-        template<typename... Rest>
-        static uint32_t calculate_args_size(const char* val, const Rest&... rest) {
-            return calculate_args_size(val) + calculate_args_size(rest...);
-        }
-        static uint32_t calculate_args_size(const std::string& val) {
-            return sizeof(uint32_t) + (uint32_t)val.size() + 1;
-        }
-        template<typename... Rest>
-        static uint32_t calculate_args_size(const std::string& val, const Rest&... rest) {
-            return calculate_args_size(val) + calculate_args_size(rest...);
-        }
-        static uint32_t calculate_args_size(std::string_view val) {
-            return sizeof(uint32_t) + (uint32_t)val.size() + 1;
-        }
-        template<typename... Rest>
-        static uint32_t calculate_args_size(std::string_view val, const Rest&... rest) {
-            return calculate_args_size(val) + calculate_args_size(rest...);
-        }
 
-        static void serialize_args(char* ptr) {
-        }
-        template<typename T, typename... Rest>
-        static void serialize_args(char* ptr, const T& val, Rest&&... rest) {
-            std::memcpy(ptr, &val, sizeof(T));
-            serialize_args(ptr + sizeof(T), std::forward<Rest>(rest)...);
-        }
-        template<typename... Rest>
-        static void serialize_args(char* ptr, const char* val, Rest&&... rest) {
-            uint32_t len = val ? (uint32_t)strlen(val) + 1 : 1;
-            std::memcpy(ptr, &len, sizeof(uint32_t));
-            if (val) {
-                std::memcpy(ptr + sizeof(uint32_t), val, len);
+        template <typename T>
+        static uint32_t arg_size(const T& val) {
+            using DecayedT = std::decay_t<T>;
+            if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
+                return sizeof(uint32_t) + (val ? (uint32_t)strlen(val) + 1 : 1);
+            }
+            else if constexpr (std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
+                return sizeof(uint32_t) + (uint32_t)val.size() + 1;
             }
             else {
-                *reinterpret_cast<char*>(ptr + sizeof(uint32_t)) = '\0';
+                return sizeof(T);
             }
-           serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
         }
-        template<typename... Rest>
-        static void serialize_args(char* ptr, const std::string& val, Rest&&... rest) {
-            uint32_t len = (uint32_t)val.size() + 1;
-            std::memcpy(ptr, &len, sizeof(uint32_t));
-            if (len > 1) {
-                std::memcpy(ptr + sizeof(uint32_t), val.data(), len - 1);
-            }
-            *(ptr + sizeof(uint32_t) + len - 1) = '\0';
-            serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
+
+        // 拦截字符串常量池字面量，如 "hello"，直接用 N 计算，彻底消灭前端 strlen
+        template <size_t N>
+        static uint32_t arg_size(const char(&)[N]) {
+            return sizeof(uint32_t) + N;
         }
-        template<typename... Rest>
-        static void serialize_args(char* ptr, std::string_view val, Rest&&... rest) {
-            uint32_t len = (uint32_t)val.size() + 1;
-            std::memcpy(ptr, &len, sizeof(uint32_t));
-            if (len > 1) {
-                std::memcpy(ptr + sizeof(uint32_t), val.data(), len - 1);
+
+        static uint32_t calculate_args_size_all() {
+            return 0;
+        }
+
+        template <typename... Args>
+        static uint32_t calculate_args_size_all(const Args&... args) {
+            return (0 + ... + arg_size(args));
+        }
+
+        template <typename T>
+        static void serialize_arg(char*& ptr, const T& val) {
+            using DecayedT = std::decay_t<T>;
+            if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
+                uint32_t len = val ? (uint32_t)strlen(val) + 1 : 1;
+                std::memcpy(ptr, &len, sizeof(uint32_t));
+                if (val) {
+                    std::memcpy(ptr + sizeof(uint32_t), val, len);
+                }
+                else {
+                    *(ptr + sizeof(uint32_t)) = '\0';
+                }
+                ptr += sizeof(uint32_t) + len;
             }
-            *(ptr + sizeof(uint32_t) + len - 1) = '\0';
-            serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
+            else if constexpr (std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
+                uint32_t len = (uint32_t)val.size() + 1;
+                std::memcpy(ptr, &len, sizeof(uint32_t));
+                if (len > 1) {
+                    std::memcpy(ptr + sizeof(uint32_t), val.data(), len - 1);
+                }
+                *(ptr + sizeof(uint32_t) + len - 1) = '\0';
+                ptr += sizeof(uint32_t) + len;
+            }
+            else {
+                std::memcpy(ptr, &val, sizeof(T));
+                ptr += sizeof(T);
+            }
+        }
+
+        template <size_t N>
+        static void serialize_arg(char*& ptr, const char(&val)[N]) {
+            uint32_t len = N;
+            std::memcpy(ptr, &len, sizeof(uint32_t));
+            std::memcpy(ptr + sizeof(uint32_t), val, N); // includes '\0'
+            ptr += sizeof(uint32_t) + N;
+        }
+
+        static void serialize_args_all(char*) {
+        }
+
+        template <typename... Args>
+        static void serialize_args_all(char* ptr, const Args&... args) {
+            (..., serialize_arg(ptr, args));
         }
 
         // ========================================================================
@@ -864,7 +872,6 @@ namespace zrlog {
             out << '\n';
         }
 
-
         static void format_timestamp(IOBuffer& out, uint64_t ns_time) {
             // 缓存秒级字符串: "YYYY-MM-DD HH:MM:SS" (19 chars)
             static thread_local time_t cache_sec = 0;
@@ -896,25 +903,25 @@ namespace zrlog {
             out << '.';
 
             // 纳秒部分: 9位补零
-            uint64_t nano = ns_time % 1000000000;
+            uint32_t nano = static_cast<uint32_t>(ns_time % 1000000000);
             char nano_buf[10]; // 9 + 1
-            detail::fast_u64_to_9digits(nano_buf, nano);
+            detail::fast_u32_to_9digits(nano_buf, nano);
             out.append(nano_buf, 9);
             out << ' ';
         }
 
         template<typename... Args>
         static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
-            // 1. 解码用户参数 (只包含日志内容参数，不包含头部)
-            auto args_tuple = detail::TupleDeserializer<typename std::decay<Args>::type...>::apply(buffer);
-
-            // 2. 格式化时间戳
+            // 1. 格式化时间戳
             format_timestamp(out, header.time);
 
-            // 3. 格式化固定头部 (Level, ThreadID, File:Line)
+            // 2. 格式化固定头部 (Level, ThreadID, File:Line)
             out << loglevel_to_string(meta.level) << " "
                 << thread_id << " "
                 << meta.file << ":" << meta.line << " ";
+
+            // 3. 解码用户参数 (只包含日志内容参数，不包含头部)
+            auto args_tuple = detail::TupleDeserializer<typename std::decay<Args>::type...>::apply(buffer);
 
             // 4. 格式化用户日志内容
             format_log_impl(out, meta.format.c_str(), args_tuple,
