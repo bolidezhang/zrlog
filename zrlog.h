@@ -396,7 +396,7 @@ namespace zrlog {
         AppenderType appender = AppenderType::File;
         std::string filename;
         LogLevel level = LogLevel::DEBUG;
-        uint32_t io_buffer_size = 1024 * 256;           //io缓冲大小(也即日志格式化缓冲, 全局唯一)
+        uint32_t io_buffer_size = 1024 * 1024 * 1;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
         uint32_t thread_buffer_size = 1024 * 1024 * 1;  //每个线程的缓冲大小(前端二进制序列化缓冲 测试发现越大如16M,时延也变大)
         uint32_t per_thread_quota = 256;                //每个线程的格式化日志的配额(防止线程产生日志太快,公平处理每个线程日志)
         uint32_t idle_wait_interval_us = 500;           //空闲等待间隔(微妙)
