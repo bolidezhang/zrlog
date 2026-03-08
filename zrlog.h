@@ -200,10 +200,14 @@ namespace zrlog {
         // 快速转换 9 位纳秒，消除除以10的耗时循环，直接查表批量处理
         inline void fast_u32_to_9digits(char* buf, uint32_t val) {
             if (val > 999999999) val = 999999999;
-            uint32_t d1 = val / 100000000; val %= 100000000;
-            uint32_t d2 = val / 1000000;   val %= 1000000;
-            uint32_t d3 = val / 10000;     val %= 10000;
-            uint32_t d4 = val / 100;       val %= 100;
+            uint32_t d1 = val / 100000000; 
+            val %= 100000000;
+            uint32_t d2 = val / 1000000;   
+            val %= 1000000;
+            uint32_t d3 = val / 10000;     
+            val %= 10000;
+            uint32_t d4 = val / 100;       
+            val %= 100;
             uint32_t d5 = val;
             buf[0] = (char)('0' + d1);
             fast_u32_to_2digits(buf + 1, d2);
