@@ -281,7 +281,8 @@ int main(int argc, char* argv[]) {
     config.filename = "benchmark_zrlog.log";
     config.level = zrlog::LogLevel::INFO;
     config.thread_buffer_size = static_cast<uint32_t>(1024 * 1024 * thread_buffer_size);
-    config.io_buffer_size = 1024 * 512;             // 512KB IO buffer
+    config.io_buffer_size = 1024 * 1024;             // 1MB IO buffer
+    //config.io_buffer_size = 1024 * 512;             // 512KB IO buffer
     config.buffer_full_policy = buffer_full_policy;
     std::cout << "config.thread_buffer_size:" << config.thread_buffer_size
         << " buffer_full_policy:" << static_cast<uint32_t>(buffer_full_policy) << std::endl;
@@ -293,7 +294,7 @@ int main(int argc, char* argv[]) {
 
     // Run benchmarks
     benchmark_clock();
-    //benchmark_frontend_latency(10);
+    //benchmark_frontend_latency(2);
     benchmark_frontend_latency(500000);
     benchmark_message_types(100000);
     benchmark_throughput(5000000);

@@ -1,8 +1,8 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.0.2 
-#define ZRLOG_VERSION 20002
+// 如：2.0.3 
+#define ZRLOG_VERSION 20003
 
 // ============================================================================
 // 引入 fmtlib (Header-Only 模式 & 编译期优化支持)
@@ -133,49 +133,38 @@ namespace zrlog {
     // 内部细节
     // ---------------------------------------------------------------------------
     namespace detail {
-        // 优化：解码 string/string_view 时直接返回指向 buffer 内部的 const char*
-        // 实现零拷贝 (前端序列化时已保证以 \0 结尾)
+
+        // 编译期类型映射 Traits：遇到字符串一律退化为 std::string_view
         template <typename T>
-        auto decode_val(char*& ptr) {
-            if constexpr (std::is_same_v<T, const char*> ||
-                std::is_same_v<T, std::string> ||
-                std::is_same_v<T, std::string_view>) {
+        struct decode_type {
+            using type = std::conditional_t<
+                std::is_same_v<T, const char*> || std::is_same_v<T, char*> ||
+                std::is_same_v<T, std::string> || std::is_same_v<T, std::string_view>,
+                std::string_view,
+                T
+            >;
+        };
+
+        // 指针漂移提取器：直接用指针指着 Buffer 内存构造 string_view 返回
+        template <typename T>
+        static auto decode_arg(char*& ptr) -> typename decode_type<std::decay_t<T>>::type {
+            using DecayedT = std::decay_t<T>;
+            if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*> ||
+                std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
                 uint32_t len;
                 std::memcpy(&len, ptr, sizeof(uint32_t));
                 const char* str = ptr + sizeof(uint32_t);
                 ptr += sizeof(uint32_t) + len;
-                return str; // 直接返回地址
+                // 零拷贝！直接返回内存视图
+                return std::string_view(str, len > 0 ? len - 1 : 0);
             }
             else {
-                T val;
-                std::memcpy(&val, ptr, sizeof(T));
-                ptr += sizeof(T);
+                DecayedT val;
+                std::memcpy(&val, ptr, sizeof(DecayedT));
+                ptr += sizeof(DecayedT);
                 return val;
             }
         }
-
-        template<typename... Ts>
-        struct TupleDeserializer;
-
-        template<typename Head, typename... Tail>
-        struct TupleDeserializer<Head, Tail...> {
-            static auto apply(char*& ptr) {
-                using RawHead = typename std::decay<Head>::type;
-                auto head = decode_val<RawHead>(ptr);
-                return std::tuple_cat(std::make_tuple(head), TupleDeserializer<Tail...>::apply(ptr));
-            }
-        };
-
-        template<>
-        struct TupleDeserializer<> {
-            static std::tuple<> apply(char*&) {
-                return std::tuple<>();
-            }
-        };
-
-        template <std::size_t... Is> struct index_sequence {};
-        template <std::size_t N, std::size_t... Is> struct make_index_sequence : make_index_sequence<N - 1, N - 1, Is...> {};
-        template <std::size_t... Is> struct make_index_sequence<0, Is...> : index_sequence<Is...> {};
 
         // 快速转换 2 位数字 (00-99)
         inline void fast_u32_to_2digits(char* buf, uint32_t val) {
@@ -204,17 +193,19 @@ namespace zrlog {
             fast_u32_to_2digits(buf + 2, val % 100);
         }
 
-        // 快速转换 9 位纳秒 (补零)
-        inline void fast_u64_to_9digits(char* buf, uint64_t val) {
-            // 从后往前填充
-            if (val > 999999999) {
-                val = 999999999;
-            }
-            char* p = buf + 8;
-            for (int i = 0; i < 9; ++i) {
-                *p-- = (char)('0' + (val % 10));
-                val /= 10;
-            }
+        // 快速转换 9 位纳秒，消除除以10的耗时循环，直接查表批量处理
+        inline void fast_u32_to_9digits(char* buf, uint32_t val) {
+            if (val > 999999999) val = 999999999;
+            uint32_t d1 = val / 100000000; val %= 100000000;
+            uint32_t d2 = val / 1000000;   val %= 1000000;
+            uint32_t d3 = val / 10000;     val %= 10000;
+            uint32_t d4 = val / 100;       val %= 100;
+            uint32_t d5 = val;
+            buf[0] = (char)('0' + d1);
+            fast_u32_to_2digits(buf + 1, d2);
+            fast_u32_to_2digits(buf + 3, d3);
+            fast_u32_to_2digits(buf + 5, d4);
+            fast_u32_to_2digits(buf + 7, d5);
         }
     }
 
@@ -401,7 +392,7 @@ namespace zrlog {
         AppenderType appender = AppenderType::File;
         std::string filename;
         LogLevel level = LogLevel::DEBUG;
-        uint32_t io_buffer_size = 1024 * 256;           //io缓冲大小(也即日志格式化缓冲, 全局唯一)
+        uint32_t io_buffer_size = 1024 * 1024 * 1;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
         uint32_t thread_buffer_size = 1024 * 1024 * 1;  //每个线程的缓冲大小(前端二进制序列化缓冲 测试发现越大如16M,时延也变大)
         uint32_t per_thread_quota = 256;                //每个线程的格式化日志的配额(防止线程产生日志太快,公平处理每个线程日志)
         uint32_t idle_wait_interval_us = 500;           //空闲等待间隔(微妙)
@@ -631,7 +622,7 @@ namespace zrlog {
 
             ThreadBuffer* buffer = get_thread_buffer();
             if (nullptr != buffer) {
-                uint32_t args_size = calculate_args_size(args...);
+                uint32_t args_size = calculate_args_size_all(args...);
                 uint32_t total_size = sizeof(LogEntryHeader) + args_size;
                 char* ptr = buffer->alloc(total_size);
 
@@ -705,7 +696,7 @@ namespace zrlog {
                 header->total_size = total_size;
                 header->log_id = log_id;
                 header->time = TscClock::now_ns_i();
-                serialize_args(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
+                serialize_args_all(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
                 buffer->commit(total_size);
                 notify_consumer();
 
@@ -716,121 +707,84 @@ namespace zrlog {
         }
 
     private:
-        static uint32_t calculate_args_size() {
-            return 0;
-        }
-        template<typename T, typename... Rest>
-        static uint32_t calculate_args_size(const T& val, const Rest&... rest) {
-            return sizeof(T) + calculate_args_size(rest...);
-        }
-        static uint32_t calculate_args_size(const char* val) {
-            return sizeof(uint32_t) + (val ? (uint32_t)strlen(val) + 1 : 1);
-        }
-        template<typename... Rest>
-        static uint32_t calculate_args_size(const char* val, const Rest&... rest) {
-            return calculate_args_size(val) + calculate_args_size(rest...);
-        }
-        static uint32_t calculate_args_size(const std::string& val) {
-            return sizeof(uint32_t) + (uint32_t)val.size() + 1;
-        }
-        template<typename... Rest>
-        static uint32_t calculate_args_size(const std::string& val, const Rest&... rest) {
-            return calculate_args_size(val) + calculate_args_size(rest...);
-        }
-        static uint32_t calculate_args_size(std::string_view val) {
-            return sizeof(uint32_t) + (uint32_t)val.size() + 1;
-        }
-        template<typename... Rest>
-        static uint32_t calculate_args_size(std::string_view val, const Rest&... rest) {
-            return calculate_args_size(val) + calculate_args_size(rest...);
-        }
-
-        static void serialize_args(char* ptr) {
-        }
-        template<typename T, typename... Rest>
-        static void serialize_args(char* ptr, const T& val, Rest&&... rest) {
-            std::memcpy(ptr, &val, sizeof(T));
-            serialize_args(ptr + sizeof(T), std::forward<Rest>(rest)...);
-        }
-        template<typename... Rest>
-        static void serialize_args(char* ptr, const char* val, Rest&&... rest) {
-            uint32_t len = val ? (uint32_t)strlen(val) + 1 : 1;
-            std::memcpy(ptr, &len, sizeof(uint32_t));
-            if (val) {
-                std::memcpy(ptr + sizeof(uint32_t), val, len);
+        template <typename T>
+        static uint32_t arg_size(const T& val) {
+            using DecayedT = std::decay_t<T>;
+            if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
+                return sizeof(uint32_t) + (val ? (uint32_t)strlen(val) + 1 : 1);
+            }
+            else if constexpr (std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
+                return sizeof(uint32_t) + (uint32_t)val.size() + 1;
             }
             else {
-                *reinterpret_cast<char*>(ptr + sizeof(uint32_t)) = '\0';
+                return sizeof(T);
             }
-            serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
-        }
-        template<typename... Rest>
-        static void serialize_args(char* ptr, const std::string& val, Rest&&... rest) {
-            uint32_t len = (uint32_t)val.size() + 1;
-            std::memcpy(ptr, &len, sizeof(uint32_t));
-            if (len > 1) {
-                std::memcpy(ptr + sizeof(uint32_t), val.data(), len - 1);
-            }
-            *(ptr + sizeof(uint32_t) + len - 1) = '\0';
-            serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
-        }
-        template<typename... Rest>
-        static void serialize_args(char* ptr, std::string_view val, Rest&&... rest) {
-            uint32_t len = (uint32_t)val.size() + 1;
-            std::memcpy(ptr, &len, sizeof(uint32_t));
-            if (len > 1) {
-                std::memcpy(ptr + sizeof(uint32_t), val.data(), len - 1);
-            }
-            *(ptr + sizeof(uint32_t) + len - 1) = '\0';
-            serialize_args(ptr + sizeof(uint32_t) + len, std::forward<Rest>(rest)...);
         }
 
-        // ========================================================================
-        // Backend: 彻底替换 snprintf，并实现无分支连续格式化流
-        // ========================================================================
-        template<typename FmtProvider, typename Tuple, std::size_t... Is>
-        static void format_log_impl(IOBuffer& out,
-            fmt::string_view time_str, uint32_t nano,
-            const char* level_str, uint64_t tid,
-            const char* file, uint32_t line,
-            const Tuple& t, detail::index_sequence<Is...>) {
+        // 拦截字符串常量池字面量，如 "hello"，直接用 N 计算，彻底消灭前端 strlen
+        template <size_t N>
+        static uint32_t arg_size(const char(&)[N]) {
+            return sizeof(uint32_t) + N;
+        }
 
-            size_t space = out.available_size();
-            if (space < 1024) {
-                out.flush_to_os();
-                space = out.available_size();
+        static uint32_t calculate_args_size_all() { 
+            return 0; 
+        }
+
+        template <typename... Args>
+        static uint32_t calculate_args_size_all(const Args&... args) {
+            return (0 + ... + arg_size(args));
+        }
+
+        template <typename T>
+        static void serialize_arg(char*& ptr, const T& val) {
+            using DecayedT = std::decay_t<T>;
+            if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
+                uint32_t len = val ? (uint32_t)strlen(val) + 1 : 1;
+                std::memcpy(ptr, &len, sizeof(uint32_t));
+                if (val) {
+                    std::memcpy(ptr + sizeof(uint32_t), val, len);
+                }
+                else {
+                    *(ptr + sizeof(uint32_t)) = '\0';
+                }
+                ptr += sizeof(uint32_t) + len;
             }
-            char* p = out.current_ptr();
-
-            // 【究极形态】：1 次极速调用，前缀参数和用户参数 std::get<Is>(t)... 完美融合！
-            auto res = fmt::format_to_n(p, space - 1, FmtProvider::compile(),
-                time_str, nano, level_str, tid, file, line,
-                std::get<Is>(t)...);
-
-            if (res.size >= space - 1) {
-                out.flush_to_os();
-                space = out.available_size();
-                p = out.current_ptr();
-
-                res = fmt::format_to_n(p, space - 1, FmtProvider::compile(),
-                    time_str, nano, level_str, tid, file, line,
-                    std::get<Is>(t)...);
-
-                size_t written = (res.size < space - 1) ? res.size : (space - 1);
-                p[written] = '\n';
-                out.advance(written + 1);
+            else if constexpr (std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
+                uint32_t len = (uint32_t)val.size() + 1;
+                std::memcpy(ptr, &len, sizeof(uint32_t));
+                if (len > 1) {
+                    std::memcpy(ptr + sizeof(uint32_t), val.data(), len - 1);
+                }
+                *(ptr + sizeof(uint32_t) + len - 1) = '\0';
+                ptr += sizeof(uint32_t) + len;
             }
             else {
-                // 安全追加换行符并推进指针
-                p[res.size] = '\n';
-                out.advance(res.size + 1);
+                std::memcpy(ptr, &val, sizeof(T));
+                ptr += sizeof(T);
             }
+        }
+
+        template <size_t N>
+        static void serialize_arg(char*& ptr, const char(&val)[N]) {
+            uint32_t len = N;
+            std::memcpy(ptr, &len, sizeof(uint32_t));
+            std::memcpy(ptr + sizeof(uint32_t), val, N); // includes '\0'
+            ptr += sizeof(uint32_t) + N;
+        }
+
+        static void serialize_args_all(char*) {
+        }
+
+        template <typename... Args>
+        static void serialize_args_all(char* ptr, const Args&... args) {
+            (..., serialize_arg(ptr, args));
         }
 
         template<typename FmtProvider, typename... Args>
         static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
 
-            // 1. 获取缓存的秒级时间字符串 (19 bytes)
+            // 0. 获取缓存的秒级时间字符串 (19 bytes)
             static thread_local time_t cache_sec = 0;
             static thread_local char cache_str[20] = { 0 };
             time_t sec = static_cast<time_t>(header.time / 1000000000);
@@ -851,18 +805,55 @@ namespace zrlog {
                 cache_str[19] = '\0';
                 cache_sec = sec;
             }
-            uint32_t nano = header.time % 1000000000;
+            uint32_t nano = static_cast<uint32_t>(header.time % 1000000000);
 
-            // 2. 解码用户参数 (只包含日志内容参数，不包含头部)
-            auto args_tuple = detail::TupleDeserializer<typename std::decay<Args>::type...>::apply(buffer);
+            // 1. 声明类型安全的空 tuple 容器 (其中的字符串类型已被转换为 string_view)
+            std::tuple<typename detail::decode_type<Args>::type...> args_tuple;
 
-            // 3. 传入前缀所需的所有实际参数
-            format_log_impl<FmtProvider>(out,
-                fmt::string_view(cache_str, 19), nano,
-                loglevel_to_string(meta.level), thread_id,
-                meta.file, meta.line,
-                args_tuple,
-                detail::make_index_sequence<std::tuple_size<decltype(args_tuple)>::value>{});
+            // 2. 定义提取 Lambda
+            auto extract = [&](auto& arg) {
+                arg = detail::decode_arg<std::remove_reference_t<decltype(arg)>>(buffer);
+            };
+
+            // 3. 用 C++17 逗号折叠表达式，依次填充 tuple 坑位 (完全没有 make_tuple 的深拷贝)
+            std::apply([&](auto&... unpacked_args) {
+                (..., extract(unpacked_args));
+            }, args_tuple);
+
+            // 4. 将填满的 tuple 平铺展开，直接送入 FMT_COMPILE 引擎！
+            std::apply([&](const auto&... final_args) {
+                size_t space = out.available_size();
+                if (space < 1024) {
+                    out.flush_to_os();
+                    space = out.available_size();
+                }
+
+                // 【极致魔法发生在这里】
+                // FmtProvider::compile() 提供了编译期的 AST (抽象语法树) 路由
+                // final_args... 提供了绝对零拷贝的内存视图 (string_view)
+                // 两者结合，fmt 库会生成最高效的汇编指令，直接将数据 memcpy 到 out.current_ptr()
+                auto res = fmt::format_to_n(out.current_ptr(), space - 1, FmtProvider::compile(),
+                    fmt::string_view(cache_str, 19), nano,
+                    loglevel_to_string(meta.level), thread_id,
+                    meta.file, meta.line, final_args...);
+
+                // 处理缓冲区写满换行逻辑
+                if (res.size >= space - 1) {
+                    out.flush_to_os();
+                    space = out.available_size();
+                    res = fmt::format_to_n(out.current_ptr(), space - 1, FmtProvider::compile(),
+                        fmt::string_view(cache_str, 19), nano,
+                        loglevel_to_string(meta.level), thread_id,
+                        meta.file, meta.line, final_args...);
+                    size_t written = (res.size < space - 1) ? res.size : (space - 1);
+                    out.current_ptr()[written] = '\n';
+                    out.advance(written + 1);
+                }
+                else {
+                    out.current_ptr()[res.size] = '\n';
+                    out.advance(res.size + 1);
+                }
+            }, args_tuple);
         }
 
         class ThreadBuffer {
