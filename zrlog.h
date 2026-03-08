@@ -934,12 +934,9 @@ namespace zrlog {
                 mask_ = size_ - 1;
                 buffer_.resize(size_);
 
-                // 【核心黑科技 1：消除 Max 级毛刺】
+                // 【核心黑科技 1：消除 Max 级毛刺 按页预热 Fast Page Pre-faulting】
                 // 内存预热 (Pre-faulting)：强制操作系统立即分配并映射真实的物理内存页。
                 // 彻底杜绝在极速打印日志时触发 Page Fault (缺页中断) 导致的巨大抖动。
-                //std::memset(buffer_.data(), 0, size_);
-
-                // 【核心黑科技：按页预热 Fast Page Pre-faulting】
                 // 每 4096 字节写一个 0，强迫操作系统映射所有物理页，比全量 memset 快几倍
                 volatile char *p = buffer_.data();
                 for (size_t i = 0; i < size_; i += 4096) {
