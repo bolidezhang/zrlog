@@ -12,6 +12,8 @@
 #include <iomanip>
 #include <fstream>
 
+using namespace zrlog::literals; // 引入字面量后缀
+
 // Get TSC frequency for timing
 static double get_tsc_freq_ghz() {
     auto t0 = std::chrono::high_resolution_clock::now();
@@ -33,6 +35,8 @@ void benchmark_frontend_latency(int iterations = 1000000) {
     latencies.reserve(iterations);
     //std::string str = "Warmup message {}";
     //const char* msg = str.data();
+
+    /*ZRLOG_INFO("Warmup message {}", zrlog::literal("test"));*/
 
     //Warm up
     for (int i = 0; i < 1000; ++i) {
@@ -292,10 +296,17 @@ int main(int argc, char* argv[]) {
         return 1;
     }
 
+    ZRLOG_INFO("Begin {}", "test...");
+    ZRLOG_INFO("Begin {}", zrlog::literal("test1..."));
+    ZRLOG_INFO("Begin {}", "test2..."_sl);
+    std::string test = "test3...";
+    ZRLOG_INFO("Begin {}", test);
+
     // Run benchmarks
     benchmark_clock();
     //benchmark_frontend_latency(2);
     benchmark_frontend_latency(500000);
+    benchmark_message_types(2);
     benchmark_message_types(100000);
     benchmark_throughput(5000000);
     benchmark_multi_thread(2, 1000000);

@@ -1,8 +1,8 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.0.3 
-#define ZRLOG_VERSION 20003
+// 如：2.1.0
+#define ZRLOG_VERSION 20100
 
 // ============================================================================
 // 引入 fmtlib (Header-Only 模式 & 编译期优化支持)
@@ -37,6 +37,16 @@
 constexpr size_t CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
 #else
 constexpr size_t CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
+#endif
+
+// 跨平台分支预测宏
+#if defined(__GNUC__) || defined(__clang__)
+    #define ZRLOG_LIKELY(x)   __builtin_expect(!!(x), 1)
+    #define ZRLOG_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#else
+    // MSVC 或其他编译器不提供静态预测，直接返回表达式本身
+    #define ZRLOG_LIKELY(x)   (x)
+    #define ZRLOG_UNLIKELY(x) (x)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -129,6 +139,50 @@ inline void zrlog_localtime(const time_t* timer, struct tm* buf) {
 
 namespace zrlog {
 
+    //使用方法:
+    //ZRLOG_INFO("System error: {}", zrlog::literal("Database connection lost"));
+
+    // 静态字符串(字面量) 绝对定长的结构体(拒绝任何对齐带来的错位可能)
+    struct string_literal_t {
+        uint64_t ptr_val;
+        uint32_t len;
+        uint32_t padding;
+    };
+
+    // 包装函数
+    template <size_t N>
+    inline constexpr string_literal_t literal(const char(&str)[N]) noexcept {
+        // 安全转换指针为 uint64_t
+        return { static_cast<uint64_t>(reinterpret_cast<uintptr_t>(str)), static_cast<uint32_t>(N - 1), 0 };
+    }
+
+    inline namespace literals {
+
+        //使用方法:
+        //ZRLOG_INFO("System error: {}", "Database connection lost"_sl);
+
+        // 提供 C++11后缀糖字面量(Syntactic Sugar)，让写代码更优雅
+        inline string_literal_t operator""_sl(const char* str, size_t len) noexcept {
+            return {
+                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(str)),
+                static_cast<uint32_t>(len),
+                0
+            };
+        }
+
+    }
+
+    // =========================================================================
+    // format_as（利用 ADL 机制，必须写在 zrlog 命名空间内！）
+    // 当 fmt 遇到 string_literal_t 时，立刻按值转换为 std::string_view 保存，彻底消灭悬垂引用！
+    // =========================================================================
+    inline std::string_view format_as(const string_literal_t& sl) {
+        return std::string_view(
+            reinterpret_cast<const char*>(static_cast<uintptr_t>(sl.ptr_val)),
+            sl.len
+        );
+    }
+
     // ---------------------------------------------------------------------------
     // 内部细节
     // ---------------------------------------------------------------------------
@@ -145,19 +199,28 @@ namespace zrlog {
             >;
         };
 
-        // 指针漂移提取器：直接用指针指着 Buffer 内存构造 string_view 返回
+        // 指针漂移提取器
         template <typename T>
         static auto decode_arg(char*& ptr) -> typename decode_type<std::decay_t<T>>::type {
             using DecayedT = std::decay_t<T>;
-            if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*> ||
+
+            // 直接读取string_literal_t结构体
+            if constexpr (std::is_same_v<DecayedT, zrlog::string_literal_t>) {
+                zrlog::string_literal_t sl;
+                std::memcpy(&sl, ptr, sizeof(zrlog::string_literal_t));
+                ptr += sizeof(zrlog::string_literal_t); 
+                return sl; // 返回给 fmt，fmt 内部会自动调用我们上面写的 format_as
+            }
+            // 原有的深拷贝字符串提取逻辑
+            else if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*> ||
                 std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
                 uint32_t len;
                 std::memcpy(&len, ptr, sizeof(uint32_t));
                 const char* str = ptr + sizeof(uint32_t);
                 ptr += sizeof(uint32_t) + len;
-                // 零拷贝！直接返回内存视图
                 return std::string_view(str, len > 0 ? len - 1 : 0);
             }
+            // 基础类型提取逻辑
             else {
                 DecayedT val;
                 std::memcpy(&val, ptr, sizeof(DecayedT));
@@ -196,10 +259,14 @@ namespace zrlog {
         // 快速转换 9 位纳秒，消除除以10的耗时循环，直接查表批量处理
         inline void fast_u32_to_9digits(char* buf, uint32_t val) {
             if (val > 999999999) val = 999999999;
-            uint32_t d1 = val / 100000000; val %= 100000000;
-            uint32_t d2 = val / 1000000;   val %= 1000000;
-            uint32_t d3 = val / 10000;     val %= 10000;
-            uint32_t d4 = val / 100;       val %= 100;
+            uint32_t d1 = val / 100000000; 
+            val %= 100000000;
+            uint32_t d2 = val / 1000000;   
+            val %= 1000000;
+            uint32_t d3 = val / 10000;     
+            val %= 10000;
+            uint32_t d4 = val / 100;       
+            val %= 100;
             uint32_t d5 = val;
             buf[0] = (char)('0' + d1);
             fast_u32_to_2digits(buf + 1, d2);
@@ -232,8 +299,8 @@ namespace zrlog {
         TscClock& operator=(const TscClock&) = delete;
 
         struct Anchor {
-            uint64_t base_ns = 0;
-            uint64_t base_tsc = 0;
+            uint64_t base_ns{ 0 };
+            uint64_t base_tsc{ 0 };
         };
 
         static TscClock& instance() {
@@ -418,7 +485,7 @@ namespace zrlog {
                     ptr += ret;
                 }
                 else if (ret < 0) {
-                    if (errno == EINTR) {
+                    if (errno == EINTR || errno == EAGAIN) {
                         continue;
                     }
                     break;
@@ -614,14 +681,14 @@ namespace zrlog {
             const char* func, Args&&... args) {
 
             uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
-            if (0 == log_id) {
+            if ZRLOG_UNLIKELY(0 == log_id) {
                 // 将 FmtProvider 一同注入模板实例化
                 log_id = register_log_meta<FmtProvider, typename std::decay<Args>::type...>(
                     log_id_atom, level, file, line, func);
             }
 
             ThreadBuffer* buffer = get_thread_buffer();
-            if (nullptr != buffer) {
+            if ZRLOG_LIKELY(nullptr != buffer) {
                 uint32_t args_size = calculate_args_size_all(args...);
                 uint32_t total_size = sizeof(LogEntryHeader) + args_size;
                 char* ptr = buffer->alloc(total_size);
@@ -710,7 +777,11 @@ namespace zrlog {
         template <typename T>
         static uint32_t arg_size(const T& val) {
             using DecayedT = std::decay_t<T>;
-            if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
+            // 如果是静态字符串，只占用 16 字节的空间！彻底消除 O(N) 的 strlen 耗时
+            if constexpr (std::is_same_v<DecayedT, zrlog::string_literal_t>) {
+                return sizeof(zrlog::string_literal_t);
+            }
+            else if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
                 return sizeof(uint32_t) + (val ? (uint32_t)strlen(val) + 1 : 1);
             }
             else if constexpr (std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
@@ -739,7 +810,12 @@ namespace zrlog {
         template <typename T>
         static void serialize_arg(char*& ptr, const T& val) {
             using DecayedT = std::decay_t<T>;
-            if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
+            
+            if constexpr (std::is_same_v<DecayedT, zrlog::string_literal_t>) {
+                std::memcpy(ptr, &val, sizeof(zrlog::string_literal_t));
+                ptr += sizeof(zrlog::string_literal_t);
+            }
+            else if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
                 uint32_t len = val ? (uint32_t)strlen(val) + 1 : 1;
                 std::memcpy(ptr, &len, sizeof(uint32_t));
                 if (val) {
@@ -828,7 +904,6 @@ namespace zrlog {
                     space = out.available_size();
                 }
 
-                // 【极致魔法发生在这里】
                 // FmtProvider::compile() 提供了编译期的 AST (抽象语法树) 路由
                 // final_args... 提供了绝对零拷贝的内存视图 (string_view)
                 // 两者结合，fmt 库会生成最高效的汇编指令，直接将数据 memcpy 到 out.current_ptr()
@@ -862,7 +937,7 @@ namespace zrlog {
                 mask_ = size_ - 1;
                 buffer_.resize(size_);
 
-                // 【核心黑科技：按页预热 Fast Page Pre-faulting】
+                // 【按页预热 Fast Page Pre-faulting】
                 // 每 4096 字节写一个 0，强迫操作系统映射所有物理页，比全量 memset 快几倍
                 volatile char* p = buffer_.data();
                 for (size_t i = 0; i < size_; i += 4096) {
@@ -882,13 +957,13 @@ namespace zrlog {
             char* alloc(uint32_t len) {
                 uint64_t w = write_index_.load(std::memory_order_relaxed);
 
-                // 【核心黑科技：消除 P99 抖动】
+                // 【消除 P99 抖动】
                 // 使用非原子的本地缓存游标 `cached_read_index_` 判断空间。
                 // 在 99% 的情况下，直接 0 成本过检，彻底避免跨核心总线通信！
-                if (w + len - cached_read_index_ > size_) {
+                if ZRLOG_UNLIKELY(w + len - cached_read_index_ > size_) {
                     // 本地认为空间不够时，才付出代价去同步消费者最新的实际进度
                     cached_read_index_ = read_index_.load(std::memory_order_acquire);
-                    if (w + len - cached_read_index_ > size_) {
+                    if ZRLOG_UNLIKELY(w + len - cached_read_index_ > size_) {
                         return nullptr;
                     }
                 }
@@ -896,16 +971,16 @@ namespace zrlog {
                 uint32_t phys_w = w & mask_;
                 uint32_t tail_free = size_ - phys_w;
 
-                // 1. 物理尾部连续空间足够，直接分配
-                if (len <= tail_free) {
+                // 物理尾部连续空间足够，直接分配
+                if ZRLOG_LIKELY(len <= tail_free) {
                     return buffer_.data() + phys_w;
                 }
 
-                // 2. 物理尾部空间不够，必须绕回 (Wrap around)
+                // 物理尾部空间不够，必须绕回 (Wrap around)
                 // 再次检查逻辑空间 (加上绕回产生的 padding 浪费后) 是否够用
-                if (w + tail_free + len - cached_read_index_ > size_) {
+                if ZRLOG_UNLIKELY(w + tail_free + len - cached_read_index_ > size_) {
                     cached_read_index_ = read_index_.load(std::memory_order_acquire);
-                    if (w + tail_free + len - cached_read_index_ > size_) {
+                    if ZRLOG_UNLIKELY(w + tail_free + len - cached_read_index_ > size_) {
                         return nullptr;
                     }
                 }
@@ -913,7 +988,7 @@ namespace zrlog {
                 constexpr uint32_t HEADER_SIZE = sizeof(LogEntryHeader);
 
                 // 写入 Padding 占位符
-                if (tail_free >= HEADER_SIZE) {
+                if ZRLOG_LIKELY(tail_free >= HEADER_SIZE) {
                     write_padding_local(phys_w, tail_free);
                 }
 
@@ -936,13 +1011,13 @@ namespace zrlog {
             // 后台（消费者）接口
             // ------------------------------------------------------------------------
             LogEntryHeader* try_read() {
-                // 【核心黑科技：消费者全本地化】
+                // 【消费者全本地化】
                 // 消费者直接使用本地游标 local_read_index_，完全避开 atomic load
                 uint64_t r = local_read_index_;
 
-                if (r >= cached_write_index_) {
+                if ZRLOG_UNLIKELY(r >= cached_write_index_) {
                     cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                    if (r >= cached_write_index_) {
+                    if ZRLOG_UNLIKELY(r >= cached_write_index_) {
                         return nullptr;
                     }
                 }
@@ -950,13 +1025,13 @@ namespace zrlog {
                 constexpr int MAX_SKIPS = 8;
                 int skips = 0;
 
-                while (skips < MAX_SKIPS && r < cached_write_index_) {
+                while ZRLOG_LIKELY(skips < MAX_SKIPS && r < cached_write_index_) {
                     uint32_t phys_r = r & mask_;
                     uint32_t tail_avail = size_ - phys_r;
                     constexpr uint32_t HEADER_SIZE = sizeof(LogEntryHeader);
 
                     // 1. 隐式 Padding：尾部连 Header 都读不全
-                    if (tail_avail < HEADER_SIZE) {
+                    if ZRLOG_UNLIKELY(tail_avail < HEADER_SIZE) {
                         r += tail_avail;
                         local_read_index_ = r;
                         // 绕回时为了防止生产者卡死，强制推送一次游标
@@ -967,9 +1042,11 @@ namespace zrlog {
                     LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(buffer_.data() + phys_r);
 
                     // 2. 显式 Padding
-                    if (header->log_id == PADDING_ID) {
+                    if ZRLOG_UNLIKELY(header->log_id == PADDING_ID) {
                         uint32_t claimed = header->total_size;
-                        if (claimed < HEADER_SIZE || claimed > tail_avail) return nullptr;
+                        if ZRLOG_UNLIKELY(claimed < HEADER_SIZE || claimed > tail_avail) {
+                            return nullptr;
+                        }
                         r += claimed;
                         local_read_index_ = r;
                         // 遇到大块 padding 强制推送，迅速释放空间
@@ -979,9 +1056,9 @@ namespace zrlog {
                     }
 
                     // 3. 拦截未完全 Commit 的块
-                    if (r + header->total_size > cached_write_index_) {
+                    if ZRLOG_UNLIKELY(r + header->total_size > cached_write_index_) {
                         cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                        if (r + header->total_size > cached_write_index_) {
+                        if ZRLOG_UNLIKELY(r + header->total_size > cached_write_index_) {
                             return nullptr;
                         }
                     }
@@ -995,7 +1072,7 @@ namespace zrlog {
             inline void consume(uint32_t len) {
                 local_read_index_ += len;
 
-                // 【核心黑科技：游标批量提交 (Batch Commit)】
+                // 【游标批量提交 (Batch Commit)】
                 // 避免消费者疯狂 store 导致生产者 L1 Cache 失效。
                 // 每积攒 4096 字节（4KB）才提交一次给生产者看。
                 // 利用极速位运算判断是否跨越了 4096 边界 (0xFFF = 4095)。
@@ -1066,7 +1143,7 @@ namespace zrlog {
             }
 
             // =========================================================================
-            // 【核心黑科技：极其严格的缓存行物理隔离】
+            // 【极其严格的缓存行物理隔离】
             // C++17 alignas 将自动填充字节，彻底杜绝 False Sharing
             // =========================================================================
 
@@ -1132,7 +1209,7 @@ namespace zrlog {
         }
 
         ThreadBuffer* get_thread_buffer() {
-            if (nullptr == thread_buffer_) {
+            if ZRLOG_UNLIKELY(nullptr == thread_buffer_) {
                 thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size, get_thread_id());
                 thread_buffer_destroyer_.init();
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
@@ -1141,11 +1218,12 @@ namespace zrlog {
             return thread_buffer_;
         }
 
+
         size_t consume_buffers_round_robin(std::vector<LogMeta>& local_log_metas, IOBuffer& io_buf, bool full_drain = false) {
             size_t processed_count = 0;
 
             {
-                //追加日志元数据到本地集合
+                // 追加日志元数据到本地集合
                 std::lock_guard<SpinMutex> lock(log_metas_mutex_);
                 if (global_log_metas_.size() > local_log_metas.size()) {
                     local_log_metas.insert(local_log_metas.end(),
@@ -1155,6 +1233,8 @@ namespace zrlog {
             }
             {
                 // 【连续内存预取】将新增的 Buffer 高效转移到后台集合
+                // 注意：新加入的 Buffer 都在 vector 尾部，天生属于“非活跃区”，
+                // 下一次纪元扫描时如果有数据，自然会被提拔到前面。
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
                 if (!thread_buffers_.empty()) {
                     thread_buffers_bg_.insert(thread_buffers_bg_.end(), thread_buffers_.begin(), thread_buffers_.end());
@@ -1162,13 +1242,32 @@ namespace zrlog {
                 }
             }
 
-            LogEntryHeader* header;
-            // 【O(1) 遍历与删除】利用 vector 和 swap-and-pop 提升 CPU 预取命中率
-            for (size_t i = 0; i < thread_buffers_bg_.size(); ) {
-                ThreadBuffer* tb = thread_buffers_bg_[i];
-                uint32_t quota = full_drain ? UINT32_MAX : config_.per_thread_quota;
+            if (thread_buffers_bg_.empty()) {
+                return 0;
+            }
 
+            ++poll_cycles_;
+
+            // =========================================================================
+            // 1. 决定扫描策略 (Epoch Scan)
+            // =========================================================================
+            // 如果是全量 Drain，或者每 64 轮，或者当前没活跃线程，进行全量扫描
+            bool is_full_scan = full_drain || (poll_cycles_ % 64 == 0) || (active_buffer_count_ == 0);
+            size_t scan_limit = is_full_scan ? thread_buffers_bg_.size() : active_buffer_count_;
+
+            LogEntryHeader *header;
+
+            // =========================================================================
+            // 2. O(1) 原地分区遍历与消费算法
+            // =========================================================================
+            for (size_t i = 0; i < scan_limit; /* 注意：这里无 i++ */) {
+                ThreadBuffer *tb = thread_buffers_bg_[i];
+                uint32_t quota = full_drain ? UINT32_MAX : config_.per_thread_quota;
+                bool current_buffer_has_data = false;
+
+                // --- 业务消费逻辑开始 ---
                 while ((quota > 0) && (header = tb->try_read())) {
+                    current_buffer_has_data = true; // 标记本轮读到了数据
                     stat_consume_count_.fetch_add(1, std::memory_order_relaxed);
                     ++processed_count;
                     --quota;
@@ -1179,9 +1278,8 @@ namespace zrlog {
                         meta.decoder(args_ptr, meta, *header, tb->thread_id(), io_buf);
                         stat_consume_valid_count_.fetch_add(1, std::memory_order_relaxed);
                     }
-                    else {  //header->log_id 无效时
+                    else {  // header->log_id 无效时，尝试再次拉取元数据
                         {
-                            //追加日志元数据到本地集合
                             std::lock_guard<SpinMutex> lock(log_metas_mutex_);
                             if (global_log_metas_.size() > local_log_metas.size()) {
                                 local_log_metas.insert(local_log_metas.end(),
@@ -1203,21 +1301,65 @@ namespace zrlog {
 
                 // 一轮消费完了，如果是最后的数据，强制把游标更新出去
                 tb->flush_consume();
+                // --- 业务消费逻辑结束 ---
 
+                // =========================================================================
+                // 3. 处理线程死亡回收 (Deallocate)
+                // =========================================================================
                 if (tb->should_deallocate() && tb->estimate_used_space() == 0) {
                     delete tb;
 
-                    // 用尾部元素覆盖当前元素，然后 pop_back，避免 vector 整体搬移！
-                    if (i != thread_buffers_bg_.size() - 1) {
-                        thread_buffers_bg_[i] = thread_buffers_bg_.back();
+                    // 【极其关键的多重 swap 逻辑】：保护活跃分区边界不被破坏
+                    if (i < active_buffer_count_) {
+                        // 1. 如果死亡的线程在“活跃区”，先把它和活跃区的最后一个元素交换
+                        active_buffer_count_--;
+                        if (i != active_buffer_count_) {
+                            std::swap(thread_buffers_bg_[i], thread_buffers_bg_[active_buffer_count_]);
+                        }
+                        // 2. 现在死亡元素在 active_buffer_count_ 的位置（属于非活跃区开头），
+                        // 再把它和整个 vector 的最后一个元素交换，然后 pop
+                        if (active_buffer_count_ != thread_buffers_bg_.size() - 1) {
+                            std::swap(thread_buffers_bg_[active_buffer_count_], thread_buffers_bg_.back());
+                        }
                     }
+                    else {
+                        // 如果死亡的线程本来就在“非活跃区”，直接和 vector 最后一个元素交换并 pop
+                        if (i != thread_buffers_bg_.size() - 1) {
+                            std::swap(thread_buffers_bg_[i], thread_buffers_bg_.back());
+                        }
+                    }
+
                     thread_buffers_bg_.pop_back();
-                    // 注意这里不 ++i，因为当前位置 i 已经被塞入了新的尾部元素，下一轮还要检查它
+                    --scan_limit; // 删除了一个元素，扫描上限必须 -1
+
+                    // 元素已删除，当前索引 i 填入了新的未知元素，直接 continue 进入下一轮检查，绝对不能 ++i
+                    continue;
+                }
+
+                // =========================================================================
+                // 4. 活跃区提拔 (Promotion) 与 降级 (Demotion)
+                // =========================================================================
+                if (current_buffer_has_data) {
+                    // 【提拔】：发现数据，如果在非活跃区，提拔进活跃区
+                    if (i >= active_buffer_count_) {
+                        std::swap(thread_buffers_bg_[i], thread_buffers_bg_[active_buffer_count_]);
+                        ++active_buffer_count_;
+                    }
+                    ++i; // 当前槽位处理完毕，前进
                 }
                 else {
-                    ++i;
+                    // 【降级】：没有数据，如果霸占着活跃区，踢出去
+                    if (i < active_buffer_count_) {
+                        --active_buffer_count_;
+                        std::swap(thread_buffers_bg_[i], thread_buffers_bg_[active_buffer_count_]);
+                        // 注意这里不 ++i，因为换过来的新元素在位置 i，需要下一轮检查
+                    }
+                    else {
+                        // 本就在非活跃区且无数据，正常前进
+                        ++i;
+                    }
                 }
-            }
+            } // end for
 
             return processed_count;
         }
@@ -1229,7 +1371,8 @@ namespace zrlog {
 
             while (log_thread_running_.load(std::memory_order_relaxed)) {
                 size_t process_count = consume_buffers_round_robin(local_log_metas, io_buf, false);
-                if (process_count < 1) {  //idle
+
+                if (process_count < 1) {  // idle
                     io_buf.flush_to_os();
                     TscClock::instance().sync_system_time();
 
@@ -1243,6 +1386,7 @@ namespace zrlog {
             }
 
             // ==================== shutdown 全量 drain（绕过 256 限制） ====================
+            // 注意：full_drain = true 时，consume 内部的 scan_limit 会强制为 size()，保证彻底清空
             while (consume_buffers_round_robin(local_log_metas, io_buf, true) > 0) {
             }
 
@@ -1275,6 +1419,10 @@ namespace zrlog {
         SpinMutex thread_buffers_mutex_;
         std::vector<ThreadBuffer*> thread_buffers_;
         std::vector<ThreadBuffer*> thread_buffers_bg_;
+
+        // --- 活跃/非活跃列表分离优化专用 ---
+        size_t active_buffer_count_{ 0 }; // 活跃线程分界线 (索引)
+        uint64_t poll_cycles_{ 0 };       // 后台空转轮询次数计数器
 
         std::unique_ptr<ILogAppender> appender_;
         std::thread log_thread_;
@@ -1311,7 +1459,7 @@ namespace zrlog {
         if (logger.check_level(level)) {                                                            \
             static std::atomic<uint32_t> log_id{0};                                                 \
             struct FmtProvider {                                                                    \
-                /* 魔法发生在这里：利用预处理器将前缀和用户的 format_str 完美拼接！*/               \
+                /* 利用预处理器将前缀和用户的 format_str 完美拼接！*/                               \
                 static constexpr auto compile() {                                                   \
                     return FMT_COMPILE("{}.{:09d} {} {} {}:{} " format_str);                        \
                 }                                                                                   \
