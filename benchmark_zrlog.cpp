@@ -302,16 +302,16 @@ int main(int argc, char* argv[]) {
     std::string test = "test3...";
     ZRLOG_INFO("Begin {}", test);
 
-    //// Run benchmarks
-    //benchmark_clock();
-    ////benchmark_frontend_latency(2);
-    //benchmark_frontend_latency(500000);
-    ////benchmark_message_types(2);
-    //benchmark_message_types(100000);
-    //benchmark_throughput(5000000);
-    //benchmark_multi_thread(2, 1000000);
-    //benchmark_multi_thread(4, 1000000);
-    //benchmark_multi_thread(8, 500000);
+    // Run benchmarks
+    benchmark_clock();
+    //benchmark_frontend_latency(2);
+    benchmark_frontend_latency(500000);
+    //benchmark_message_types(2);
+    benchmark_message_types(100000);
+    benchmark_throughput(5000000);
+    benchmark_multi_thread(2, 1000000);
+    benchmark_multi_thread(4, 1000000);
+    benchmark_multi_thread(8, 500000);
 
     // Shutdown
     ZRLOG_FINI();

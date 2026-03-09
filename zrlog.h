@@ -169,7 +169,7 @@ namespace zrlog {
 
     // =========================================================================
     // format_as（利用 ADL 机制，必须写在 zrlog 命名空间内！）
-    // 当 fmt 遇到 string_literal_t 时，立刻按值转换为 std::string_view 保存，彻底消灭悬垂引用！
+    // 当 fmt 遇到 string_literal_t 时，转换为 std::string_view 保存，彻底消灭悬垂引用！
     // =========================================================================
     inline std::string_view format_as(const string_literal_t& sl) {
         return std::string_view(sl.ptr, sl.len);
