@@ -41,8 +41,8 @@ constexpr size_t CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 
 // 跨平台分支预测宏
 #if defined(__GNUC__) || defined(__clang__)
-    #define ZRLOG_LIKELY(x)   __builtin_expect(!!(x), 1)
-    #define ZRLOG_UNLIKELY(x) __builtin_expect(!!(x), 0)
+    #define ZRLOG_LIKELY(x)   (__builtin_expect(!!(x), 1))
+    #define ZRLOG_UNLIKELY(x) (__builtin_expect(!!(x), 0))
 #else
     // MSVC 或其他编译器不提供静态预测，直接返回表达式本身
     #define ZRLOG_LIKELY(x)   (x)
@@ -144,7 +144,7 @@ namespace zrlog {
 
     // 静态字符串(字面量) 绝对定长的结构体(拒绝任何对齐带来的错位可能)
     struct string_literal_t {
-        uint64_t ptr_val;
+        const char *ptr;
         uint32_t len;
         uint32_t padding;
     };
@@ -153,7 +153,7 @@ namespace zrlog {
     template <size_t N>
     inline constexpr string_literal_t literal(const char(&str)[N]) noexcept {
         // 安全转换指针为 uint64_t
-        return { static_cast<uint64_t>(reinterpret_cast<uintptr_t>(str)), static_cast<uint32_t>(N - 1), 0 };
+        return {str, static_cast<uint32_t>(N - 1), 0 };
     }
 
     inline namespace literals {
@@ -162,12 +162,8 @@ namespace zrlog {
         //ZRLOG_INFO("System error: {}", "Database connection lost"_sl);
 
         // 提供 C++11后缀糖字面量(Syntactic Sugar)，让写代码更优雅
-        inline string_literal_t operator""_sl(const char* str, size_t len) noexcept {
-            return {
-                static_cast<uint64_t>(reinterpret_cast<uintptr_t>(str)),
-                static_cast<uint32_t>(len),
-                0
-            };
+        inline constexpr string_literal_t operator""_sl(const char* str, size_t len) noexcept {
+            return { str, static_cast<uint32_t>(len), 0 };
         }
 
     }
@@ -177,10 +173,7 @@ namespace zrlog {
     // 当 fmt 遇到 string_literal_t 时，立刻按值转换为 std::string_view 保存，彻底消灭悬垂引用！
     // =========================================================================
     inline std::string_view format_as(const string_literal_t& sl) {
-        return std::string_view(
-            reinterpret_cast<const char*>(static_cast<uintptr_t>(sl.ptr_val)),
-            sl.len
-        );
+        return std::string_view(sl.ptr, sl.len);
     }
 
     // ---------------------------------------------------------------------------
