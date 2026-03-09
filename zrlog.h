@@ -142,18 +142,17 @@ namespace zrlog {
     //使用方法:
     //ZRLOG_INFO("System error: {}", zrlog::literal("Database connection lost"));
 
-    // 静态字符串(字面量) 绝对定长的结构体(拒绝任何对齐带来的错位可能)
+    // 静态字符串(字面量)
     struct string_literal_t {
         const char *ptr;
         uint32_t len;
-        uint32_t padding;
     };
 
     // 包装函数
     template <size_t N>
     inline constexpr string_literal_t literal(const char(&str)[N]) noexcept {
         // 安全转换指针为 uint64_t
-        return {str, static_cast<uint32_t>(N - 1), 0 };
+        return {str, static_cast<uint32_t>(N - 1)};
     }
 
     inline namespace literals {
@@ -163,7 +162,7 @@ namespace zrlog {
 
         // 提供 C++11后缀糖字面量(Syntactic Sugar)，让写代码更优雅
         inline constexpr string_literal_t operator""_sl(const char* str, size_t len) noexcept {
-            return { str, static_cast<uint32_t>(len), 0 };
+            return { str, static_cast<uint32_t>(len) };
         }
 
     }
