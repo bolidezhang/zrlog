@@ -163,9 +163,9 @@ zrlog::Config {
 
 Recommended defaults for many services:
 
-- `thread_buffer_size = 1MB`
-- `io_buffer_size = 1MB
-- `buffer_full_policy = Discard` (latency-sensitive) or `Retry` (balanced)
+- thread_buffer_size = 1MB`
+- io_buffer_size = 1MB
+- buffer_full_policy = Discard` (latency-sensitive) or `Retry` (balanced)
 
 ---
 
