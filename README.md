@@ -1,8 +1,5 @@
 ﻿# zrlog
 
-![C++17](https://img.shields.io/badge/Standard-C%2B%2B17-blue.svg)
-![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)
-
 **zrlog** is a C++17 asynchronous logging library engineered for **latency-sensitive and high-concurrency systems**.
 It focuses on extremely low frontend latency and very high throughput.
 
@@ -43,7 +40,7 @@ You can easily compile and run the included `benchmark_zrlog.cpp` to verify the 
 **1. Compile the benchmark:**
 Ensure you have cloned or downloaded `fmtlib`. Replace `/path/to/fmt/include` with your actual `fmt` header path.
 ```bash
-g++ -O3 -std=c++17 -pthread -I/path/to/fmt/include benchmark_zrlog.cpp -o benchmark_zrlog
+g++ -O3 -march=native -flto -std=c++17 -pthread -I./fmt/include benchmark_zrlog.cpp -o benchmark_zrlog
 ```
 
 **2. Run the benchmark:**
@@ -89,7 +86,7 @@ Execute the compiled binary. By default, it uses a 1MB thread buffer and the `Di
 **Compilation Example (GCC/Clang):**
 ```bash
 # Don't forget to include the fmtlib path
-g++ -O3 -std=c++17 -pthread -I/path/to/fmt/include main.cpp -o app
+g++ -O3 -march=native -flto -std=c++17 -pthread -I/path/to/fmt/include main.cpp -o app
 ```
 
 ---
