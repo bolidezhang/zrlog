@@ -2,8 +2,6 @@
 
 A C++17 single-header asynchronous logging library focused on **ultra-low latency** and **high throughput**.
 
-> 中文说明：`zrlog` 是一个 C++17 单头文件异步日志库，目标是低延迟、高吞吐。
-
 ---
 
 ## Why zrlog
