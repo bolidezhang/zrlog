@@ -14,13 +14,13 @@ endif()
 # 线程库（用于 std::thread）
 find_package(Threads REQUIRED)
 
-# ===== 修改：fmt 仅作为头文件库使用，只需添加包含路径 =====
-# 假设头文件位于 ./fmt 目录下（例如 ./fmt/fmt/core.h）
-# 如果 fmt 目录内部还有 include 子目录，请相应调整
-target_include_directories(benchmark_zrlog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fmt/include)
-
-# 可执行文件
+# 可执行文件 —— 必须先创建目标
 add_executable(benchmark_zrlog benchmark_zrlog.cpp)
+
+# ===== fmt 头文件路径（在目标创建后添加）=====
+# 假设头文件位于 ./fmt 目录下（例如 ./fmt/fmt/core.h）
+# 如果实际路径是 ./fmt/include，请相应修改
+target_include_directories(benchmark_zrlog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fmt/include)
 
 # 链接库：仅需要 Threads（fmt 无需链接）
 target_link_libraries(benchmark_zrlog PRIVATE
