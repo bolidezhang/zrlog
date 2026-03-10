@@ -1,5 +1,8 @@
 ﻿# zrlog
 
+![C++17](https://img.shields.io/badge/Standard-C%2B%2B17-blue.svg)
+![License](https://img.shields.io/badge/License-MIT-brightgreen.svg)
+
 **zrlog** is a C++17 asynchronous logging library engineered for **latency-sensitive and high-concurrency systems**.
 It focuses on extremely low frontend latency and very high throughput.
 
@@ -33,7 +36,36 @@ zrlog has been rigorously tested against industry-standard logging libraries. It
 *   **Top-Tier Class**: Belongs to the same nanosecond-level elite tier as `nanolog` and `fmtlog`.
 *   **Decimates Traditional Loggers**: Achieves **10x+ higher performance** (latency and throughput) compared to mainstream loggers like `spdlog`. It is an ideal replacement for High-Frequency Trading (HFT) and extreme low-latency backends.
 
-*(You can run the included `benchmark_zrlog.cpp` to verify the performance on your own hardware).*
+### 📊 Running the Benchmark
+
+You can easily compile and run the included `benchmark_zrlog.cpp` to verify the performance on your own hardware.
+
+**1. Compile the benchmark:**
+Ensure you have cloned or downloaded `fmtlib`. Replace `/path/to/fmt/include` with your actual `fmt` header path.
+```bash
+g++ -O3 -std=c++17 -pthread -I/path/to/fmt/include benchmark_zrlog.cpp -o benchmark_zrlog
+```
+
+**2. Run the benchmark:**
+Execute the compiled binary. By default, it uses a 1MB thread buffer and the `Discard` policy.
+```bash
+./benchmark_zrlog
+```
+
+*(Optional)* You can tune the benchmark by passing arguments:
+```bash
+# Usage: ./benchmark_zrlog [thread_buffer_size_MB] [buffer_full_policy]
+# buffer_full_policy: 0 = Discard, 1 = Block, 2 = Retry
+
+# Example: Run with a 2.5MB thread buffer and 'Retry' policy
+./benchmark_zrlog 2.5 2
+```
+
+**The benchmark suite executes the following tests:**
+1.  **Frontend Latency Test**: Measures the ns-level overhead of a single log call (Avg, MIN, MAX, P50, P90, P99, P99.9).
+2.  **Throughput Test**: Measures Million logs/sec (M logs/sec) in both single-threaded and multi-threaded scenarios.
+3.  **Message Type Latency**: Compares the serialization overhead of pure integers, strings, and mixed types.
+4.  **Clock Performance**: Compares the speed of the hardware `TscClock` vs the standard `std::chrono::system_clock`.
 
 ---
 
