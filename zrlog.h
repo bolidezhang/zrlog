@@ -673,19 +673,19 @@ namespace zrlog {
             const char* func, Args&&... args) {
 
             uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
-            if ZRLOG_UNLIKELY(0 == log_id) {
+            if (ZRLOG_UNLIKELY(0 == log_id)) {
                 // 将 FmtProvider 一同注入模板实例化
                 log_id = register_log_meta<FmtProvider, typename std::decay<Args>::type...>(
                     log_id_atom, level, file, line, func);
             }
 
             ThreadBuffer* buffer = get_thread_buffer();
-            if ZRLOG_LIKELY(nullptr != buffer) {
+            if (ZRLOG_LIKELY(nullptr != buffer)) {
                 uint32_t args_size = calculate_args_size_all(args...);
                 uint32_t total_size = sizeof(LogEntryHeader) + args_size;
                 char* ptr = buffer->alloc(total_size);
 
-                if (nullptr == ptr) {
+                if (ZRLOG_UNLIKELY(nullptr == ptr)) {
                     switch (config_.buffer_full_policy) {
                     case BufferFullPolicy::Discard:
                         return false;
@@ -711,7 +711,7 @@ namespace zrlog {
 
                             ++spin_count;
                             ptr = buffer->alloc(total_size); // 重新尝试分配
-                        } while (nullptr == ptr);
+                        } while (ZRLOG_UNLIKELY(nullptr == ptr));
                     }
                     break;
 
@@ -740,7 +740,7 @@ namespace zrlog {
 
                             ++spin_count;
                             ptr = buffer->alloc(total_size); // 重新尝试分配
-                        } while (nullptr == ptr);
+                        } while (ZRLOG_UNLIKELY(nullptr == ptr));
                     }
                     break;
 
