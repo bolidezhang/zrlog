@@ -85,8 +85,8 @@ int main() {
     cfg.appender = zrlog::AppenderType::File;
     cfg.filename = "app.log";
     cfg.level = zrlog::LogLevel::INFO;
-    cfg.thread_buffer_size = 1 * 1024 * 1024;  // per-thread 1MB
-    cfg.io_buffer_size     = 256 * 1024;       // backend I/O buffer
+    cfg.thread_buffer_size = 1 * 1024 * 1024;   // per-thread 1MB
+    cfg.io_buffer_size     = 1024 * 1024;       // backend I/O buffer
     cfg.buffer_full_policy = zrlog::BufferFullPolicy::Discard;
 
     if (!ZRLOG_INIT_CONF(cfg)) {
@@ -143,7 +143,6 @@ g++ -O3 -std=c++17 -pthread `pkg-config --cflags fmt` your_program.cpp `pkg-conf
 - `fatal error: fmt/compile.h: No such file or directory` — add `-I` to point to `fmt` headers or install `fmt`.
 - Linker errors for `-lfmt` — install and link `fmt` correctly or use header-only mode.
 - Using `%d`/`%s` style placeholders — replace them with `{}` style for all macros.
-- **未调用 `ZRLOG_FINI()` 导致日志丢失** — 请在程序退出前调用以刷新缓冲。
 
 ---
 
@@ -165,7 +164,7 @@ zrlog::Config {
 Recommended defaults for many services:
 
 - `thread_buffer_size = 1MB`
-- `io_buffer_size = 256KB`
+- `io_buffer_size = 1MB
 - `buffer_full_policy = Discard` (latency-sensitive) or `Retry` (balanced)
 
 ---
