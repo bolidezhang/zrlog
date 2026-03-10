@@ -938,7 +938,7 @@ namespace zrlog {
                 mask_ = size_ - 1;
                 buffer_.resize(size_);
 
-                // 【核心黑科技 1：消除 Max 级毛刺 按页预热 Fast Page Pre-faulting】
+                // 【消除 Max 级毛刺 按页预热 Fast Page Pre-faulting】
                 // 内存预热 (Pre-faulting)：强制操作系统立即分配并映射真实的物理内存页。
                 // 彻底杜绝在极速打印日志时触发 Page Fault (缺页中断) 导致的巨大抖动。
                 // 每 4096 字节写一个 0，强迫操作系统映射所有物理页，比全量 memset 快几倍
@@ -960,7 +960,7 @@ namespace zrlog {
             char* alloc(uint32_t len) {
                 uint64_t w = write_index_.load(std::memory_order_relaxed);
 
-                // 【核心黑科技 2：消除 P99 抖动】
+                // 【消除 P99 抖动】
                 // 使用非原子的本地缓存游标 `cached_read_index_` 判断空间。
                 // 在 99% 的情况下，直接 0 成本过检，彻底避免跨核心总线通信！
                 if (w + len - cached_read_index_ > size_) {
@@ -1014,7 +1014,7 @@ namespace zrlog {
             // 后台（消费者）接口
             // ------------------------------------------------------------------------
             LogEntryHeader* try_read() {
-                // 【核心黑科技 3：消费者全本地化】
+                // 【消费者全本地化】
                 // 消费者直接使用本地游标 local_read_index_，完全避开 atomic load
                 uint64_t r = local_read_index_;
 
@@ -1073,7 +1073,7 @@ namespace zrlog {
             inline void consume(uint32_t len) {
                 local_read_index_ += len;
 
-                // 【核心黑科技 4：游标批量提交 (Batch Commit)】
+                // 【游标批量提交 (Batch Commit)】
                 // 避免消费者疯狂 store 导致生产者 L1 Cache 失效。
                 // 每积攒 4096 字节（4KB）才提交一次给生产者看。
                 // 利用极速位运算判断是否跨越了 4096 边界 (0xFFF = 4095)。
@@ -1144,7 +1144,7 @@ namespace zrlog {
             }
 
             // =========================================================================
-            // 【核心黑科技 5：极其严格的缓存行物理隔离】
+            // 【极其严格的缓存行物理隔离】
             // C++17 alignas 将自动填充字节，彻底杜绝 False Sharing
             // =========================================================================
 
