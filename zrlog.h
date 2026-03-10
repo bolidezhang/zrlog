@@ -41,8 +41,8 @@ constexpr size_t CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 
 // 跨平台分支预测宏
 #if defined(__GNUC__) || defined(__clang__)
-    #define ZRLOG_LIKELY(x)   (__builtin_expect(!!(x), 1))
-    #define ZRLOG_UNLIKELY(x) (__builtin_expect(!!(x), 0))
+    #define ZRLOG_LIKELY(x)   __builtin_expect(!!(x), 1)
+    #define ZRLOG_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #else
     // MSVC 或其他编译器不提供静态预测，直接返回表达式本身
     #define ZRLOG_LIKELY(x)   (x)
@@ -572,10 +572,10 @@ namespace zrlog {
             }
 
             void append(const char* src, size_t len) {
-                if (pos_ + len > size_) {
+                if (ZRLOG_UNLIKELY(pos_ + len > size_)) {
                     flush_to_os();
                 }
-                if (len > size_) {
+                if (ZRLOG_UNLIKELY(len > size_)) {
                     appender_->writen(src, len);
                     return;
                 }
@@ -584,7 +584,7 @@ namespace zrlog {
             }
 
             void flush_to_os() {
-                if (pos_ > 0) {
+                if (ZRLOG_LIKELY(pos_ > 0)) {
                     appender_->writen(data_.data(), pos_);
                     pos_ = 0;
                 }
@@ -952,10 +952,10 @@ namespace zrlog {
                 // 【消除 P99 抖动】
                 // 使用非原子的本地缓存游标 `cached_read_index_` 判断空间。
                 // 在 99% 的情况下，直接 0 成本过检，彻底避免跨核心总线通信！
-                if ZRLOG_UNLIKELY(w + len - cached_read_index_ > size_) {
+                if (ZRLOG_UNLIKELY(w + len - cached_read_index_ > size_)) {
                     // 本地认为空间不够时，才付出代价去同步消费者最新的实际进度
                     cached_read_index_ = read_index_.load(std::memory_order_acquire);
-                    if ZRLOG_UNLIKELY(w + len - cached_read_index_ > size_) {
+                    if (ZRLOG_UNLIKELY(w + len - cached_read_index_ > size_)) {
                         return nullptr;
                     }
                 }
@@ -964,15 +964,15 @@ namespace zrlog {
                 uint32_t tail_free = size_ - phys_w;
 
                 // 物理尾部连续空间足够，直接分配
-                if ZRLOG_LIKELY(len <= tail_free) {
+                if (ZRLOG_LIKELY(len <= tail_free)) {
                     return buffer_.data() + phys_w;
                 }
 
                 // 物理尾部空间不够，必须绕回 (Wrap around)
                 // 再次检查逻辑空间 (加上绕回产生的 padding 浪费后) 是否够用
-                if ZRLOG_UNLIKELY(w + tail_free + len - cached_read_index_ > size_) {
+                if (ZRLOG_UNLIKELY(w + tail_free + len - cached_read_index_ > size_)) {
                     cached_read_index_ = read_index_.load(std::memory_order_acquire);
-                    if ZRLOG_UNLIKELY(w + tail_free + len - cached_read_index_ > size_) {
+                    if (ZRLOG_UNLIKELY(w + tail_free + len - cached_read_index_ > size_)) {
                         return nullptr;
                     }
                 }
@@ -980,7 +980,7 @@ namespace zrlog {
                 constexpr uint32_t HEADER_SIZE = sizeof(LogEntryHeader);
 
                 // 写入 Padding 占位符
-                if ZRLOG_LIKELY(tail_free >= HEADER_SIZE) {
+                if (ZRLOG_LIKELY(tail_free >= HEADER_SIZE)) {
                     write_padding_local(phys_w, tail_free);
                 }
 
@@ -1007,7 +1007,7 @@ namespace zrlog {
                 // 消费者直接使用本地游标 local_read_index_，完全避开 atomic load
                 uint64_t r = local_read_index_;
 
-                if ZRLOG_UNLIKELY(r >= cached_write_index_) {
+                if (ZRLOG_UNLIKELY(r >= cached_write_index_)) {
                     cached_write_index_ = write_index_.load(std::memory_order_acquire);
                     if ZRLOG_UNLIKELY(r >= cached_write_index_) {
                         return nullptr;
@@ -1017,13 +1017,13 @@ namespace zrlog {
                 constexpr int MAX_SKIPS = 8;
                 int skips = 0;
 
-                while ZRLOG_LIKELY(skips < MAX_SKIPS && r < cached_write_index_) {
+                while (ZRLOG_LIKELY(skips < MAX_SKIPS && r < cached_write_index_)) {
                     uint32_t phys_r = r & mask_;
                     uint32_t tail_avail = size_ - phys_r;
                     constexpr uint32_t HEADER_SIZE = sizeof(LogEntryHeader);
 
                     // 1. 隐式 Padding：尾部连 Header 都读不全
-                    if ZRLOG_UNLIKELY(tail_avail < HEADER_SIZE) {
+                    if (ZRLOG_UNLIKELY(tail_avail < HEADER_SIZE)) {
                         r += tail_avail;
                         local_read_index_ = r;
                         // 绕回时为了防止生产者卡死，强制推送一次游标
@@ -1034,7 +1034,7 @@ namespace zrlog {
                     LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(buffer_.data() + phys_r);
 
                     // 2. 显式 Padding
-                    if ZRLOG_UNLIKELY(header->log_id == PADDING_ID) {
+                    if (ZRLOG_UNLIKELY(header->log_id == PADDING_ID)) {
                         uint32_t claimed = header->total_size;
                         if ZRLOG_UNLIKELY(claimed < HEADER_SIZE || claimed > tail_avail) {
                             return nullptr;
@@ -1048,7 +1048,7 @@ namespace zrlog {
                     }
 
                     // 3. 拦截未完全 Commit 的块
-                    if ZRLOG_UNLIKELY(r + header->total_size > cached_write_index_) {
+                    if (ZRLOG_UNLIKELY(r + header->total_size > cached_write_index_)) {
                         cached_write_index_ = write_index_.load(std::memory_order_acquire);
                         if ZRLOG_UNLIKELY(r + header->total_size > cached_write_index_) {
                             return nullptr;
@@ -1068,7 +1068,7 @@ namespace zrlog {
                 // 避免消费者疯狂 store 导致生产者 L1 Cache 失效。
                 // 每积攒 4096 字节（4KB）才提交一次给生产者看。
                 // 利用极速位运算判断是否跨越了 4096 边界 (0xFFF = 4095)。
-                if ((local_read_index_ & 0xFFF) < len) {
+                if (ZRLOG_LIKELY((local_read_index_ & 0xFFF) < len)) {
                     read_index_.store(local_read_index_, std::memory_order_release);
                 }
             }
