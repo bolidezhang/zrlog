@@ -1201,7 +1201,7 @@ namespace zrlog {
         }
 
         ThreadBuffer* get_thread_buffer() {
-            if ZRLOG_UNLIKELY(nullptr == thread_buffer_) {
+            if (ZRLOG_UNLIKELY(nullptr == thread_buffer_)) {
                 thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size, get_thread_id());
                 thread_buffer_destroyer_.init();
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
