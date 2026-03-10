@@ -1009,7 +1009,7 @@ namespace zrlog {
 
                 if (ZRLOG_UNLIKELY(r >= cached_write_index_)) {
                     cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                    if ZRLOG_UNLIKELY(r >= cached_write_index_) {
+                    if (ZRLOG_UNLIKELY(r >= cached_write_index_)) {
                         return nullptr;
                     }
                 }
@@ -1036,7 +1036,7 @@ namespace zrlog {
                     // 2. 显式 Padding
                     if (ZRLOG_UNLIKELY(header->log_id == PADDING_ID)) {
                         uint32_t claimed = header->total_size;
-                        if ZRLOG_UNLIKELY(claimed < HEADER_SIZE || claimed > tail_avail) {
+                        if (ZRLOG_UNLIKELY(claimed < HEADER_SIZE || claimed > tail_avail)) {
                             return nullptr;
                         }
                         r += claimed;
@@ -1050,7 +1050,7 @@ namespace zrlog {
                     // 3. 拦截未完全 Commit 的块
                     if (ZRLOG_UNLIKELY(r + header->total_size > cached_write_index_)) {
                         cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                        if ZRLOG_UNLIKELY(r + header->total_size > cached_write_index_) {
+                        if (ZRLOG_UNLIKELY(r + header->total_size > cached_write_index_)) {
                             return nullptr;
                         }
                     }
