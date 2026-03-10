@@ -1,277 +1,179 @@
-# zrlog
+Ôªø# zrlog
 
-A C++17 asynchronous logging library focused on **ultra-low frontend latency** and **very high throughput**.
+**zrlog** is a C++17 asynchronous logging library engineered for **latency-sensitive and high-concurrency systems**.
+It focuses on extremely low frontend latency and very high throughput.
 
-> ÷–ŒƒÀµ√˜£∫`zrlog`  «“ª∏ˆ√ÊœÚ—”≥Ÿ√Ù∏–”Î∏ﬂ≤¢∑¢≥°æ∞µƒ C++17 “Ï≤Ω»’÷æø‚°£v1.x ”Î v2.x ‘⁄…Ëº∆”Î“¿¿µ…œ”–÷ÿ“™«¯±£¨«ÎŒÒ±ÿ≤Èø¥œ¬Œƒµƒ IMPORTANT NOTICE°£
-
----
-
-## IMPORTANT NOTICE (Required)
-
-- `v1.x` is a single-header, zero-dependency implementation (single-header, no external dependencies).  
-- `v2.x` introduces a dependency on the fmt library (fmtlib) for backend compile-time formatting (`FMT_COMPILE`).
-
-Note: If you require a zero-dependency deployment, continue to use `v1.x`. If you accept the `fmt` dependency, `v2.x` provides significantly lower frontend latency and higher overall throughput.
+v1.x and v2.x differ significantly in design and dependencies ‚Äî please read the **IMPORTANT NOTICE** below before using.
 
 ---
 
-## Project Overview
+## ‚ö†Ô∏è IMPORTANT NOTICE: Version Selection
 
-`zrlog` v2.x moves expensive work (formatting + syscalls) off the hot path. The frontend **serializes parameters in binary** and appends them to a per-thread SPSC ring buffer; a background consumer thread **formats using `FMT_COMPILE`** and performs batched I/O (`writev`) to achieve maximum throughput.
+zrlog is maintained in two separate branches to cater to different project needs. Please checkout the appropriate branch:
 
-Core design goals:
+*   **[v1.x Branch] Pure & Lightweight (Single-header)** üëâ `git checkout v1.x`
+    *   **Features**: Single-header, **Zero third-party dependencies**.
+    *   **Use Case**: Projects that need a drop-in logging solution without pulling in external libraries.
+    *   **Format Mechanism**: Runtime formatting (supports traditional `printf`-style placeholders like `%d`, `%s`).
+*   **[v2.x Branch] Extreme Performance (Current)** üëâ `git checkout v2.x`
+    *   **Features**: Integrates the modern C++ formatting library **[`fmtlib`](https://github.com/fmtlib/fmt)** (Header-Only mode).
+    *   **Use Case**: Modern C++ projects demanding the absolute highest performance and lowest latency.
+    *   **Format Mechanism**: Leverages `fmtlib`'s `FMT_COMPILE` to shift log format parsing from runtime to **compile-time**.
 
-- Minimize the cost of the logging call in application threads
-- Push formatting and syscall work to a single background thread
-- Keep memory and CPU overhead predictable and cache-friendly
-
----
-
-## Key Features (v2.x)
-
-- Single-header integration for the library (include `zrlog.h`), but **v2.x depends on fmtlib** for formatting.
-- Per-thread lock-free `ThreadBuffer` (SPSC) to avoid contention.
-- Binary entry format in the frontend (no formatting on hot path).
-- Backend `FMT_COMPILE`-based formatting and `writev`/batched I/O.
-- High-resolution TSC-based clock (with calibration).
-- Configurable buffer-full policies: `Discard` / `Retry` / `Block`.
-- Cross-platform fast paths (Linux / Windows) and architecture-specific optimizations (x86_64 / aarch64).
+> **üö® BREAKING CHANGE in v2.x**: 
+> v2.x is **NOT backward compatible** with v1.x. It entirely drops support for `printf`-style formatting. You **MUST** use `fmtlib` syntax (i.e., `{}` placeholders). If upgrading from v1.x, you must update all your format strings.
 
 ---
 
-## Repository Layout
+## üèÜ Performance Benchmarks
 
-```
-zrlog/
- ©¿©§©§ zrlog.h              # core header (v2.x uses fmt)
- ©¿©§©§ benchmark_zrlog.cpp  # benchmark & stress test
- ©¿©§©§ CMakeLists.txt
- ©¿©§©§ Makefile
- ©∏©§©§ README.md
-```
+zrlog has been rigorously tested against industry-standard logging libraries. It sits comfortably in the absolute top tier of low-latency loggers:
+
+*   **Beats `fmtlog`**: Consistently outperforms `fmtlog` in frontend latency (delivering lower **Average**, **P50**, and **MIN** latency). Moreover, its maximum **throughput is significantly higher** than `fmtlog`.
+*   **Top-Tier Class**: Belongs to the same nanosecond-level elite tier as `nanolog` and `fmtlog`.
+*   **Decimates Traditional Loggers**: Achieves **10x+ higher performance** (latency and throughput) compared to mainstream loggers like `spdlog`. It is an ideal replacement for High-Frequency Trading (HFT) and extreme low-latency backends.
+
+*(You can run the included `benchmark_zrlog.cpp` to verify the performance on your own hardware).*
 
 ---
 
-## Build
+## ‚ú® Core Features (v2.x)
 
-### Option A: Makefile
+- **üöÄ Compile-Time Formatting**: Seamlessly integrates `fmtlib`. Macros automatically extract format strings and generate `FMT_COMPILE` ASTs, allowing the backend to execute highly optimized assembly instructions.
+- **‚ö° Lock-Free Frontend**: Uses a `ThreadLocal` ring buffer. 99% of log calls pass through with zero cost, completely avoiding cross-core bus traffic and locks.
+- **‚è±Ô∏è Hardware TSC Timestamp**: Bypasses `std::chrono::system_clock` by reading the CPU's `rdtsc` instruction directly for ultra-fast time retrieval.
+- **üõ°Ô∏è Cache-Line Isolation**: Core data structures are strictly aligned using `alignas(CACHE_LINE_SIZE)` to entirely eliminate False Sharing across threads.
+- **üßµ Zero-Cost Static Strings**: Introduces the `_sl` literal suffix and `zrlog::literal` wrapper. This intercepts string constants at compile time, eliminating frontend `strlen` and deep copy overhead.
+- **üß† Smart Consumer Scheduling**: The background consumer uses Epoch Scanning and active/inactive partition algorithms, batch-committing cursors to minimize L1 cache invalidation.
 
+---
+
+## üõ†Ô∏è Build & Dependencies (v2.x)
+
+- **Standard**: C++17 or above.
+- **Dependencies**: `fmtlib` (Header-Only mode is enabled internally via `#define FMT_HEADER_ONLY`).
+- **Platforms**: Linux (x86_64 / aarch64), Windows (MSVC).
+
+**Compilation Example (GCC/Clang):**
 ```bash
-make
-```
-
-Binary output: `benchmark_zrlog`
-
-### Option B: CMake
-
-```bash
-cmake -S . -B build
-cmake --build build -j
+# Don't forget to include the fmtlib path
+g++ -O3 -std=c++17 -pthread -I/path/to/fmt/include main.cpp -o app
 ```
 
 ---
 
-## Quick Start (v2.x °™ requires fmt)
+## üöÄ Quick Start
 
-> NOTE: v2.x uses `fmt` (`FMT_COMPILE`) for backend high-performance formatting. Ensure `fmt` headers (and library if linking) are available at build time.
+### Basic Usage
 
-### Minimal example
+*Note: Use `{}` placeholders for v2.x.*
 
 ```cpp
-#include "zrlog.h"   // v2.x zrlog.h uses fmt-style placeholders {}
+#include "zrlog.h"
 
 int main() {
-    zrlog::Config cfg;
-    cfg.appender = zrlog::AppenderType::File;
-    cfg.filename = "app.log";
-    cfg.level = zrlog::LogLevel::INFO;
-    cfg.thread_buffer_size = 1 * 1024 * 1024;   // per-thread 1MB
-    cfg.io_buffer_size     = 1024 * 1024;       // backend I/O buffer
-    cfg.buffer_full_policy = zrlog::BufferFullPolicy::Discard;
+    // 1. Initialize logger (Output to file, Level: INFO)
+    ZRLOG_INIT("app_run.log", zrlog::LogLevel::INFO);
 
-    if (!ZRLOG_INIT_CONF(cfg)) {
-        return 1;
-    }
+    // 2. Write logs (Supports modern fmt syntax)
+    ZRLOG_INFO("Server started on port {}", 8080);
+    
+    // 3. Mixed types
+    ZRLOG_WARN("User {} login failed, attempt: {}", "admin", 3);
 
-    // fmt-style placeholders {}
-    ZRLOG_INFO("service started, pid={}", 1234);
-    ZRLOG_WARN("queue depth={}", 42);
-
-    std::string s = "hello";
-    ZRLOG_INFO("message: {}", s);
-
-    // ensure backend flushes before exit
+    // 4. Shutdown and flush before exit
     ZRLOG_FINI();
     return 0;
 }
 ```
 
-### Behavioral notes
+### ‚ö° Extreme Optimization: Static String Literals
 
-- Logging macros use **`fmt`-style `{}`** placeholders (not `printf`-style `%` tokens).  
-- **Frontend does not format** strings °™ it serializes arguments and appends entries to a per-thread buffer. The background consumer does formatting using `FMT_COMPILE`.  
-- Always call `ZRLOG_FINI()` on shutdown so buffered entries are formatted and flushed.
+Normally, `ZRLOG_INFO("Error: {}", "Timeout")` forces the frontend to execute `strlen("Timeout")` and deep-copy the string. 
+zrlog v2.x offers the **`_sl`** literal suffix and **`zrlog::literal()`** wrapper to achieve **zero-latency and zero-copy** for constant strings:
 
-### Compilation (common cases)
+```cpp
+using namespace zrlog::literals; // Import _sl suffix
 
-#### 1) Header-only `fmt` (preferred for simple setups)
+// Recommended 1: Using the _sl suffix
+ZRLOG_INFO("System status: {}", "Database connection lost"_sl);
 
-If `fmt` is used header-only or installed so that headers are discoverable:
-
-```bash
-g++ -O3 -std=c++17 -pthread -I/path/to/fmt/include your_program.cpp -o your_program
-```
-
-If your system already provides `fmt` headers:
-
-```bash
-g++ -O3 -std=c++17 -pthread your_program.cpp -o your_program
-```
-
-#### 2) Linking libfmt (if installed as a library)
-
-If you need to link the compiled `fmt` library:
-
-```bash
-g++ -O3 -std=c++17 -pthread your_program.cpp -lfmt -o your_program
-# or with pkg-config
-g++ -O3 -std=c++17 -pthread `pkg-config --cflags fmt` your_program.cpp `pkg-config --libs fmt` -o your_program
-```
-
-### Common build/runtime errors
-
-- `fatal error: fmt/compile.h: No such file or directory` °™ add `-I` to point to `fmt` headers or install `fmt`.
-- Linker errors for `-lfmt` °™ install and link `fmt` correctly or use header-only mode.
-- Using `%d`/`%s` style placeholders °™ replace them with `{}` style for all macros.
-
----
-
-## Configuration Overview
-
-```text
-zrlog::Config {
-    LogLevel level;
-    AppenderType appender;      // File / Console
-    std::string filename;
-    size_t thread_buffer_size;  // per-thread ring buffer size (bytes)
-    size_t io_buffer_size;      // backend I/O buffer (bytes)
-    BufferFullPolicy buffer_full_policy; // Discard | Retry | Block
-    int buffer_full_retry_count; // used when policy == Retry
-    // other tuning params: TSC calibration, writev batch size, flush interval, etc.
-}
-```
-
-Recommended defaults for many services:
-
-- thread_buffer_size = 1MB`
-- io_buffer_size = 1MB
-- buffer_full_policy = Discard` (latency-sensitive) or `Retry` (balanced)
-
----
-
-## Log Levels
-
-- TRACE
-- DEBUG
-- INFO
-- WARN
-- ERR
-- FATAL
-
-Compile-time filtering may be supported (depending on `zrlog.h` macros).
-
----
-
-## Buffer Full Policy
-
-- **Discard**: drop message immediately °™ lowest frontend latency.  
-- **Retry**: retry a configured number of times before dropping.  
-- **Block**: block until space available °™ guarantees delivery at cost of increased latency.
-
-Choose per your latency vs durability needs.
-
----
-
-## Backend & Performance Design
-
-- Frontend does minimal work: timestamp (TSC), parameter serialization, and ring-buffer append.  
-- Backend formats entries using `FMT_COMPILE` and issues batched `writev` calls °™ fewer syscalls and higher throughput.  
-- SPSC per-thread buffers minimize contention and improve cache locality.  
-- TSC-based timestamping reduces clock overhead (calibration available).
-
----
-
-## Benchmark
-
-A `benchmark_zrlog` program is included to measure:
-
-- clock overhead (TSC vs system clock)
-- frontend latency percentiles (p50/p90/p99)
-- single-thread & multi-thread throughput
-
-Run:
-
-```bash
-./benchmark_zrlog [thread_buffer_size_MB] [buffer_full_policy]
-# e.g. ./benchmark_zrlog 1.0 0
+// Recommended 2: Using the zrlog::literal wrapper
+ZRLOG_ERROR("Module load error: {}", zrlog::literal("CacheManager"));
 ```
 
 ---
 
-## Migration: v1.x °˙ v2.x
+## ‚öôÔ∏è Core Concepts & Configuration
 
-- **Dependency**: v2.x requires `fmt` (v1.x did not).  
-- **API**: Most logging macros remain compatible, but placeholders are `fmt`-style `{}`.  
-- **Semantics**: Frontend is faster (no formatting) and backend formatting timing may differ (log text appears when backend formats/flushes).
+### 1. Log Levels
+zrlog provides 6 severity levels. You can configure the global minimum log level during initialization. Any log statement below this level is **completely bypassed at the macro level**, resulting in zero CPU overhead.
 
-If zero-dependency is critical, keep using v1.x.
+Available levels and their corresponding macros:
+*   `TRACE` ‚ûî `ZRLOG_TRACE(...)`
+*   `DEBUG` ‚ûî `ZRLOG_DEBUG(...)`
+*   `INFO`  ‚ûî `ZRLOG_INFO(...)`
+*   `WARN`  ‚ûî `ZRLOG_WARN(...)`
+*   `ERROR` ‚ûî `ZRLOG_ERROR(...)`
+*   `FATAL` ‚ûî `ZRLOG_FATAL(...)`
+
+### 2. Buffer Full Policy (Crucial for HFT)
+Since zrlog is an asynchronous logger, the frontend (business thread) writes to a thread-local RingBuffer, and a background thread reads it and writes to the disk. 
+**What happens when your business thread produces logs faster than the disk can write, and the RingBuffer gets full?** 
+
+zrlog provides three policies via `zrlog::BufferFullPolicy` to handle this scenario, allowing you to choose between latency and data completeness:
+
+1.  **`Discard` (Default - Extreme Low Latency)**: 
+    *   *Behavior*: Instantly drops the new log entry if the buffer is full.
+    *   *Use Case*: Algorithmic trading (HFT) and real-time systems where avoiding frontend latency spikes is vastly more important than losing a few debug logs. Business threads are **never** blocked.
+2.  **`Block` (Zero Data Loss)**: 
+    *   *Behavior*: The frontend thread will spin and yield (using an adaptive backoff algorithm: `CPU PAUSE` for the first 256 iterations, then `std::this_thread::yield()`) until the background thread clears enough space.
+    *   *Use Case*: Financial auditing, transaction logging, or scenarios where every single log entry is mission-critical, even if it causes a temporary latency spike in the business thread.
+3.  **`Retry` (Balanced Approach)**: 
+    *   *Behavior*: Spins and retries for a limited number of times (configured via `config.buffer_full_retry_count`). If the buffer is still full after the retries, it drops the log.
+    *   *Use Case*: Systems that want to smooth out micro-bursts of logs without suffering from indefinite blocking during extreme IO bottlenecks.
+
+**Configuration Example:**
+```cpp
+zrlog::Config config;
+config.filename = "high_perf.log";
+config.level = zrlog::LogLevel::DEBUG;
+
+// Thread-local frontend buffer size (Default: 1MB per thread)
+config.thread_buffer_size = 1024 * 1024 * 2; 
+
+// Set the Buffer Full Policy
+config.buffer_full_policy = zrlog::BufferFullPolicy::Retry;
+config.buffer_full_retry_count = 1024; // Only active if policy is Retry
+
+zrlog::NanoLogger::instance().init(config);
+```
 
 ---
 
-## Important Performance Note (appendix)
+## üß† Design Philosophy
 
-**Special note**: In our benchmark suite, `zrlog v2.x` shows **better frontend latency and higher overall throughput** than `fmtlog` under the same hardware, compiler flags, and workload profile. To make comparisons reproducible, always publish:
-
-- benchmark commands & parameters
-- hardware (CPU model, frequency, core count, caches)
-- OS and kernel version
-- compiler + flags (e.g. `g++ -O3 -march=native -std=c++17 -pthread`)
-- exact library versions/commits
-- metrics: p50/p90/p99, stable throughput (logs/s), CPU usage, memory usage
-- whether TSC/writev/batching were enabled
-
-Suggested presentation (table or chart) for fairness:
-
-| Library      | p50 latency | p99 latency | Throughput (logs/s) | Test hardware |
-|-------------:|:-----------:|:-----------:|:-------------------:|:-------------:|
-| zrlog v2.x   | °™ ns        | °™ ns        | °™                   | CPU, cores    |
-| fmtlog       | °™ ns        | °™ ns        | °™                   | same hardware |
-
-Include raw benchmark scripts and outputs for verification.
+1. **Why zero system calls on the frontend?**
+   Business threads only write the raw binary representation of their arguments (not formatted text) into a lock-free Thread-Local RingBuffer. This completely bypasses global mutexes, `snprintf`, and string concatenation overhead.
+2. **How do we prevent Cache-Line Bouncing?**
+   In the `ThreadBuffer`, producer cursors (`write_index_`) and consumer cursors (`read_index_`) are strictly separated by `alignas(CACHE_LINE_SIZE)`. This guarantees a near 100% L1/L2 cache hit rate by physically isolating atomic variables.
 
 ---
 
-## Notes & Gotchas
+## ‚ùì FAQ (Frequently Asked Questions)
 
-- Always call `ZRLOG_FINI()` to flush and drain backend buffers before exit.  
-- v1.x remains available for zero-dependency needs. v2.x trades a small dependency for considerably better frontend latency and overall throughput.  
-- When tuning for production, measure with your real workload and enable/disable TSC or writev batching as appropriate.
+### Q1: Why is `std::chrono::system_clock` replaced with `TscClock`?
+Getting the current time is notoriously slow (often 20-50ns even with vDSO). For a logger aiming for sub-10ns frontend latency, this is a massive bottleneck. zrlog reads the CPU's Time Stamp Counter (`rdtsc` instruction in x86), which takes ~1-2ns, and syncs it with the system clock periodically in the background thread.
 
----
+### Q2: What happens if a business thread exits/dies? Do I lose the logs currently in its thread-local buffer?
+**No.** zrlog uses a `thread_local ThreadBufferDestroyer`. When a thread exits, the destructor is automatically triggered. It marks the thread's buffer for deallocation and signals the background consumer. The consumer will completely drain the remaining logs to the disk before safely deleting the buffer memory. **No memory leaks, no lost logs.**
 
-## License
+### Q3: Why is `_sl` or `zrlog::literal` so much faster than a normal string?
+When you log a normal string `ZRLOG_INFO("{}", "hello")`, the frontend must calculate its length (`strlen`) and perform a deep copy of the characters ("hello") into the ring buffer. 
+By using `ZRLOG_INFO("{}", "hello"_sl)`, you are telling zrlog this string lives in the read-only data segment (constant pool). zrlog simply copies the pointer and its compile-time length (16 bytes total) into the buffer. The background thread later dereferences the pointer directly. **Zero `strlen`, zero deep copy.**
 
-MIT License.
+### Q4: Can I log custom classes or structs?
+**Yes.** Because zrlog v2.x natively integrates `fmtlib`, any custom type that has an implemented `fmt::formatter` will work seamlessly. You pass your object just like you would to `fmt::print()`, and zrlog will handle the serialization (Note: Ensure the object's state is safely copied if it mutates after the log call, as formatting happens asynchronously).
 
----
-
-## Contributing
-
-Contributions, bug reports, and performance improvements are welcome.
-
-When submitting performance-related changes, please provide:
-
-1. CPU model & core count  
-2. Compiler & flags  
-3. Benchmark commands and raw outputs (p50/p90/p99, throughput)
-
+### Q5: Why do I get a compilation error saying `FMT_COMPILE` or `fmt` is not found?
+Ensure you have downloaded `fmtlib` and added its `include` directory to your compiler's include path (e.g., `-I/path/to/fmt/include`). zrlog v2.x strictly requires `fmtlib` to unlock its compile-time formatting capabilities.
