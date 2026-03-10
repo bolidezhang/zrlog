@@ -160,7 +160,7 @@ namespace zrlog {
         //使用方法:
         //ZRLOG_INFO("System error: {}", "Database connection lost"_sl);
 
-        // 提供 C++11后缀糖字面量(Syntactic Sugar)，让写代码更优雅
+        // 提供 C++11后缀糖字面量(Syntactic Sugar)，让代码更优雅
         inline constexpr string_literal_t operator""_sl(const char* str, size_t len) noexcept {
             return { str, static_cast<uint32_t>(len) };
         }

@@ -33,7 +33,7 @@ Core design goals:
 - Per-thread lock-free `ThreadBuffer` (SPSC) to avoid contention.
 - Binary entry format in the frontend (no formatting on hot path).
 - Backend `FMT_COMPILE`-based formatting and `writev`/batched I/O.
-- High-resolution TSC-based clock (with calibration); fallback to system clock where needed.
+- High-resolution TSC-based clock (with calibration).
 - Configurable buffer-full policies: `Discard` / `Retry` / `Block`.
 - Cross-platform fast paths (Linux / Windows) and architecture-specific optimizations (x86_64 / aarch64).
 
