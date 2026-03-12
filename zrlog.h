@@ -1,8 +1,14 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.1.0
-#define ZRLOG_VERSION 20100
+// 如：2.2.1
+#define ZRLOG_VERSION 20201
+
+// ============================================================================
+// 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
+// 参数依次为: 1.时间字符串 2.纳秒 3.日志级别 4.线程ID 5.文件名 6.行号
+// ============================================================================
+#define ZRLOG_HEADER_FMT "{}.{:09d} {} {} {}:{} "
 
 // ============================================================================
 // 引入 fmtlib (Header-Only 模式 & 编译期优化支持)
@@ -41,12 +47,12 @@ constexpr size_t CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 
 // 跨平台分支预测宏
 #if defined(__GNUC__) || defined(__clang__)
-    #define ZRLOG_LIKELY(x)   __builtin_expect(!!(x), 1)
-    #define ZRLOG_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define ZRLOG_LIKELY(x)   __builtin_expect(!!(x), 1)
+#define ZRLOG_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #else
     // MSVC 或其他编译器不提供静态预测，直接返回表达式本身
-    #define ZRLOG_LIKELY(x)   (x)
-    #define ZRLOG_UNLIKELY(x) (x)
+#define ZRLOG_LIKELY(x)   (x)
+#define ZRLOG_UNLIKELY(x) (x)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -144,19 +150,17 @@ namespace zrlog {
 
     // 静态字符串(字面量)
     struct string_literal_t {
-        const char *ptr;
+        const char* ptr;
         uint32_t len;
     };
 
     // 包装函数
     template <size_t N>
     inline constexpr string_literal_t literal(const char(&str)[N]) noexcept {
-        // 安全转换指针为 uint64_t
-        return {str, static_cast<uint32_t>(N - 1)};
+        return { str, static_cast<uint32_t>(N > 0 ? N - 1 : 0) };
     }
 
     inline namespace literals {
-
         //使用方法:
         //ZRLOG_INFO("System error: {}", "Database connection lost"_sl);
 
@@ -164,7 +168,6 @@ namespace zrlog {
         inline constexpr string_literal_t operator""_sl(const char* str, size_t len) noexcept {
             return { str, static_cast<uint32_t>(len) };
         }
-
     }
 
     // =========================================================================
@@ -191,28 +194,25 @@ namespace zrlog {
             >;
         };
 
-        // 指针漂移提取器
+        // 指针漂移提取器 (反序列化)
         template <typename T>
         static auto decode_arg(char*& ptr) -> typename decode_type<std::decay_t<T>>::type {
             using DecayedT = std::decay_t<T>;
 
-            // 直接读取string_literal_t结构体
             if constexpr (std::is_same_v<DecayedT, zrlog::string_literal_t>) {
                 zrlog::string_literal_t sl;
                 std::memcpy(&sl, ptr, sizeof(zrlog::string_literal_t));
-                ptr += sizeof(zrlog::string_literal_t); 
-                return sl; // 返回给 fmt，fmt 内部会自动调用我们上面写的 format_as
+                ptr += sizeof(zrlog::string_literal_t);
+                return sl;
             }
-            // 原有的深拷贝字符串提取逻辑
             else if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*> ||
                 std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
                 uint32_t len;
                 std::memcpy(&len, ptr, sizeof(uint32_t));
                 const char* str = ptr + sizeof(uint32_t);
                 ptr += sizeof(uint32_t) + len;
-                return std::string_view(str, len > 0 ? len - 1 : 0);
+                return std::string_view(str, len);
             }
-            // 基础类型提取逻辑
             else {
                 DecayedT val;
                 std::memcpy(&val, ptr, sizeof(DecayedT));
@@ -251,13 +251,13 @@ namespace zrlog {
         // 快速转换 9 位纳秒，消除除以10的耗时循环，直接查表批量处理
         inline void fast_u32_to_9digits(char* buf, uint32_t val) {
             if (val > 999999999) val = 999999999;
-            uint32_t d1 = val / 100000000; 
+            uint32_t d1 = val / 100000000;
             val %= 100000000;
-            uint32_t d2 = val / 1000000;   
+            uint32_t d2 = val / 1000000;
             val %= 1000000;
-            uint32_t d3 = val / 10000;     
+            uint32_t d3 = val / 10000;
             val %= 10000;
-            uint32_t d4 = val / 100;       
+            uint32_t d4 = val / 100;
             val %= 100;
             uint32_t d5 = val;
             buf[0] = (char)('0' + d1);
@@ -430,10 +430,23 @@ namespace zrlog {
     enum class LogLevel : uint8_t {
         TRACE = 0, DEBUG, INFO, WARN, ERR, FATAL
     };
-    inline const char* loglevel_to_string(LogLevel level) {
-        static const char* names[] = { "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL" };
+
+    // 1. 使用 constexpr 保证编译期求值，零运行时开销
+    // 2. 按值返回 std::string_view
+    // 3. 加上 noexcept 关键字，便于编译器优化
+    inline constexpr std::string_view loglevel_to_string(LogLevel level) noexcept {
+        // 使用 constexpr 数组，完全存储在只读数据段 (.rodata)
+        constexpr std::string_view names[] = {
+            "TRACE", "DEBUG", "INFO", "WARN", "ERROR", "FATAL"
+        };
+        //return names[static_cast<uint8_t>(level)];
+
+        // 恢复边界检查，这在日志库中非常关键（防止打印脏数据导致崩溃）
         uint8_t idx = static_cast<uint8_t>(level);
-        return (idx <= 5) ? names[idx] : "UNKNOWN";
+        if (ZRLOG_LIKELY(idx < std::size(names))) {
+            return names[idx];
+        }
+        return "UNKNOWN";
     }
 
     enum class AppenderType : uint8_t {
@@ -543,16 +556,16 @@ namespace zrlog {
         class IOBuffer;
         struct LogMeta;
         struct LogEntryHeader;
-        // Decoder 签名新增 thread_id 参数，避免在每条 Header 中重复存储
         using DecoderFn = void(*)(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out);
 
         struct LogMeta {
-            uint32_t    id;
-            LogLevel    level;
-            const char* file;
-            uint32_t    line;
-            const char* func;
-            DecoderFn   decoder; // 格式化字符串已被 FMT_COMPILE 吸收，无需 std::string format
+            uint32_t    id = 0;
+            LogLevel    level = LogLevel::TRACE;
+            uint32_t    line = 0;
+            std::string_view file;
+            std::string_view func;
+            std::string format;
+            DecoderFn   decoder;
         };
 
         // 【极限压缩】将 LogEntryHeader 压缩至 16 字节，大幅提升缓存命中率与容量
@@ -666,165 +679,172 @@ namespace zrlog {
         }
 
         // ========================================================================
-        // Frontend: 接收由宏传入的 FmtProvider (包含编译期的 FMT_COMPILE 结构)
+        // Frontend: 静态日志入口 (通过 FMT_COMPILE 实现极致前端序列化)
         // ========================================================================
         template<typename FmtProvider, typename... Args>
-        bool log(std::atomic<uint32_t>& log_id_atom, LogLevel level, const char* file, uint32_t line,
-            const char* func, Args&&... args) {
+        bool log(std::atomic<uint32_t>& log_id_atom, LogLevel level, std::string_view file, uint32_t line,
+            std::string_view func, Args&&... args) {
 
             uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
             if (ZRLOG_UNLIKELY(0 == log_id)) {
-                // 将 FmtProvider 一同注入模板实例化
                 log_id = register_log_meta<FmtProvider, typename std::decay<Args>::type...>(
                     log_id_atom, level, file, line, func);
             }
 
-            ThreadBuffer* buffer = get_thread_buffer();
-            if (ZRLOG_LIKELY(nullptr != buffer)) {
-                uint32_t args_size = calculate_args_size_all(args...);
-                uint32_t total_size = sizeof(LogEntryHeader) + args_size;
-                char* ptr = buffer->alloc(total_size);
+            return push_log_entry(log_id, std::forward<Args>(args)...);
+        }
 
-                if (ZRLOG_UNLIKELY(nullptr == ptr)) {
-                    switch (config_.buffer_full_policy) {
-                    case BufferFullPolicy::Discard:
-                        return false;
+        // ========================================================================
+        // Frontend: 动态日志入口 (支持运行时 std::string format)
+        // ========================================================================
+        template<typename... Args>
+        bool log_runtime(std::atomic<uint32_t>& log_id_atom, LogLevel level, std::string_view file, uint32_t line,
+            std::string_view func, std::string_view format, Args&&... args) {
 
-                    case BufferFullPolicy::Block: {
-                        // 兜底：如果后台消费者线程碰巧在休眠，强制唤醒它赶紧消费腾出空间
-                        notify_consumer();
-
-                        uint32_t spin_count = 0;
-                        do {
-                            // 如果后端线程已经停止，避免死循环
-                            if (!log_thread_running_.load(std::memory_order_relaxed)) {
-                                return false;
-                            }
-
-                            // 智能退避算法 (Adaptive Backoff)
-                            if (spin_count < 256) {
-                                ZRLOG_CPU_PAUSE(); // 前256次仅做CPU级自旋，避免上下文切换的重负载
-                            }
-                            else {
-                                std::this_thread::yield(); // 之后让出线程时间片，防止前端线程把CPU跑满100%导致消费者饿死
-                            }
-
-                            ++spin_count;
-                            ptr = buffer->alloc(total_size); // 重新尝试分配
-                        } while (ZRLOG_UNLIKELY(nullptr == ptr));
-                    }
-                    break;
-
-                    case BufferFullPolicy::Retry: {
-                        // 兜底：如果后台消费者线程碰巧在休眠，强制唤醒它赶紧消费腾出空间
-                        notify_consumer();
-
-                        uint32_t spin_count = 0;
-                        do {
-                            // 如果后端线程已经停止，避免死循环
-                            if (!log_thread_running_.load(std::memory_order_relaxed)) {
-                                return false;
-                            }
-
-                            if (spin_count >= config_.buffer_full_retry_count) {
-                                return false; // 策略3：超过重试次数，最终丢弃
-                            }
-
-                            // 智能退避算法 (Adaptive Backoff)
-                            if (spin_count < 256) {
-                                ZRLOG_CPU_PAUSE(); // 前256次仅做CPU级自旋，避免上下文切换的重负载
-                            }
-                            else {
-                                std::this_thread::yield(); // 之后让出线程时间片，防止前端线程把CPU跑满100%导致消费者饿死
-                            }
-
-                            ++spin_count;
-                            ptr = buffer->alloc(total_size); // 重新尝试分配
-                        } while (ZRLOG_UNLIKELY(nullptr == ptr));
-                    }
-                    break;
-
-                    default:
-                        return false;
-
-                    }
-                }
-
-                // 如果走到这里，说明 ptr 必然不为 nullptr (分配成功)
-                LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(ptr);
-                header->total_size = total_size;
-                header->log_id = log_id;
-                header->time = TscClock::now_ns_i();
-                serialize_args_all(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
-                buffer->commit(total_size);
-                notify_consumer();
-
-                return true;
+            uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
+            if (ZRLOG_UNLIKELY(0 == log_id)) {
+                log_id = register_runtime_log_meta<typename std::decay<Args>::type...>(
+                    log_id_atom, level, file, line, func, format);
             }
 
-            return false;
+            return push_log_entry(log_id, std::forward<Args>(args)...);
         }
 
     private:
+
+        // ========================================================================
+        // 公共的入队与序列化逻辑 (被 log 和 log_runtime 共同调用，完美转发)
+        // ========================================================================
+        template<typename... Args>
+        inline bool push_log_entry(uint32_t log_id, Args&&... args) {
+            ThreadBuffer *buffer = get_thread_buffer();
+            if (ZRLOG_UNLIKELY(nullptr == buffer)) {
+                return false;
+            }
+
+            uint32_t args_size = calculate_args_size_all(args...);
+            uint32_t total_size = sizeof(LogEntryHeader) + args_size;
+            char* ptr = buffer->alloc(total_size);
+
+            if (ZRLOG_UNLIKELY(nullptr == ptr)) {
+                switch (config_.buffer_full_policy) {
+                case BufferFullPolicy::Discard:
+                    return false;
+
+                case BufferFullPolicy::Block: {
+                    notify_consumer();
+                    uint32_t spin_count = 0;
+                    do {
+                        if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                            return false;
+                        }
+                        if (spin_count < 256) {
+                            ZRLOG_CPU_PAUSE();
+                        }
+                        else {
+                            std::this_thread::yield();
+                        }
+                        ++spin_count;
+                        ptr = buffer->alloc(total_size);
+                    } while (ZRLOG_UNLIKELY(nullptr == ptr));
+                }
+                break;
+
+                case BufferFullPolicy::Retry: {
+                    notify_consumer();
+                    uint32_t spin_count = 0;
+                    do {
+                        if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                            return false;
+                        }
+                        if (spin_count >= config_.buffer_full_retry_count) {
+                            return false;
+                        }
+                        if (spin_count < 256) {
+                            ZRLOG_CPU_PAUSE();
+                        }
+                        else {
+                            std::this_thread::yield();
+                        }
+                        ++spin_count;
+                        ptr = buffer->alloc(total_size);
+                    } while (ZRLOG_UNLIKELY(nullptr == ptr));
+                }
+                break;
+
+                default:
+                    return false;
+                }
+            }
+
+            // 分配成功，进行真正的极速序列化
+            LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(ptr);
+            header->total_size = total_size;
+            header->log_id = log_id;
+            header->time = TscClock::now_ns_i();
+            serialize_args_all(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
+            buffer->commit(total_size);
+            notify_consumer();
+
+            return true;
+        }
+
+        // ------------------------------------------------------------------------
+        // 极速前端序列化引擎 (零拷贝、无 \0 冗余)
+        // ------------------------------------------------------------------------
         template <typename T>
-        static uint32_t arg_size(const T& val) {
+        static constexpr uint32_t arg_size(const T& val) noexcept {
             using DecayedT = std::decay_t<T>;
-            // 如果是静态字符串，只占用 16 字节的空间！彻底消除 O(N) 的 strlen 耗时
             if constexpr (std::is_same_v<DecayedT, zrlog::string_literal_t>) {
                 return sizeof(zrlog::string_literal_t);
             }
             else if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
-                return sizeof(uint32_t) + (val ? (uint32_t)strlen(val) + 1 : 1);
+                return sizeof(uint32_t) + (val ? (uint32_t)strlen(val) : 0);
             }
             else if constexpr (std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
-                return sizeof(uint32_t) + (uint32_t)val.size() + 1;
+                return sizeof(uint32_t) + (uint32_t)val.size();
             }
             else {
                 return sizeof(T);
             }
         }
 
-        // 拦截字符串常量池字面量，如 "hello"，直接用 N 计算，彻底消灭前端 strlen
         template <size_t N>
-        static uint32_t arg_size(const char(&)[N]) {
-            return sizeof(uint32_t) + N;
+        static constexpr uint32_t arg_size(const char(&)[N]) noexcept {
+            return sizeof(uint32_t) + (N > 0 ? static_cast<uint32_t>(N - 1) : 0);
         }
 
-        static uint32_t calculate_args_size_all() { 
-            return 0; 
+        static constexpr uint32_t calculate_args_size_all() noexcept {
+            return 0;
         }
 
         template <typename... Args>
-        static uint32_t calculate_args_size_all(const Args&... args) {
+        static constexpr uint32_t calculate_args_size_all(const Args&... args) noexcept {
             return (0 + ... + arg_size(args));
         }
 
         template <typename T>
         static void serialize_arg(char*& ptr, const T& val) {
             using DecayedT = std::decay_t<T>;
-            
+
             if constexpr (std::is_same_v<DecayedT, zrlog::string_literal_t>) {
                 std::memcpy(ptr, &val, sizeof(zrlog::string_literal_t));
                 ptr += sizeof(zrlog::string_literal_t);
             }
             else if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
-                uint32_t len = val ? (uint32_t)strlen(val) + 1 : 1;
+                uint32_t len = val ? (uint32_t)strlen(val) : 0;
                 std::memcpy(ptr, &len, sizeof(uint32_t));
-                if (val) {
+                if (len > 0) {
                     std::memcpy(ptr + sizeof(uint32_t), val, len);
-                }
-                else {
-                    *(ptr + sizeof(uint32_t)) = '\0';
                 }
                 ptr += sizeof(uint32_t) + len;
             }
             else if constexpr (std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
-                uint32_t len = (uint32_t)val.size() + 1;
+                uint32_t len = (uint32_t)val.size();
                 std::memcpy(ptr, &len, sizeof(uint32_t));
-                if (len > 1) {
-                    std::memcpy(ptr + sizeof(uint32_t), val.data(), len - 1);
+                if (len > 0) {
+                    std::memcpy(ptr + sizeof(uint32_t), val.data(), len);
                 }
-                *(ptr + sizeof(uint32_t) + len - 1) = '\0';
                 ptr += sizeof(uint32_t) + len;
             }
             else {
@@ -835,10 +855,12 @@ namespace zrlog {
 
         template <size_t N>
         static void serialize_arg(char*& ptr, const char(&val)[N]) {
-            uint32_t len = N;
+            uint32_t len = N > 0 ? static_cast<uint32_t>(N - 1) : 0;
             std::memcpy(ptr, &len, sizeof(uint32_t));
-            std::memcpy(ptr + sizeof(uint32_t), val, N); // includes '\0'
-            ptr += sizeof(uint32_t) + N;
+            if (len > 0) {
+                std::memcpy(ptr + sizeof(uint32_t), val, len);
+            }
+            ptr += sizeof(uint32_t) + len;
         }
 
         static void serialize_args_all(char*) {
@@ -849,78 +871,104 @@ namespace zrlog {
             (..., serialize_arg(ptr, args));
         }
 
-        template<typename FmtProvider, typename... Args>
-        static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
-
-            // 0. 获取缓存的秒级时间字符串 (19 bytes)
+        // ========================================================================
+        // 公共的时间格式化缓存函数 (消除冗余代码)
+        // ========================================================================
+        static inline const char* get_time_format_cache(uint64_t time_ns, uint32_t& out_nano) {
             static thread_local time_t cache_sec = 0;
             static thread_local char cache_str[20] = { 0 };
-            time_t sec = static_cast<time_t>(header.time / 1000000000);
-            if (sec != cache_sec) {
+
+            time_t sec = static_cast<time_t>(time_ns / 1000000000);
+            out_nano = static_cast<uint32_t>(time_ns % 1000000000);
+
+            if (ZRLOG_UNLIKELY(sec != cache_sec)) {
                 struct tm tm_buf;
                 zrlog_gmtime(&sec, &tm_buf);
-                detail::fast_u32_to_4digits(cache_str, tm_buf.tm_year + 1900); 
+                detail::fast_u32_to_4digits(cache_str, tm_buf.tm_year + 1900);
                 cache_str[4] = '-';
-                detail::fast_u32_to_2digits(cache_str + 5, tm_buf.tm_mon + 1); 
+                detail::fast_u32_to_2digits(cache_str + 5, tm_buf.tm_mon + 1);
                 cache_str[7] = '-';
-                detail::fast_u32_to_2digits(cache_str + 8, tm_buf.tm_mday);    
+                detail::fast_u32_to_2digits(cache_str + 8, tm_buf.tm_mday);
                 cache_str[10] = ' ';
-                detail::fast_u32_to_2digits(cache_str + 11, tm_buf.tm_hour);   
+                detail::fast_u32_to_2digits(cache_str + 11, tm_buf.tm_hour);
                 cache_str[13] = ':';
-                detail::fast_u32_to_2digits(cache_str + 14, tm_buf.tm_min);    
+                detail::fast_u32_to_2digits(cache_str + 14, tm_buf.tm_min);
                 cache_str[16] = ':';
                 detail::fast_u32_to_2digits(cache_str + 17, tm_buf.tm_sec);
-                cache_str[19] = '\0';
                 cache_sec = sec;
             }
-            uint32_t nano = static_cast<uint32_t>(header.time % 1000000000);
+            return cache_str;
+        }
 
-            // 1. 声明类型安全的空 tuple 容器 (其中的字符串类型已被转换为 string_view)
-            std::tuple<typename detail::decode_type<Args>::type...> args_tuple;
+        // ========================================================================
+        // 静态日志 Decoder: 编译期极端渲染 (AST / 机器码生成)
+        // ========================================================================
+        template<typename FmtProvider, typename... Args>
+        static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
+            uint32_t nano;
+            const char* time_str = get_time_format_cache(header.time, nano);
 
-            // 2. 定义提取 Lambda
-            auto extract = [&](auto& arg) {
-                arg = detail::decode_arg<std::remove_reference_t<decltype(arg)>>(buffer);
-            };
-
-            // 3. 用 C++17 逗号折叠表达式，依次填充 tuple 坑位 (完全没有 make_tuple 的深拷贝)
-            std::apply([&](auto&... unpacked_args) {
-                (..., extract(unpacked_args));
-            }, args_tuple);
-
-            // 4. 将填满的 tuple 平铺展开，直接送入 FMT_COMPILE 引擎！
+            // 用大括号初始化列表保证严格的从左到右求值顺序，同时彻底消灭默认构造！
             std::apply([&](const auto&... final_args) {
                 size_t space = out.available_size();
-                if (space < 1024) {
+                // 一次性索要充足空间，消除格式化期间的多次空间检查
+                if (ZRLOG_UNLIKELY(space < 2048)) {
                     out.flush_to_os();
                     space = out.available_size();
                 }
 
-                // FmtProvider::compile() 提供了编译期的 AST (抽象语法树) 路由
-                // final_args... 提供了绝对零拷贝的内存视图 (string_view)
-                // 两者结合，fmt 库会生成最高效的汇编指令，直接将数据 memcpy 到 out.current_ptr()
                 auto res = fmt::format_to_n(out.current_ptr(), space - 1, FmtProvider::compile(),
-                    fmt::string_view(cache_str, 19), nano,
+                    fmt::string_view(time_str, 19), nano,
                     loglevel_to_string(meta.level), thread_id,
                     meta.file, meta.line, final_args...);
 
-                // 处理缓冲区写满换行逻辑
-                if (res.size >= space - 1) {
+                out.current_ptr()[res.size] = '\n';
+                out.advance(res.size + 1);
+
+            }, std::tuple<typename detail::decode_type<Args>::type...>{ detail::decode_arg<Args>(buffer)... });
+        }
+
+        // ========================================================================
+        // 动态日志 Decoder: 头部编译期极速渲染，正文使用 fmt::runtime 链式写入
+        // ========================================================================
+        template<typename... Args>
+        static void generated_runtime_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
+            uint32_t nano;
+            const char* time_str = get_time_format_cache(header.time, nano);
+
+            std::apply([&](const auto&... final_args) {
+                size_t space = out.available_size();
+                if (ZRLOG_UNLIKELY(space < 2048)) {
                     out.flush_to_os();
                     space = out.available_size();
-                    res = fmt::format_to_n(out.current_ptr(), space - 1, FmtProvider::compile(),
-                        fmt::string_view(cache_str, 19), nano,
+                }
+
+                try {
+                    // 1. 【编译期极速写入头部】
+                    auto res_hdr = fmt::format_to_n(out.current_ptr(), space - 1,
+                        FMT_COMPILE(ZRLOG_HEADER_FMT),
+                        fmt::string_view(time_str, 19), nano,
                         loglevel_to_string(meta.level), thread_id,
-                        meta.file, meta.line, final_args...);
-                    size_t written = (res.size < space - 1) ? res.size : (space - 1);
-                    out.current_ptr()[written] = '\n';
-                    out.advance(written + 1);
+                        meta.file, meta.line);
+
+                    // 2. 【运行时游标链式写入正文】
+                    size_t remaining_space = space - 1 - res_hdr.size;
+                    auto res_body = fmt::format_to_n(res_hdr.out, remaining_space,
+                        fmt::runtime(meta.format),
+                        final_args...
+                    );
+
+                    // 3. 【统一换行与提交】
+                    size_t total_written = res_hdr.size + res_body.size;
+                    out.current_ptr()[total_written] = '\n';
+                    out.advance(total_written + 1);
+
                 }
-                else {
-                    out.current_ptr()[res.size] = '\n';
-                    out.advance(res.size + 1);
+                catch (const fmt::format_error& e) {
+                    auto err_msg = fmt::format_to_n(out.current_ptr(), space - 1, "[FMT_ERROR: {}]\n", e.what());
+                    out.advance(err_msg.size);
                 }
-            }, args_tuple);
+            }, std::tuple<typename detail::decode_type<Args>::type...>{ detail::decode_arg<Args>(buffer)... });
         }
 
         class ThreadBuffer {
@@ -939,8 +987,8 @@ namespace zrlog {
 
             ~ThreadBuffer() = default;
 
-            inline uint64_t thread_id() const { 
-                return thread_id_; 
+            inline uint64_t thread_id() const {
+                return thread_id_;
             }
 
             // ------------------------------------------------------------------------
@@ -1175,18 +1223,15 @@ namespace zrlog {
             }
         };
 
-        // ========================================================================
-        // Management
-        // ========================================================================
         template<typename FmtProvider, typename... Args>
-        uint32_t register_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, const char* file, uint32_t line, const char* func) {
+        uint32_t register_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, std::string_view file, uint32_t line, std::string_view func) {
             std::lock_guard<SpinMutex> lock(log_metas_mutex_);
             uint32_t id = log_id_atom.load(std::memory_order_relaxed);
             if (id != 0) {
                 return id;
             }
 
-            uint32_t new_id = static_cast<uint32_t>(global_log_metas_.size() + 1);
+            uint32_t new_id = static_cast<uint32_t>(global_log_metas_.size());
             LogMeta new_log;
             new_log.id = new_id;
             new_log.level = level;
@@ -1194,6 +1239,30 @@ namespace zrlog {
             new_log.line = line;
             new_log.func = func;
             new_log.decoder = &generated_decoder<FmtProvider, Args...>;
+            global_log_metas_.push_back(std::move(new_log));
+
+            log_id_atom.store(new_id, std::memory_order_relaxed);
+            return new_id;
+        }
+
+        template<typename... Args>
+        uint32_t register_runtime_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, std::string_view file, uint32_t line, std::string_view func, std::string_view format) {
+            std::lock_guard<SpinMutex> lock(log_metas_mutex_);
+            uint32_t id = log_id_atom.load(std::memory_order_relaxed);
+            if (id != 0) {
+                return id;
+            }
+
+            uint32_t new_id = static_cast<uint32_t>(global_log_metas_.size());
+            LogMeta new_log;
+            new_log.id = new_id;
+            new_log.level = level;
+            new_log.file = file;
+            new_log.line = line;
+            new_log.func = func;
+            // 运行时注册深拷贝 format，用于后续的 fmt::runtime
+            new_log.format = std::string(format);
+            new_log.decoder = &generated_runtime_decoder<Args...>;
             global_log_metas_.push_back(std::move(new_log));
 
             log_id_atom.store(new_id, std::memory_order_relaxed);
@@ -1209,7 +1278,6 @@ namespace zrlog {
             }
             return thread_buffer_;
         }
-
 
         size_t consume_buffers_round_robin(std::vector<LogMeta>& local_log_metas, IOBuffer& io_buf, bool full_drain = false) {
             size_t processed_count = 0;
@@ -1247,7 +1315,7 @@ namespace zrlog {
             bool is_full_scan = full_drain || (poll_cycles_ % 64 == 0) || (active_buffer_count_ == 0);
             size_t scan_limit = is_full_scan ? thread_buffers_bg_.size() : active_buffer_count_;
 
-            LogEntryHeader *header;
+            LogEntryHeader* header;
 
             // =========================================================================
             // 2. O(1) 原地分区遍历与消费算法
@@ -1264,8 +1332,8 @@ namespace zrlog {
                     ++processed_count;
                     --quota;
 
-                    if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
-                        const LogMeta& meta = local_log_metas[header->log_id - 1];
+                    if (header->log_id > 0 && header->log_id < local_log_metas.size()) {
+                        const LogMeta& meta = local_log_metas[header->log_id];
                         char* args_ptr = (char*)header + sizeof(LogEntryHeader);
                         meta.decoder(args_ptr, meta, *header, tb->thread_id(), io_buf);
                         stat_consume_valid_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1280,8 +1348,8 @@ namespace zrlog {
                             }
                         }
 
-                        if (header->log_id > 0 && header->log_id <= local_log_metas.size()) {
-                            const LogMeta& meta = local_log_metas[header->log_id - 1];
+                        if (header->log_id > 0 && header->log_id < local_log_metas.size()) {
+                            const LogMeta& meta = local_log_metas[header->log_id];
                             char* args_ptr = (char*)header + sizeof(LogEntryHeader);
                             meta.decoder(args_ptr, meta, *header, tb->thread_id(), io_buf);
                             stat_consume_valid_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1394,9 +1462,12 @@ namespace zrlog {
 
         NanoLogger() {
             TscClock::instance();
-            global_log_metas_.reserve(1000);
             thread_buffers_.reserve(100);
             thread_buffers_bg_.reserve(100);
+            global_log_metas_.reserve(1000);
+
+            //新增log_id为0的LogMeta项,保证有效log_id的序号从1开始
+            global_log_metas_.emplace_back(std::move(LogMeta()));
         }
         ~NanoLogger() {
             fini();
@@ -1412,9 +1483,8 @@ namespace zrlog {
         std::vector<ThreadBuffer*> thread_buffers_;
         std::vector<ThreadBuffer*> thread_buffers_bg_;
 
-        // --- 活跃/非活跃列表分离优化专用 ---
-        size_t active_buffer_count_{ 0 }; // 活跃线程分界线 (索引)
-        uint64_t poll_cycles_{ 0 };       // 后台空转轮询次数计数器
+        size_t active_buffer_count_{ 0 };
+        uint64_t poll_cycles_{ 0 };
 
         std::unique_ptr<ILogAppender> appender_;
         std::thread log_thread_;
@@ -1422,7 +1492,6 @@ namespace zrlog {
 
         std::mutex              idle_wait_mutex_;
         std::condition_variable idle_wait_condition_;
-        // 强制独占一个缓存行，不和 mutex 沾边
         alignas(CACHE_LINE_SIZE) std::atomic<bool> idle_wait_flag_{ false };
 
     public:
@@ -1438,25 +1507,27 @@ namespace zrlog {
 }
 
 // ---------------------------------------------------------------------------
-// 宏定义更新：注入局部的 FmtProvider 结构体以捕获编译期字面量
+// 静态宏：编译期极致优化
 // ---------------------------------------------------------------------------
 
 #define ZRLOG_INIT_CONF(config) zrlog::NanoLogger::instance().init(config)
 #define ZRLOG_INIT(filename, level) zrlog::NanoLogger::instance().init(filename, level)
 #define ZRLOG_FINI() zrlog::NanoLogger::instance().fini()
 
-#define ZRLOG_BODY(level, format_str, ...)                                                          \
+#define ZRLOG_BODY(level, format, ...)                                                              \
     do {                                                                                            \
         zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                                  \
         if (logger.check_level(level)) {                                                            \
             static std::atomic<uint32_t> log_id{0};                                                 \
             struct FmtProvider {                                                                    \
-                /* 利用预处理器将前缀和用户的 format_str 完美拼接！*/                               \
                 static constexpr auto compile() {                                                   \
-                    return FMT_COMPILE("{}.{:09d} {} {} {}:{} " format_str);                        \
+                    /* 将固定日志头与用户日志格式完美拼接 */                                        \
+                    return FMT_COMPILE(ZRLOG_HEADER_FMT format);                                    \
                 }                                                                                   \
             };                                                                                      \
-            logger.log<FmtProvider>(log_id, level, __FILE__, __LINE__, __func__, ##__VA_ARGS__);    \
+            std::string_view file { __FILE__, sizeof(__FILE__) - 1 };                               \
+            std::string_view func { __func__, sizeof(__func__) - 1 };                               \
+            logger.log<FmtProvider>(log_id, level, file, __LINE__, func, ##__VA_ARGS__);            \
         }                                                                                           \
     } while (0)
 
@@ -1466,3 +1537,25 @@ namespace zrlog {
 #define ZRLOG_WARN(format, ...)  ZRLOG_BODY(zrlog::LogLevel::WARN,  format, ##__VA_ARGS__)
 #define ZRLOG_ERROR(format, ...) ZRLOG_BODY(zrlog::LogLevel::ERR,   format, ##__VA_ARGS__)
 #define ZRLOG_FATAL(format, ...) ZRLOG_BODY(zrlog::LogLevel::FATAL, format, ##__VA_ARGS__)
+
+// ---------------------------------------------------------------------------
+// 动态宏：支持运行时生成的 format
+// ---------------------------------------------------------------------------
+
+#define ZRLOG_DYN_BODY(level, format, ...)                                                          \
+    do {                                                                                            \
+        zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                                  \
+        if (logger.check_level(level)) {                                                            \
+            static std::atomic<uint32_t> log_id{0};                                                 \
+            std::string_view file { __FILE__, sizeof(__FILE__) - 1 };                               \
+            std::string_view func { __func__, sizeof(__func__) - 1 };                               \
+            logger.log_runtime(log_id, level, file, __LINE__, func, format, ##__VA_ARGS__);         \
+        }                                                                                           \
+    } while (0)
+
+#define ZRLOG_DYN_TRACE(format, ...) ZRLOG_DYN_BODY(zrlog::LogLevel::TRACE, format, ##__VA_ARGS__)
+#define ZRLOG_DYN_DEBUG(format, ...) ZRLOG_DYN_BODY(zrlog::LogLevel::DEBUG, format, ##__VA_ARGS__)
+#define ZRLOG_DYN_INFO(format, ...)  ZRLOG_DYN_BODY(zrlog::LogLevel::INFO,  format, ##__VA_ARGS__)
+#define ZRLOG_DYN_WARN(format, ...)  ZRLOG_DYN_BODY(zrlog::LogLevel::WARN,  format, ##__VA_ARGS__)
+#define ZRLOG_DYN_ERROR(format, ...) ZRLOG_DYN_BODY(zrlog::LogLevel::ERR,   format, ##__VA_ARGS__)
+#define ZRLOG_DYN_FATAL(format, ...) ZRLOG_DYN_BODY(zrlog::LogLevel::FATAL, format, ##__VA_ARGS__)

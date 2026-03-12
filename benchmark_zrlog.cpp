@@ -302,9 +302,14 @@ int main(int argc, char* argv[]) {
     std::string test = "test3...";
     ZRLOG_INFO("Begin {}", test);
 
+    std::string format = "Begin1 {}";
+    test = "dyn format...";
+    ZRLOG_DYN_INFO(format, test);
+    ZRLOG_DYN_INFO("Begin2 {}", test);
+    
     // Run benchmarks
     benchmark_clock();
-    //benchmark_frontend_latency(2);
+    //benchmark_frontend_latency(1000);
     benchmark_frontend_latency(500000);
     //benchmark_message_types(2);
     benchmark_message_types(100000);
