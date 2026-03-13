@@ -1010,7 +1010,7 @@ namespace zrlog {
                                 fmt::make_format_args(final_args...)
                             );
 
-                            total_written = std::min<size_t>(hdr_res.size + hdr_res.size, space - 1);
+                            total_written = std::min<size_t>(body_res.size + hdr_res.size, space - 1);
                         }
 
                         out.current_ptr()[total_written] = '\n';
