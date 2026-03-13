@@ -74,8 +74,18 @@ endif
 
 #INCS := -I/usr/include/g++-2 -I/usr/local/include
 INCS := -I./ -I/usr/local/include
-
 LIBS := -L/usr/lib -lpthread
+
+#****************************************************************************
+# 新增：Release 模式下的额外优化选项（仅在非 DEBUG 时生效）
+#****************************************************************************
+ifneq (YES, ${DEBUG})
+    # -march=native : 针对当前 CPU 架构自动启用最高指令集（如 AVX2、SSE4.2）
+    # -flto        : 链接时优化，允许跨文件内联、消除无用代码，需同时用于编译和链接
+    CFLAGS   += -march=native -flto
+    CXXFLAGS += -march=native -flto
+    LDFLAGS  += -flto
+endif
 
 #****************************************************************************
 # Makefile code common to all platforms
