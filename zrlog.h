@@ -1,8 +1,8 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：1.6.3
-#define ZRLOG_VERSION 10603
+// 如：1.6.4
+#define ZRLOG_VERSION 10604
 
 #include <vector>
 #include <list>
@@ -292,7 +292,7 @@ namespace zrlog {
 #endif
         }
 
-        bool calibrate(int rounds = 5, int interval_ms = 20) {
+        bool calibrate(int rounds = 5, int interval_ms = 1) {
             std::vector<double> rates;
             rates.reserve(rounds);
 
@@ -401,15 +401,15 @@ namespace zrlog {
     struct Config {
         AppenderType appender = AppenderType::File;
         std::string filename;
-        LogLevel level = LogLevel::DEBUG;
-        uint32_t io_buffer_size = 1024 * 1024 * 1;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
+        LogLevel level = LogLevel::INFO;
+        uint32_t io_buffer_size = 1024 * 1024 * 4;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
         uint32_t thread_buffer_size = 1024 * 1024 * 1;  //每个线程的缓冲大小(前端二进制序列化缓冲 测试发现越大如16M,时延也变大)
         uint32_t per_thread_quota = 256;                //每个线程的格式化日志的配额(防止线程产生日志太快,公平处理每个线程日志)
-        uint32_t idle_wait_interval_us = 500;           //空闲等待间隔(微妙)
+        uint32_t idle_wait_interval_us = 1000;          //空闲等待间隔(微妙)
 
         // ---- 缓冲区满时的处理策略 ----
         BufferFullPolicy buffer_full_policy = BufferFullPolicy::Discard;
-        uint32_t buffer_full_retry_count = 1024;     //重试次数(仅在 Retry 策略下生效)
+        uint32_t buffer_full_retry_count = 256;     //重试次数(仅在 Retry 策略下生效)
     };
 
     class ILogAppender {
@@ -848,7 +848,7 @@ namespace zrlog {
         template<typename Tuple, std::size_t... Is>
         static void format_log_impl(IOBuffer& out, const char* fmt, const Tuple& t, detail::index_sequence<Is...>) {
             size_t space = out.available_size();
-            if (space < 256) {
+            if (space < 2048) {
                 out.flush_to_os();
                 space = out.available_size();
             }
@@ -1372,8 +1372,8 @@ namespace zrlog {
         std::atomic<uint64_t>  stat_consume_valid_count_{ 0 };
     };
 
-    ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
-    thread_local NanoLogger::ThreadBufferDestroyer NanoLogger::thread_buffer_destroyer_;
+    inline ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
+    inline thread_local NanoLogger::ThreadBufferDestroyer NanoLogger::thread_buffer_destroyer_;
 }
 
 // ---------------------------------------------------------------------------
