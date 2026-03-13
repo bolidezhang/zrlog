@@ -1,15 +1,14 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.2.2
-#define ZRLOG_VERSION 20202
+// 如：2.2.3
+#define ZRLOG_VERSION 20203
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
 // 参数依次为: 1.时间字符串 2.纳秒 3.日志级别 4.线程ID 5.文件名 6.行号
 // ============================================================================
 #define ZRLOG_HEADER_FMT "{}.{:09d} {} {} {}:{} "
-#define ZRLOG_FMT_ERROR  "{}.{:09d} {} {} {}:{} error:\"{}\" format:\"{}\"\n"
 
 // ============================================================================
 // 引入 fmtlib (Header-Only 模式 & 编译期优化支持)
@@ -917,34 +916,34 @@ namespace zrlog {
 
             // 用大括号初始化列表保证严格的从左到右求值顺序，同时彻底消灭默认构造！
             std::apply([&](const auto&... final_args) {
-                size_t space = out.available_size();
+                size_t space = out.available_size() - 1;  // 预留 1 字节给 \n
                 // 一次性索要充足空间，消除格式化期间的多次空间检查
                 if (ZRLOG_UNLIKELY(space < 2048)) {
                     out.flush_to_os();
-                    space = out.available_size();
+                    space = out.available_size() -1;
                 }
 
-                auto res = fmt::format_to_n(out.current_ptr(), space - 1, FmtProvider::compile(),
+                auto res = fmt::format_to_n(out.current_ptr(), space, FmtProvider::compile(),
                     fmt::string_view(time_str, 19), nano,
                     loglevel_to_string(meta.level), thread_id,
                     meta.file, meta.line, final_args...);
 
                 // 处理缓冲区写满换行逻辑
-                if (ZRLOG_UNLIKELY(res.size >= space - 1)) {
+                if (ZRLOG_LIKELY(res.size <= space)) {
+                    out.current_ptr()[res.size] = '\n';
+                    out.advance(res.size + 1);
+                }
+                else {
                     out.flush_to_os();
-                    space = out.available_size();
+                    space = out.available_size() - 1;
 
-                    res = fmt::format_to_n(out.current_ptr(), space - 1, FmtProvider::compile(),
+                    res = fmt::format_to_n(out.current_ptr(), space, FmtProvider::compile(),
                         fmt::string_view(time_str, 19), nano,
                         loglevel_to_string(meta.level), thread_id,
                         meta.file, meta.line, final_args...);
-                    size_t written = std::min<size_t>(res.size, space - 1);
+                    size_t written = std::min<size_t>(res.size, space);
                     out.current_ptr()[written] = '\n';
                     out.advance(written + 1);
-                }
-                else {
-                    out.current_ptr()[res.size] = '\n';
-                    out.advance(res.size + 1);
                 }
 
             }, std::tuple<typename detail::decode_type<Args>::type...>{ detail::decode_arg<Args>(buffer)... });
@@ -956,73 +955,109 @@ namespace zrlog {
         template<typename... Args>
         static void generated_runtime_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
             uint32_t nano;
-            const char *time_str = get_time_format_cache(header.time, nano);
+            const char* time_str = get_time_format_cache(header.time, nano);
 
             std::apply([&](const auto&... final_args) {
-                size_t space = out.available_size();
+                size_t space = out.available_size() - 1; // 预留 1 字节给 \n
+                // 一次性索要充足空间，消除格式化期间的多次空间检查
                 if (ZRLOG_UNLIKELY(space < 2048)) {
                     out.flush_to_os();
-                    space = out.available_size();
+                    space = out.available_size() - 1;
                 }
 
                 try {
-                    // 1. 【编译期极速写入头部】
-                    auto hdr_res = fmt::format_to_n(out.current_ptr(), space - 1,
+                    // 1. 【第一次尝试：极速渲染头部】
+                    auto hdr_res = fmt::format_to_n(out.current_ptr(), space,
                         FMT_COMPILE(ZRLOG_HEADER_FMT),
                         fmt::string_view(time_str, 19), nano,
                         loglevel_to_string(meta.level), thread_id,
                         meta.file, meta.line);
 
-                    // 2. 【运行时游标链式写入正文】
-                    size_t remaining_space = space - 1 - hdr_res.size;
+                    // 严格区分实际写入大小和理论需要大小
+                    size_t actual_hdr_len = std::min<size_t>(hdr_res.size, space);
+                    size_t remaining_space = space - actual_hdr_len;
 
-                    // 【优化】：编译期短路。如果没有任何动态参数，彻底绕过 fmt 的运行时解析引擎！直接 memcpy！
+                    size_t theoretical_total = hdr_res.size;
+                    size_t actual_total = actual_hdr_len;
+
+                    // 2. 【第一次尝试：写入正文】
                     if constexpr (sizeof...(Args) == 0) {
                         size_t copy_len = std::min<size_t>(meta.format.size(), remaining_space);
                         std::memcpy(hdr_res.out, meta.format.data(), copy_len);
 
-                        size_t total_written = hdr_res.size + copy_len;
-                        out.current_ptr()[total_written] = '\n';
-                        out.advance(total_written + 1);
+                        theoretical_total += meta.format.size();
+                        actual_total += copy_len;
                     }
                     else {
-                        // 【优化】：强制类型擦除（Type Erasure）。
-                        // 放弃使用模板函数 format_to_n，直接手动构建 format_args 并调用非模板的 vformat_to_n。
-                        // 这将极大地减少后台消费线程的代码体积膨胀（Binary Bloat），大幅提升 CPU L1 指令缓存命中率！
                         auto body_res = fmt::vformat_to_n(
                             hdr_res.out,
                             remaining_space,
                             fmt::string_view(meta.format.data(), meta.format.size()),
                             fmt::make_format_args(final_args...)
                         );
-                        size_t total_written = hdr_res.size + body_res.size;
 
-                        // 处理缓冲区写满换行逻辑
-                        if (ZRLOG_UNLIKELY(total_written >= space - 1)) {
-                            out.flush_to_os();
-                            space = out.available_size();
+                        theoretical_total += body_res.size;
+                        actual_total += std::min<size_t>(body_res.size, remaining_space);
+                    }
 
-                            remaining_space = space - 1 - hdr_res.size;
-                            body_res  = fmt::vformat_to_n(
+                    // 3. 【判断是否需要重试】
+                    // 用理论总大小(theoretical_total)与提供的空间比对，而不是用实际写入大小！
+                    if (ZRLOG_LIKELY(theoretical_total <= space)) {
+                        // 没发生任何截断，安全换行
+                        out.current_ptr()[actual_total] = '\n';
+                        out.advance(actual_total + 1);
+                    }
+                    else {
+                        // 发生截断！说明当前缓冲区不够长。
+                        // 此时之前写入的 actual_total 数据变成了“截断废料”。
+                        // 动作：直接落盘刷空，重新来过！
+                        out.flush_to_os();
+                        space = out.available_size() - 1;
+
+                        // 【重试】：在新缓冲区里重新格式化头部！(非常重要)
+                        hdr_res = fmt::format_to_n(out.current_ptr(), space,
+                            FMT_COMPILE(ZRLOG_HEADER_FMT),
+                            fmt::string_view(time_str, 19), nano,
+                            loglevel_to_string(meta.level), thread_id,
+                            meta.file, meta.line);
+
+                        actual_hdr_len = std::min<size_t>(hdr_res.size, space);
+                        remaining_space = space - actual_hdr_len;
+                        actual_total = actual_hdr_len;
+
+                        // 【重试】：在新缓冲区里重新格式化正文！
+                        if constexpr (sizeof...(Args) == 0) {
+                            size_t copy_len = std::min<size_t>(meta.format.size(), remaining_space);
+                            std::memcpy(hdr_res.out, meta.format.data(), copy_len);
+                            actual_total += copy_len;
+                        }
+                        else {
+                            auto body_res = fmt::vformat_to_n(
                                 hdr_res.out,
                                 remaining_space,
                                 fmt::string_view(meta.format.data(), meta.format.size()),
                                 fmt::make_format_args(final_args...)
                             );
-
-                            total_written = std::min<size_t>(body_res.size + hdr_res.size, space - 1);
+                            actual_total += std::min<size_t>(body_res.size, remaining_space);
                         }
 
-                        out.current_ptr()[total_written] = '\n';
-                        out.advance(total_written + 1);
+                        // 这一次哪怕再发生截断，也只能认命了(说明日志单条长度超过了整个 IOBuffer 的最大容量)
+                        // 强制截断换行，保证内存绝对安全
+                        out.current_ptr()[actual_total] = '\n';
+                        out.advance(actual_total + 1);
                     }
                 }
                 catch (const fmt::format_error& e) {
-                    auto err_msg = fmt::format_to_n(out.current_ptr(), space - 1,
-                        FMT_COMPILE(ZRLOG_FMT_ERROR),
-                        fmt::string_view(time_str, 19), nano, loglevel_to_string(meta.level), thread_id, meta.file, meta.line, 
+                    // 对于异常捕获，同样保留 1 字节并安全换行
+                    size_t err_space = out.available_size() - 1;
+                    auto err_msg = fmt::format_to_n(out.current_ptr(), err_space,
+                        FMT_COMPILE("[FMT_ERROR] {}.{:09d} {} {}:{} format: '{}' error: '{}'"),
+                        fmt::string_view(time_str, 19), nano, loglevel_to_string(meta.level), meta.file, meta.line,
                         fmt::string_view(meta.format.data(), meta.format.size()), e.what());
-                    out.advance(err_msg.size);
+
+                    size_t actual_err_len = std::min<size_t>(err_msg.size, err_space);
+                    out.current_ptr()[actual_err_len] = '\n';
+                    out.advance(actual_err_len + 1);
                 }
             }, std::tuple<typename detail::decode_type<Args>::type...>{ detail::decode_arg<Args>(buffer)... });
         }
