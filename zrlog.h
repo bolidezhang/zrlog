@@ -1,14 +1,15 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.2.1
-#define ZRLOG_VERSION 20201
+// 如：2.2.2
+#define ZRLOG_VERSION 20202
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
 // 参数依次为: 1.时间字符串 2.纳秒 3.日志级别 4.线程ID 5.文件名 6.行号
 // ============================================================================
 #define ZRLOG_HEADER_FMT "{}.{:09d} {} {} {}:{} "
+#define ZRLOG_FMT_ERROR  "{}.{:09d} {} {} {}:{} error:\"{}\" format:\"{}\"\n"
 
 // ============================================================================
 // 引入 fmtlib (Header-Only 模式 & 编译期优化支持)
@@ -341,7 +342,7 @@ namespace zrlog {
 #endif
         }
 
-        bool calibrate(int rounds = 5, int interval_ms = 20) {
+        bool calibrate(int rounds = 3, int interval_ms = 1) {
             std::vector<double> rates;
             rates.reserve(rounds);
 
@@ -420,8 +421,14 @@ namespace zrlog {
             return static_cast<uint64_t>(::GetCurrentThreadId());
 #elif defined(__linux__)
             return static_cast<uint64_t>(::syscall(SYS_gettid));
+#elif defined(__APPLE__)
+            uint64_t tid;
+            pthread_threadid_np(NULL, &tid);
+            return tid;
 #else
-            return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+            //return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+            static std::atomic<uint64_t> global_tid_{ 0 };
+            return global_tid_.fetch_add(1, std::memory_order_relaxed) + 1; // 绝对安全的 fallback
 #endif
         }();
         return tid_;
@@ -463,15 +470,15 @@ namespace zrlog {
     struct Config {
         AppenderType appender = AppenderType::File;
         std::string filename;
-        LogLevel level = LogLevel::DEBUG;
-        uint32_t io_buffer_size = 1024 * 1024 * 1;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
+        LogLevel level = LogLevel::INFO;
+        uint32_t io_buffer_size = 1024 * 1024 * 4;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
         uint32_t thread_buffer_size = 1024 * 1024 * 1;  //每个线程的缓冲大小(前端二进制序列化缓冲 测试发现越大如16M,时延也变大)
         uint32_t per_thread_quota = 256;                //每个线程的格式化日志的配额(防止线程产生日志太快,公平处理每个线程日志)
-        uint32_t idle_wait_interval_us = 500;           //空闲等待间隔(微妙)
+        uint32_t idle_wait_interval_us = 1000;          //空闲等待间隔(微妙)
 
         // ---- 缓冲区满时的处理策略 ----
         BufferFullPolicy buffer_full_policy = BufferFullPolicy::Discard;
-        uint32_t buffer_full_retry_count = 1024;     //重试次数(仅在 Retry 策略下生效)
+        uint32_t buffer_full_retry_count = 256;         //重试次数(仅在 Retry 策略下生效)
     };
 
     class ILogAppender {
@@ -906,7 +913,7 @@ namespace zrlog {
         template<typename FmtProvider, typename... Args>
         static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
             uint32_t nano;
-            const char* time_str = get_time_format_cache(header.time, nano);
+            const char *time_str = get_time_format_cache(header.time, nano);
 
             // 用大括号初始化列表保证严格的从左到右求值顺序，同时彻底消灭默认构造！
             std::apply([&](const auto&... final_args) {
@@ -922,19 +929,34 @@ namespace zrlog {
                     loglevel_to_string(meta.level), thread_id,
                     meta.file, meta.line, final_args...);
 
-                out.current_ptr()[res.size] = '\n';
-                out.advance(res.size + 1);
+                // 处理缓冲区写满换行逻辑
+                if (ZRLOG_UNLIKELY(res.size >= space - 1)) {
+                    out.flush_to_os();
+                    space = out.available_size();
+
+                    res = fmt::format_to_n(out.current_ptr(), space - 1, FmtProvider::compile(),
+                        fmt::string_view(time_str, 19), nano,
+                        loglevel_to_string(meta.level), thread_id,
+                        meta.file, meta.line, final_args...);
+                    size_t written = std::min<size_t>(res.size, space - 1);
+                    out.current_ptr()[written] = '\n';
+                    out.advance(written + 1);
+                }
+                else {
+                    out.current_ptr()[res.size] = '\n';
+                    out.advance(res.size + 1);
+                }
 
             }, std::tuple<typename detail::decode_type<Args>::type...>{ detail::decode_arg<Args>(buffer)... });
         }
 
         // ========================================================================
-        // 动态日志 Decoder: 头部编译期极速渲染，正文使用 fmt::runtime 链式写入
+        // 动态日志 Decoder: 头部编译期极速渲染，正文使用链式写入
         // ========================================================================
         template<typename... Args>
         static void generated_runtime_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
             uint32_t nano;
-            const char* time_str = get_time_format_cache(header.time, nano);
+            const char *time_str = get_time_format_cache(header.time, nano);
 
             std::apply([&](const auto&... final_args) {
                 size_t space = out.available_size();
@@ -945,27 +967,61 @@ namespace zrlog {
 
                 try {
                     // 1. 【编译期极速写入头部】
-                    auto res_hdr = fmt::format_to_n(out.current_ptr(), space - 1,
+                    auto hdr_res = fmt::format_to_n(out.current_ptr(), space - 1,
                         FMT_COMPILE(ZRLOG_HEADER_FMT),
                         fmt::string_view(time_str, 19), nano,
                         loglevel_to_string(meta.level), thread_id,
                         meta.file, meta.line);
 
                     // 2. 【运行时游标链式写入正文】
-                    size_t remaining_space = space - 1 - res_hdr.size;
-                    auto res_body = fmt::format_to_n(res_hdr.out, remaining_space,
-                        fmt::runtime(meta.format),
-                        final_args...
-                    );
+                    size_t remaining_space = space - 1 - hdr_res.size;
 
-                    // 3. 【统一换行与提交】
-                    size_t total_written = res_hdr.size + res_body.size;
-                    out.current_ptr()[total_written] = '\n';
-                    out.advance(total_written + 1);
+                    // 【优化】：编译期短路。如果没有任何动态参数，彻底绕过 fmt 的运行时解析引擎！直接 memcpy！
+                    if constexpr (sizeof...(Args) == 0) {
+                        size_t copy_len = std::min<size_t>(meta.format.size(), remaining_space);
+                        std::memcpy(hdr_res.out, meta.format.data(), copy_len);
 
+                        size_t total_written = hdr_res.size + copy_len;
+                        out.current_ptr()[total_written] = '\n';
+                        out.advance(total_written + 1);
+                    }
+                    else {
+                        // 【优化】：强制类型擦除（Type Erasure）。
+                        // 放弃使用模板函数 format_to_n，直接手动构建 format_args 并调用非模板的 vformat_to_n。
+                        // 这将极大地减少后台消费线程的代码体积膨胀（Binary Bloat），大幅提升 CPU L1 指令缓存命中率！
+                        auto body_res = fmt::vformat_to_n(
+                            hdr_res.out,
+                            remaining_space,
+                            fmt::string_view(meta.format.data(), meta.format.size()),
+                            fmt::make_format_args(final_args...)
+                        );
+                        size_t total_written = hdr_res.size + body_res.size;
+
+                        // 处理缓冲区写满换行逻辑
+                        if (ZRLOG_UNLIKELY(total_written >= space - 1)) {
+                            out.flush_to_os();
+                            space = out.available_size();
+
+                            remaining_space = space - 1 - hdr_res.size;
+                            body_res  = fmt::vformat_to_n(
+                                hdr_res.out,
+                                remaining_space,
+                                fmt::string_view(meta.format.data(), meta.format.size()),
+                                fmt::make_format_args(final_args...)
+                            );
+
+                            total_written = std::min<size_t>(hdr_res.size + hdr_res.size, space - 1);
+                        }
+
+                        out.current_ptr()[total_written] = '\n';
+                        out.advance(total_written + 1);
+                    }
                 }
                 catch (const fmt::format_error& e) {
-                    auto err_msg = fmt::format_to_n(out.current_ptr(), space - 1, "[FMT_ERROR: {}]\n", e.what());
+                    auto err_msg = fmt::format_to_n(out.current_ptr(), space - 1,
+                        FMT_COMPILE(ZRLOG_FMT_ERROR),
+                        fmt::string_view(time_str, 19), nano, loglevel_to_string(meta.level), thread_id, meta.file, meta.line, 
+                        fmt::string_view(meta.format.data(), meta.format.size()), e.what());
                     out.advance(err_msg.size);
                 }
             }, std::tuple<typename detail::decode_type<Args>::type...>{ detail::decode_arg<Args>(buffer)... });
@@ -979,7 +1035,7 @@ namespace zrlog {
 
                 // 【按页预热 Fast Page Pre-faulting】
                 // 每 4096 字节写一个 0，强迫操作系统映射所有物理页，比全量 memset 快几倍
-                volatile char* p = buffer_.data();
+                volatile char *p = buffer_.data();
                 for (size_t i = 0; i < size_; i += 4096) {
                     p[i] = 0;
                 }
@@ -1372,7 +1428,7 @@ namespace zrlog {
                     // 【极其关键的多重 swap 逻辑】：保护活跃分区边界不被破坏
                     if (i < active_buffer_count_) {
                         // 1. 如果死亡的线程在“活跃区”，先把它和活跃区的最后一个元素交换
-                        active_buffer_count_--;
+                        --active_buffer_count_;
                         if (i != active_buffer_count_) {
                             std::swap(thread_buffers_bg_[i], thread_buffers_bg_[active_buffer_count_]);
                         }
@@ -1502,8 +1558,8 @@ namespace zrlog {
         std::atomic<uint64_t>  stat_consume_valid_count_{ 0 };
     };
 
-    ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
-    thread_local NanoLogger::ThreadBufferDestroyer NanoLogger::thread_buffer_destroyer_;
+    inline ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
+    inline thread_local NanoLogger::ThreadBufferDestroyer NanoLogger::thread_buffer_destroyer_;
 }
 
 // ---------------------------------------------------------------------------
