@@ -39,18 +39,24 @@ You can easily compile and run the included `benchmark_zrlog.cpp` to verify the 
 
 **1. Compile the benchmark:**
 Ensure you have cloned or downloaded `fmtlib`. Replace `/path/to/fmt/include` with your actual `fmt` header path.
+```bash
 g++ -O3 -march=native -flto -std=c++17 -pthread -I./fmt/include benchmark_zrlog.cpp -o benchmark_zrlog
+```
 
 **2. Run the benchmark:**
 Execute the compiled binary. By default, it uses a 1MB thread buffer and the `Discard` policy.
+```bash
 ./benchmark_zrlog
+```
 
 *(Optional)* You can tune the benchmark by passing arguments:
+```bash
 # Usage: ./benchmark_zrlog [thread_buffer_size_MB] [buffer_full_policy]
 # buffer_full_policy: 0 = Discard, 1 = Block, 2 = Retry
 
 # Example: Run with a 2.5MB thread buffer and 'Retry' policy
 ./benchmark_zrlog 2.5 2
+```
 
 **The benchmark suite executes the following tests:**
 1.  **Frontend Latency Test**: Measures the ns-level overhead of a single log call (Avg, MIN, MAX, P50, P90, P99, P99.9).
