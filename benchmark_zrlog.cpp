@@ -255,6 +255,9 @@ void benchmark_clock() {
 }
 
 int main(int argc, char* argv[]) {
+
+    zrlog::install_crash_handler();
+
     double thread_buffer_size = 1.0;   //default value: 1 MB
     zrlog::BufferFullPolicy buffer_full_policy = zrlog::BufferFullPolicy::Discard;
     if (argc > 1) {
@@ -282,6 +285,7 @@ int main(int argc, char* argv[]) {
 
     // Initialize logger
     zrlog::Config config;
+    config.appender = zrlog::AppenderType::RotatingFile;
     config.filename = "benchmark_zrlog.log";
     config.level = zrlog::LogLevel::INFO;
     config.thread_buffer_size = static_cast<uint32_t>(1024 * 1024 * thread_buffer_size);

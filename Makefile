@@ -75,7 +75,6 @@ endif
 # 注意：fmt 是 header-only 库，只需添加头文件路径。
 # 如果你的 fmt 头文件直接位于 ./fmt 下（即 ./fmt/fmt/core.h），请将路径改为 -I./fmt
 INCS := -I./ -I./fmt/include -I/usr/local/include
-
 LIBS := -L/usr/lib -lpthread
 
 #****************************************************************************
@@ -113,7 +112,6 @@ SRCS := benchmark_zrlog.cpp
 
 # Add on the sources for libraries
 SRCS := ${SRCS}
-
 OBJS := $(addsuffix .o,$(basename ${SRCS}))
 
 #****************************************************************************
