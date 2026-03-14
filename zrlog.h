@@ -1,8 +1,8 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.2.3
-#define ZRLOG_VERSION 20203
+// 如：2.3.0
+#define ZRLOG_VERSION 20300
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
@@ -37,6 +37,7 @@
 #include <charconv>
 #include <memory>
 #include <new>
+#include <csignal>        // 用于崩溃信号捕获
 
 // 获取当前 CPU 架构的 L1 Cache Line 大小 (C++17)
 #ifdef __cpp_lib_hardware_interference_size
@@ -70,8 +71,10 @@ constexpr size_t CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 #define ZRLOG_WRITE(fd, data, len)      _write(fd, data, (unsigned int)(len))
 #define ZRLOG_CLOSE(fd)                 _close(fd)
 #define ZRLOG_FLUSH_FILE(fd)            _commit(fd)
+#define ZRLOG_ACCESS(path, mode)        _access(path, mode)
 #define ZRLOG_O_FLAGS                   (_O_WRONLY | _O_CREAT | _O_APPEND | _O_BINARY)
 #define ZRLOG_S_FLAGS                   (_S_IREAD | _S_IWRITE)
+#define ZRLOG_F_OK                      0
 #define ZRLOG_CPU_PAUSE()               _mm_pause()
 #define ZRLOG_FAST_THREAD_LOCAL         __declspec(thread)
 
@@ -111,9 +114,12 @@ inline uint64_t zrlog_rdtsc() {
 #define ZRLOG_WRITE(fd, data, len)      ::write(fd, data, len)
 #define ZRLOG_CLOSE(fd)                 ::close(fd)
 #define ZRLOG_FLUSH_FILE(fd)            ::fsync(fd)
+#define ZRLOG_ACCESS(path, mode)        ::access(path, mode)
 #define ZRLOG_O_FLAGS                   (O_WRONLY | O_CREAT | O_APPEND)
 #define ZRLOG_S_FLAGS                   (0644)
+#define ZRLOG_F_OK                      F_OK
 #define ZRLOG_FAST_THREAD_LOCAL         __thread
+
 
 #if defined(__x86_64__) || defined(__i386__)
 #define ZRLOG_CPU_PAUSE() __asm__ volatile("pause")
@@ -266,7 +272,7 @@ namespace zrlog {
             fast_u32_to_2digits(buf + 5, d4);
             fast_u32_to_2digits(buf + 7, d5);
         }
-    }
+    }  //end namespace detail
 
     // ---------------------------------------------------------------------------
     // 基础工具类
@@ -456,8 +462,9 @@ namespace zrlog {
     }
 
     enum class AppenderType : uint8_t {
-        File,
-        Console
+        Console,            //控制台
+        File,               //文件
+        RotatingFile,       //滚动文件
     };
 
     enum class BufferFullPolicy : uint8_t {
@@ -467,7 +474,7 @@ namespace zrlog {
     };
 
     struct Config {
-        AppenderType appender = AppenderType::File;
+        AppenderType appender = AppenderType::RotatingFile;
         std::string filename;
         LogLevel level = LogLevel::INFO;
         uint32_t io_buffer_size = 1024 * 1024 * 4;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
@@ -478,6 +485,10 @@ namespace zrlog {
         // ---- 缓冲区满时的处理策略 ----
         BufferFullPolicy buffer_full_policy = BufferFullPolicy::Discard;
         uint32_t buffer_full_retry_count = 256;         //重试次数(仅在 Retry 策略下生效)
+
+        // ---- 滚动文件配置 ----
+        uint32_t rotating_file_size = 1024 * 1024 * 100;    // 默认 100MB 滚动一次
+        uint32_t rotating_max_files = 5;                    // 默认保留 5 个备份文件
     };
 
     class ILogAppender {
@@ -543,6 +554,100 @@ namespace zrlog {
         }
 
     private:
+        int fd_ = -1;
+    };
+
+    class RotatingFileLogAppender : public ILogAppender {
+    public:
+        RotatingFileLogAppender(const std::string& path, size_t max_size, uint32_t max_files)
+            : base_path_(path), max_size_(max_size), max_files_(max_files) {
+            open_current_file();
+        }
+
+        ~RotatingFileLogAppender() override {
+            close();
+        }
+
+        int write(const char* data, size_t len) override {
+            // 每次写入前检查是否超过单文件最大限制
+            if (ZRLOG_UNLIKELY(current_size_ + len > max_size_)) {
+                roll();
+            }
+            int ret = ZRLOG_WRITE(fd_, data, len);
+            if (ret > 0) {
+                current_size_ += ret;
+            }
+            return ret;
+        }
+
+        int flush() override {
+            return ZRLOG_FLUSH_FILE(fd_);
+        }
+
+    private:
+        void open_current_file() {
+            fd_ = ZRLOG_OPEN(base_path_.c_str(), ZRLOG_O_FLAGS, ZRLOG_S_FLAGS);
+            if (fd_ != -1) {
+                struct stat st;
+                if (fstat(fd_, &st) == 0) {
+                    current_size_ = st.st_size; // 支持重启续写
+                }
+                else {
+                    current_size_ = 0;
+                }
+            }
+        }
+
+        void close() {
+            if (fd_ != -1) {
+                ZRLOG_CLOSE(fd_);
+                fd_ = -1;
+            }
+        }
+
+        void roll() {
+            close();
+
+            if (max_files_ > 0) {
+                // 预分配栈缓冲区，彻底消灭堆碎片
+                const size_t buf_size = base_path_.size() + 16;
+                std::string src_buf(buf_size, '\0');
+                std::string dst_buf(buf_size, '\0');
+
+                std::memcpy(src_buf.data(), base_path_.data(), base_path_.size());
+                std::memcpy(dst_buf.data(), base_path_.data(), base_path_.size());
+                size_t base_len = base_path_.size();
+
+                for (uint32_t i = max_files_ - 1; i >= 1; --i) {
+                    auto src_res = fmt::format_to(src_buf.data() + base_len, ".{}", i);
+                    *src_res = '\0';
+
+                    // 检查源文件是否存在，避免不必要的系统调用
+                    if (ZRLOG_ACCESS(src_buf.data(), ZRLOG_F_OK) != 0) {
+                        continue;
+                    }
+
+                    auto dst_res = fmt::format_to(dst_buf.data() + base_len, ".{}", i + 1);
+                    *dst_res = '\0';
+
+                    std::remove(dst_buf.data()); // Windows 下 rename 前需移除目标
+                    std::rename(src_buf.data(), dst_buf.data());
+                }
+
+                auto dst_res = fmt::format_to(dst_buf.data() + base_len, ".1");
+                *dst_res = '\0';
+                std::remove(dst_buf.data());
+                std::rename(base_path_.c_str(), dst_buf.data());
+            }
+
+            open_current_file();
+            current_size_ = 0;
+        }
+
+        std::string base_path_;
+        size_t max_size_;
+        uint32_t max_files_;
+        size_t current_size_ = 0;
         int fd_ = -1;
     };
 
@@ -641,15 +746,10 @@ namespace zrlog {
 
             if (!log_thread_running_.load(std::memory_order_relaxed)) {
                 if (config_.appender == AppenderType::File) {
-                    if (config_.filename.empty()) {
-                        fprintf(stderr, "NanoLogger: File appender requires filename.\n");
-                        return false;
-                    }
-                    auto file_appender = std::make_unique<FileLogAppender>(config_.filename);
-                    if (!file_appender->is_open()) {
-                        return false;
-                    }
-                    appender_ = std::move(file_appender);
+                    appender_ = std::make_unique<FileLogAppender>(config_.filename);
+                }
+                else if (config_.appender == AppenderType::RotatingFile) {
+                    appender_ = std::make_unique<RotatingFileLogAppender>(config_.filename, config_.rotating_file_size, config_.rotating_max_files);
                 }
                 else {
                     appender_ = std::make_unique<ConsoleLogAppender>();
@@ -714,6 +814,27 @@ namespace zrlog {
             }
 
             return push_log_entry(log_id, std::forward<Args>(args)...);
+        }
+
+        // 崩溃兜底紧急刷盘接口
+        void emergency_flush() {
+            if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                return;
+            }
+
+            // 标记为崩溃模式，并通知后台消费者立刻醒来
+            is_crashed_.store(true, std::memory_order_release);
+            notify_consumer();
+
+            // 当前线程（发生崩溃的业务线程）自旋阻塞，给后台线程抢救数据的时间。
+            // 设置 3000 毫秒超时，防止磁盘卡死导致进程无法退出 Core Dump。
+            auto start_time = std::chrono::steady_clock::now();
+            while (!crash_drain_done_.load(std::memory_order_acquire)) {
+                if (std::chrono::steady_clock::now() - start_time > std::chrono::milliseconds(3000)) {
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
         }
 
     private:
@@ -1306,12 +1427,16 @@ namespace zrlog {
             ~ThreadBufferDestroyer() {
                 if (nullptr != NanoLogger::thread_buffer_) {
                     NanoLogger::thread_buffer_->mark_deallocate();
-                    NanoLogger::instance().notify_consumer();
+                    logger_->notify_consumer();
                 }
             }
 
-            void init() {
+            inline void init(NanoLogger* logger) {
+                logger_ = logger;
             }
+            
+        private:
+            NanoLogger *logger_{ nullptr };
         };
 
         template<typename FmtProvider, typename... Args>
@@ -1363,7 +1488,7 @@ namespace zrlog {
         ThreadBuffer* get_thread_buffer() {
             if (ZRLOG_UNLIKELY(nullptr == thread_buffer_)) {
                 thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size, get_thread_id());
-                thread_buffer_destroyer_.init();
+                thread_buffer_destroyer_.init(this);
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
                 thread_buffers_.push_back(thread_buffer_);
             }
@@ -1521,8 +1646,17 @@ namespace zrlog {
             IOBuffer io_buf(appender_.get(), config_.io_buffer_size);
 
             while (log_thread_running_.load(std::memory_order_relaxed)) {
-                size_t process_count = consume_buffers_round_robin(local_log_metas, io_buf, false);
 
+                // 【崩溃检测】发现发生严重崩溃，立即启动抢救式全量 Drain
+                if (ZRLOG_UNLIKELY(is_crashed_.load(std::memory_order_acquire))) {
+                    while (consume_buffers_round_robin(local_log_metas, io_buf, true) > 0) {
+                    }
+                    io_buf.flush_force();
+                    crash_drain_done_.store(true, std::memory_order_release);
+                    return; // 抢救完毕，安全退出
+                }
+
+                size_t process_count = consume_buffers_round_robin(local_log_metas, io_buf, false);
                 if (process_count < 1) {  // idle
                     io_buf.flush_to_os();
                     TscClock::instance().sync_system_time();
@@ -1591,15 +1725,44 @@ namespace zrlog {
         std::atomic<uint64_t>  stat_produce_valid_count_{ 0 };
         std::atomic<uint64_t>  stat_consume_count_{ 0 };
         std::atomic<uint64_t>  stat_consume_valid_count_{ 0 };
+
+        //崩溃状态标识
+        std::atomic<bool> is_crashed_{ false };
+        std::atomic<bool> crash_drain_done_{ false };
     };
 
     inline ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
     inline thread_local NanoLogger::ThreadBufferDestroyer NanoLogger::thread_buffer_destroyer_;
-}
+
+    // ---------------------------------------------------------------------------
+    // 崩溃信号捕获 (Crash Handler)
+    // ---------------------------------------------------------------------------
+    namespace detail {
+        inline void crash_signal_handler(int sig) {
+            // 发生崩溃，触发日志紧急刷盘
+            NanoLogger::instance().emergency_flush();
+
+            // 恢复系统默认行为并重新抛出，以生成 Core Dump
+            std::signal(sig, SIG_DFL);
+            std::raise(sig);
+        }
+    }
+
+    inline void install_crash_handler() {
+        std::signal(SIGSEGV, detail::crash_signal_handler);
+        std::signal(SIGABRT, detail::crash_signal_handler);
+        std::signal(SIGFPE, detail::crash_signal_handler);
+        std::signal(SIGILL, detail::crash_signal_handler);
+    }
+
+}  //end namespace zrlog
 
 // ---------------------------------------------------------------------------
 // 静态宏：编译期极致优化
 // ---------------------------------------------------------------------------
+
+// 确保 format 是字符串字面量的魔法技巧：
+#define ZRLOG_ENSURE_STRING_LITERAL(fmt_str)  "" fmt_str ""
 
 #define ZRLOG_INIT_CONF(config) zrlog::NanoLogger::instance().init(config)
 #define ZRLOG_INIT(filename, level) zrlog::NanoLogger::instance().init(filename, level)
@@ -1607,6 +1770,11 @@ namespace zrlog {
 
 #define ZRLOG_BODY(level, format, ...)                                                              \
     do {                                                                                            \
+        /* 如果 format 是变量，"" format "" 这一步就会报清晰的错误： */                             \
+        /* "error: expected ';' before 'format'" -> 提醒用户不要传变量 */                           \
+        constexpr const char* _check_literal = ZRLOG_ENSURE_STRING_LITERAL(format);                 \
+        (void)_check_literal;                                                                       \
+                                                                                                    \
         zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                                  \
         if (logger.check_level(level)) {                                                            \
             static std::atomic<uint32_t> log_id{0};                                                 \
