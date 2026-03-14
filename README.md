@@ -25,46 +25,29 @@ zrlog is maintained in two separate branches to cater to different project needs
 
 ---
 
-## 🏆 Performance Benchmarks
-
-zrlog has been rigorously tested against industry-standard logging libraries. It sits comfortably in the absolute top tier of low-latency loggers:
-
-*   **Beats `fmtlog`**: Consistently outperforms `fmtlog` in frontend latency (delivering lower **Average**, **P50**, and **MIN** latency). Moreover, its maximum **throughput is significantly higher** than `fmtlog`.
-*   **Top-Tier Class**: Belongs to the same nanosecond-level elite tier as `nanolog` and `fmtlog`.
-*   **Decimates Traditional Loggers**: Achieves **10x - 50x higher performance** (latency and throughput) compared to mainstream loggers like `spdlog`. It is an ideal replacement for High-Frequency Trading (HFT) and extreme low-latency backends.
-
-### 📊 Running the Benchmark
-
-You can easily compile and run the included `benchmark_zrlog.cpp` to verify the performance on your own hardware.
-
-**1. Compile the benchmark:**
-Ensure you have cloned or downloaded `fmtlib`. Replace `/path/to/fmt/include` with your actual `fmt` header path.
-```bash
-g++ -O3 -march=native -flto -std=c++17 -pthread -I./fmt/include benchmark_zrlog.cpp -o benchmark_zrlog
-```
-
-**2. Run the benchmark:**
-Execute the compiled binary. By default, it uses a 1MB thread buffer and the `Discard` policy.
-```bash
-./benchmark_zrlog
-```
-
-*(Optional)* You can tune the benchmark by passing arguments:
-```bash
-# Usage: ./benchmark_zrlog [thread_buffer_size_MB] [buffer_full_policy]
-# buffer_full_policy: 0 = Discard, 1 = Block, 2 = Retry
-
-# Example: Run with a 2.5MB thread buffer and 'Retry' policy
-./benchmark_zrlog 2.5 2
-```
-
-**The benchmark suite executes the following tests:**
-1.  **Frontend Latency Test**: Measures the ns-level overhead of a single log call (Avg, MIN, MAX, P50, P90, P99, P99.9).
-2.  **Throughput Test**: Measures Million logs/sec (M logs/sec) in both single-threaded and multi-threaded scenarios.
-3.  **Message Type Latency**: Compares the serialization overhead of pure integers, strings, and mixed types.
-4.  **Clock Performance**: Compares the speed of the hardware `TscClock` vs the standard `std::chrono::system_clock`.
-
----
+## 🏗️ Architecture Overview
+zrlog achieves extreme performance by strictly decoupling the extraction of data (frontend) from the formatting of strings (backend).
+code
+Text
++-------------------+       +-----------------------+
+| Business Thread 1 | ----> | TLS RingBuffer (1MB)  | --+
++-------------------+       +-----------------------+   |
+      (Frontend)               (Lock-Free SPSC Queue)   |     +-------------------+      +----------------+
+                                                        +---> | Background Thread | ---> | IOBuffer (4MB) | ---> Disk (Rolling)
++-------------------+       +-----------------------+   +---> | (Formatter & I/O) |      +----------------+
+| Business Thread N | ----> | TLS RingBuffer (1MB)  | --+     +-------------------+
++-------------------+       +-----------------------+               (Backend)
+Frontend (Producer):
+Executes in your business thread.
+Zero parsing, zero string formatting, zero system calls.
+It grabs a high-precision TSC hardware timestamp, serializes the raw arguments (e.g., integers, floats, string pointers) into a dense binary payload, and pushes it to a Thread-Local Storage (TLS) RingBuffer.
+Lock-Free Queues:
+Each thread owns a dedicated Single-Producer-Single-Consumer (SPSC) RingBuffer.
+Cache lines are strictly isolated (alignas) to prevent CPU False Sharing.
+Backend (Consumer):
+A dedicated background thread constantly polls all active thread buffers (using an efficient Epoch-based Round-Robin algorithm).
+It pops the binary payload, decodes it using a compile-time generated AST function (FMT_COMPILE), and converts it into human-readable text.
+The text is written to a large IOBuffer and periodically flushed to the disk.
 
 ## ✨ Enterprise-Grade Features (v2.3+)
 
@@ -198,6 +181,47 @@ zrlog provides three policies via `zrlog::BufferFullPolicy` to handle this scena
    Business threads only write the raw binary representation of their arguments (not formatted text) into a lock-free Thread-Local RingBuffer. This completely bypasses global mutexes, `snprintf`, and string concatenation overhead.
 2. **How do we prevent Cache-Line Bouncing?**
    In the `ThreadBuffer`, producer cursors (`write_index_`) and consumer cursors (`read_index_`) are strictly separated by `alignas(CACHE_LINE_SIZE)`. This guarantees a near 100% L1/L2 cache hit rate by physically isolating atomic variables.
+
+---
+
+## 🏆 Performance Benchmarks
+
+zrlog has been rigorously tested against industry-standard logging libraries. It sits comfortably in the absolute top tier of low-latency loggers:
+
+*   **Beats `fmtlog`**: Consistently outperforms `fmtlog` in frontend latency (delivering lower **Average**, **P50**, and **MIN** latency). Moreover, its maximum **throughput is significantly higher** than `fmtlog`.
+*   **Top-Tier Class**: Belongs to the same nanosecond-level elite tier as `nanolog` and `fmtlog` and `quill`.
+*   **Decimates Traditional Loggers**: Achieves **10x - 50x higher performance** (latency and throughput) compared to mainstream loggers like `spdlog`. It is an ideal replacement for High-Frequency Trading (HFT) and extreme low-latency backends.
+
+### 📊 Running the Benchmark
+
+You can easily compile and run the included `benchmark_zrlog.cpp` to verify the performance on your own hardware.
+
+**1. Compile the benchmark:**
+Ensure you have cloned or downloaded `fmtlib`. Replace `/path/to/fmt/include` with your actual `fmt` header path.
+```bash
+g++ -O3 -march=native -flto -std=c++17 -pthread -I./fmt/include benchmark_zrlog.cpp -o benchmark_zrlog
+```
+
+**2. Run the benchmark:**
+Execute the compiled binary. By default, it uses a 1MB thread buffer and the `Discard` policy.
+```bash
+./benchmark_zrlog
+```
+
+*(Optional)* You can tune the benchmark by passing arguments:
+```bash
+# Usage: ./benchmark_zrlog [thread_buffer_size_MB] [buffer_full_policy]
+# buffer_full_policy: 0 = Discard, 1 = Block, 2 = Retry
+
+# Example: Run with a 2.5MB thread buffer and 'Retry' policy
+./benchmark_zrlog 2.5 2
+```
+
+**The benchmark suite executes the following tests:**
+1.  **Frontend Latency Test**: Measures the ns-level overhead of a single log call (Avg, MIN, MAX, P50, P90, P99, P99.9).
+2.  **Throughput Test**: Measures Million logs/sec (M logs/sec) in both single-threaded and multi-threaded scenarios.
+3.  **Message Type Latency**: Compares the serialization overhead of pure integers, strings, and mixed types.
+4.  **Clock Performance**: Compares the speed of the hardware `TscClock` vs the standard `std::chrono::system_clock`.
 
 ---
 
