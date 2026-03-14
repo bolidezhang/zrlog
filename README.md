@@ -26,9 +26,9 @@ zrlog is maintained in two separate branches to cater to different project needs
 ---
 
 ## 🏗️ Architecture Overview
+```text
 zrlog achieves extreme performance by strictly decoupling the extraction of data (frontend) from the formatting of strings (backend).
-code
-Text
+
 +-------------------+       +-----------------------+
 | Business Thread 1 | ----> | TLS RingBuffer (1MB)  | --+
 +-------------------+       +-----------------------+   |
@@ -37,17 +37,19 @@ Text
 +-------------------+       +-----------------------+   +---> | (Formatter & I/O) |      +----------------+
 | Business Thread N | ----> | TLS RingBuffer (1MB)  | --+     +-------------------+
 +-------------------+       +-----------------------+               (Backend)
+
 Frontend (Producer):
-Executes in your business thread.
-Zero parsing, zero string formatting, zero system calls.
-It grabs a high-precision TSC hardware timestamp, serializes the raw arguments (e.g., integers, floats, string pointers) into a dense binary payload, and pushes it to a Thread-Local Storage (TLS) RingBuffer.
+    Executes in your business thread.
+    Zero parsing, zero string formatting, zero system calls.
+    It grabs a high-precision TSC hardware timestamp, serializes the raw arguments (e.g., integers, floats, string pointers) into a dense binary payload, and pushes it to a Thread-Local Storage (TLS) RingBuffer.
 Lock-Free Queues:
-Each thread owns a dedicated Single-Producer-Single-Consumer (SPSC) RingBuffer.
-Cache lines are strictly isolated (alignas) to prevent CPU False Sharing.
+    Each thread owns a dedicated Single-Producer-Single-Consumer (SPSC) RingBuffer.
+    Cache lines are strictly isolated (alignas) to prevent CPU False Sharing.
 Backend (Consumer):
-A dedicated background thread constantly polls all active thread buffers (using an efficient Epoch-based Round-Robin algorithm).
-It pops the binary payload, decodes it using a compile-time generated AST function (FMT_COMPILE), and converts it into human-readable text.
-The text is written to a large IOBuffer and periodically flushed to the disk.
+    A dedicated background thread constantly polls all active thread buffers (using an efficient Epoch-based Round-Robin algorithm).
+    It pops the binary payload, decodes it using a compile-time generated AST function (FMT_COMPILE), and converts it into human-readable text.
+    The text is written to a large IOBuffer and periodically flushed to the disk.
+```
 
 ## ✨ Enterprise-Grade Features (v2.3+)
 
