@@ -97,6 +97,7 @@ g++ -O3 -march=native -flto -std=c++17 -pthread -I/path/to/fmt/include main.cpp 
 
 *Note: Use `{}` placeholders for v2.x.*
 
+```cpp
 #include "zrlog.h"
 
 int main() {
@@ -121,6 +122,7 @@ int main() {
     ZRLOG_FINI();
     return 0;
 }
+```
 
 ### ⚡ Extreme Optimization: Static String Literals
 
