@@ -659,7 +659,7 @@ namespace zrlog {
             else if (ret < 0) {
                 // 【修复 BUG】：写失败 (如 ENOSPC 磁盘满)。
                 // 虽然 fd 还开着，但数据写不进去了！必须立刻兜底到 stderr 防止数据丢失。
-                auto res = ZRLOG_WRITE(STDERR_FILENO, data, len);
+                [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, data, len);
 
                 // 强制累加 current_size_，确保后续能触发 roll() 尝试重新整理文件系统状态
                 current_size_ += len;
@@ -690,7 +690,7 @@ namespace zrlog {
             else {
                 // 文件打开失败的严重报警与退避设定
                 const char err_msg[] = "\n[ZRLOG CRITICAL] Failed to open log file! Fallback to stderr.\n";
-                auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
+                [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
                 current_size_ = 0;
 
                 size_t retry_interval = max_size_ / 10;
@@ -747,7 +747,7 @@ namespace zrlog {
                         if (std::rename(base_path_.c_str(), dst_buf) != 0) {
                             rename_success = false;
                             const char err_msg[] = "\n[ZRLOG ERROR] Rotate failed! Appending to existing file.\n";
-                            auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
+                            [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
                         }
                     }
                 }
@@ -1774,7 +1774,7 @@ namespace zrlog {
             if (!config_.background_thread_core_ids.empty()) {
                 if (!zrlog::pin_thread_to_cores(config_.background_thread_core_ids)) {
                     const char err_msg[] = "[ZRLOG WARNING] Failed to pin background thread to specified CPU cores.\n";
-                    ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
+                    [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
                 }
             }
 
