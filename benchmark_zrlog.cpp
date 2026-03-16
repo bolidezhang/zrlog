@@ -292,6 +292,7 @@ int main(int argc, char* argv[]) {
     config.io_buffer_size = 1024 * 1024 * 4;          // 4MB IO buffer
     //config.io_buffer_size = 1024 * 512;             // 512KB IO buffer
     config.buffer_full_policy = buffer_full_policy;
+    //config.background_thread_core_ids = { 0,1 };
     std::cout << "config.thread_buffer_size:" << config.thread_buffer_size
         << " buffer_full_policy:" << static_cast<uint32_t>(buffer_full_policy) << std::endl;
 

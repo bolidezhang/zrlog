@@ -1,8 +1,8 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.3.0
-#define ZRLOG_VERSION 20300
+// 如：2.4.0
+#define ZRLOG_VERSION 20400
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
@@ -86,7 +86,6 @@ constexpr size_t CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 
 //标准错误输出 screen(defaut)
 #define STDERR_FILENO 2
-
 inline void zrlog_gmtime(const time_t* timer, struct tm* buf) {
     gmtime_s(buf, timer);
 }
@@ -105,6 +104,8 @@ inline uint64_t zrlog_rdtsc() {
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/types.h>
+#include <pthread.h>
+#include <sched.h>
 
 #ifdef __x86_64__
 #include <x86intrin.h>
@@ -188,6 +189,12 @@ namespace zrlog {
     // 内部细节
     // ---------------------------------------------------------------------------
     namespace detail {
+
+        // 编译期特征：判断 T 的真实类型（去除引用和 const/volatile 修饰后）是否为裸指针
+        template <typename T>
+        constexpr bool is_raw_char_ptr_v =
+            std::is_same_v<std::remove_cv_t<std::remove_reference_t<T>>, char*> ||
+            std::is_same_v<std::remove_cv_t<std::remove_reference_t<T>>, const char*>;
 
         // 编译期类型映射 Traits：遇到字符串一律退化为 std::string_view
         template <typename T>
@@ -420,7 +427,7 @@ namespace zrlog {
         Anchor anchor_{ 0, 0 };
     };
 
-    static inline uint64_t get_thread_id() {
+    inline uint64_t get_thread_id() {
         static thread_local uint64_t tid_ = []() -> uint64_t {
 #ifdef  _WIN32
             return static_cast<uint64_t>(::GetCurrentThreadId());
@@ -437,6 +444,60 @@ namespace zrlog {
 #endif
         }();
         return tid_;
+    }
+
+    /**
+       * @brief 将当前线程绑定到一组指定的 CPU 核心上
+       *
+       * @param core_ids 核心 ID 列表，例如 {1, 2, 3}。如果传空，则不限制调度。
+       * @return true  绑定成功，或列表为空
+       * @return false 绑定失败，或当前系统不支持
+       */
+    inline bool pin_thread_to_cores(const std::vector<int>& core_ids) {
+        if (core_ids.empty()) {
+            return true; // 不要求绑核
+        }
+
+#if defined(__linux__)
+        cpu_set_t cpuset;
+        CPU_ZERO(&cpuset);
+
+        // 遍历激活掩码中对应的多个核心位
+        for (int core_id : core_ids) {
+            if (core_id >= 0) {
+                CPU_SET(core_id, &cpuset);
+            }
+        }
+
+        int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+        return (rc == 0);
+
+#elif defined(_WIN32)
+        DWORD_PTR mask = 0;
+
+        // 遍历并进行位或运算，合成最终的多核掩码
+        for (int core_id : core_ids) {
+            if (core_id >= 0 && core_id < 64) { // Windows 默认 DWORD_PTR 限制 64 核内
+                mask |= (static_cast<DWORD_PTR>(1) << core_id);
+            }
+        }
+
+        HANDLE thread = GetCurrentThread();
+        DWORD_PTR result = SetThreadAffinityMask(thread, mask);
+        return (result != 0);
+#else
+        return false;
+#endif
+    }
+
+    /**
+     * @brief 便利重载：绑定到单个核心
+     */
+    inline bool pin_thread_to_core(int core_id) {
+        if (core_id < 0) {
+            return true;
+        }
+        return pin_thread_to_cores(std::vector<int>{core_id});
     }
 
     enum class LogLevel : uint8_t {
@@ -480,11 +541,17 @@ namespace zrlog {
         uint32_t io_buffer_size = 1024 * 1024 * 4;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
         uint32_t thread_buffer_size = 1024 * 1024 * 1;  //每个线程的缓冲大小(前端二进制序列化缓冲 测试发现越大如16M,时延也变大)
         uint32_t per_thread_quota = 256;                //每个线程的格式化日志的配额(防止线程产生日志太快,公平处理每个线程日志)
-        uint32_t idle_wait_interval_us = 1000;          //空闲等待间隔(微妙)
+        uint32_t idle_wait_interval_us = 1000;          //空闲等待间隔(微秒)
+        uint32_t force_flush_interval_ms = 3000;        //强制刷盘间隔(毫秒)
+        uint32_t crash_drain_wait_ms = 3000;            //发生崩溃的业务线程自旋阻塞，给后台线程抢救数据的时长(毫秒)
+
+        // 支持将日志后台线程绑定到多个核心 (如 {0, 1, 2})
+        // 默认空列表表示由 OS 全局调度
+        std::vector<int> background_thread_core_ids;
 
         // ---- 缓冲区满时的处理策略 ----
         BufferFullPolicy buffer_full_policy = BufferFullPolicy::Discard;
-        uint32_t buffer_full_retry_count = 256;         //重试次数(仅在 Retry 策略下生效)
+        uint32_t buffer_full_retry_count = 256;             //重试次数(仅在 Retry 策略下生效)
 
         // ---- 滚动文件配置 ----
         uint32_t rotating_file_size = 1024 * 1024 * 100;    // 默认 100MB 滚动一次
@@ -560,7 +627,7 @@ namespace zrlog {
     class RotatingFileLogAppender : public ILogAppender {
     public:
         RotatingFileLogAppender(const std::string& path, size_t max_size, uint32_t max_files)
-            : base_path_(path), max_size_(max_size), max_files_(max_files) {
+            : base_path_(path), max_size_(max_size), max_files_(max_files), next_roll_size_(max_size) {
             open_current_file();
         }
 
@@ -569,19 +636,41 @@ namespace zrlog {
         }
 
         int write(const char* data, size_t len) override {
-            // 每次写入前检查是否超过单文件最大限制
-            if (ZRLOG_UNLIKELY(current_size_ + len > max_size_)) {
+            // 触发器：正常写满，或在退避期写够了数据
+            if (ZRLOG_UNLIKELY(current_size_ + len > next_roll_size_)) {
                 roll();
             }
+
+            // 兜底 1：文件彻底瘫痪，全量降级到 stderr
+            if (ZRLOG_UNLIKELY(fd_ == -1)) {
+                int ret = ZRLOG_WRITE(STDERR_FILENO, data, len);
+                if (ret > 0) {
+                    current_size_ += ret; // 累加字节数作为重试定时器
+                }
+                return ret;
+            }
+
+            // 正常写入
             int ret = ZRLOG_WRITE(fd_, data, len);
             if (ret > 0) {
                 current_size_ += ret;
+            }
+            else if (ret < 0) {
+                // 【修复 BUG】：写失败 (如 ENOSPC 磁盘满)。
+                // 虽然 fd 还开着，但数据写不进去了！必须立刻兜底到 stderr 防止数据丢失。
+                ZRLOG_WRITE(STDERR_FILENO, data, len);
+
+                // 强制累加 current_size_，确保后续能触发 roll() 尝试重新整理文件系统状态
+                current_size_ += len;
             }
             return ret;
         }
 
         int flush() override {
-            return ZRLOG_FLUSH_FILE(fd_);
+            if (ZRLOG_LIKELY(fd_ != -1)) {
+                return ZRLOG_FLUSH_FILE(fd_);
+            }
+            return 0;
         }
 
     private:
@@ -590,11 +679,24 @@ namespace zrlog {
             if (fd_ != -1) {
                 struct stat st;
                 if (fstat(fd_, &st) == 0) {
-                    current_size_ = st.st_size; // 支持重启续写
+                    current_size_ = st.st_size;
                 }
                 else {
                     current_size_ = 0;
                 }
+                next_roll_size_ = max_size_;
+            }
+            else {
+                // 文件打开失败的严重报警与退避设定
+                const char* err_msg = "\n[ZRLOG CRITICAL] Failed to open log file! Fallback to stderr.\n";
+                ZRLOG_WRITE(STDERR_FILENO, err_msg, strlen(err_msg));
+                current_size_ = 0;
+
+                size_t retry_interval = max_size_ / 10;
+                if (retry_interval < 1024 * 1024) {
+                    retry_interval = 1024 * 1024;
+                }
+                next_roll_size_ = retry_interval;
             }
         }
 
@@ -608,46 +710,70 @@ namespace zrlog {
         void roll() {
             close();
 
+            bool rename_success = true;
+
             if (max_files_ > 0) {
-                // 预分配栈缓冲区，彻底消灭堆碎片
-                const size_t buf_size = base_path_.size() + 16;
-                std::string src_buf(buf_size, '\0');
-                std::string dst_buf(buf_size, '\0');
+                if (ZRLOG_ACCESS(base_path_.c_str(), ZRLOG_F_OK) == 0) {
+                    // 【修复 BUG】：真正的纯栈内存分配 (避免 std::string 触发 malloc)
+                    // 4096 (PATH_MAX) 足够容纳任何合法的文件路径
+                    char src_buf[4096];
+                    char dst_buf[4096];
 
-                std::memcpy(src_buf.data(), base_path_.data(), base_path_.size());
-                std::memcpy(dst_buf.data(), base_path_.data(), base_path_.size());
-                size_t base_len = base_path_.size();
+                    if (base_path_.size() + 16 < sizeof(src_buf)) {
+                        size_t base_len = base_path_.size();
+                        std::memcpy(src_buf, base_path_.data(), base_len);
+                        std::memcpy(dst_buf, base_path_.data(), base_len);
 
-                for (uint32_t i = max_files_ - 1; i >= 1; --i) {
-                    auto src_res = fmt::format_to(src_buf.data() + base_len, ".{}", i);
-                    *src_res = '\0';
+                        for (uint32_t i = max_files_ - 1; i >= 1; --i) {
+                            auto src_res = fmt::format_to(src_buf + base_len, ".{}", i);
+                            *src_res = '\0';
 
-                    // 检查源文件是否存在，避免不必要的系统调用
-                    if (ZRLOG_ACCESS(src_buf.data(), ZRLOG_F_OK) != 0) {
-                        continue;
+                            if (ZRLOG_ACCESS(src_buf, ZRLOG_F_OK) != 0) {
+                                continue;
+                            }
+
+                            auto dst_res = fmt::format_to(dst_buf + base_len, ".{}", i + 1);
+                            *dst_res = '\0';
+
+                            std::remove(dst_buf);
+                            std::rename(src_buf, dst_buf);
+                        }
+
+                        auto dst_res = fmt::format_to(dst_buf + base_len, ".1");
+                        *dst_res = '\0';
+                        std::remove(dst_buf);
+
+                        if (std::rename(base_path_.c_str(), dst_buf) != 0) {
+                            rename_success = false;
+                            const char* err_msg = "\n[ZRLOG ERROR] Rotate failed! Appending to existing file.\n";
+                            ZRLOG_WRITE(STDERR_FILENO, err_msg, strlen(err_msg));
+                        }
                     }
-
-                    auto dst_res = fmt::format_to(dst_buf.data() + base_len, ".{}", i + 1);
-                    *dst_res = '\0';
-
-                    std::remove(dst_buf.data()); // Windows 下 rename 前需移除目标
-                    std::rename(src_buf.data(), dst_buf.data());
                 }
-
-                auto dst_res = fmt::format_to(dst_buf.data() + base_len, ".1");
-                *dst_res = '\0';
-                std::remove(dst_buf.data());
-                std::rename(base_path_.c_str(), dst_buf.data());
+            }
+            else {
+                // 【修复 BUG】：当 max_files_ == 0 时，绝不能保留原文件，否则死循环。
+                // 必须无条件删除，让 open_current_file() 重头创建一个 0 字节的新文件。
+                std::remove(base_path_.c_str());
             }
 
             open_current_file();
-            current_size_ = 0;
+
+            // 退避策略：如果重命名失败且我们还在往老文件里写，延迟下一次重试时间
+            if (max_files_ > 0 && !rename_success && fd_ != -1) {
+                size_t backoff_step = max_size_ / 10;
+                if (backoff_step < 1024 * 1024) {
+                    backoff_step = 1024 * 1024;
+                }
+                next_roll_size_ = current_size_ + backoff_step;
+            }
         }
 
         std::string base_path_;
         size_t max_size_;
         uint32_t max_files_;
         size_t current_size_ = 0;
+        size_t next_roll_size_;
         int fd_ = -1;
     };
 
@@ -791,6 +917,11 @@ namespace zrlog {
         bool log(std::atomic<uint32_t>& log_id_atom, LogLevel level, std::string_view file, uint32_t line,
             std::string_view func, Args&&... args) {
 
+            // 在编译期扫描所有参数，如果有裸指针，直接让编译失败！
+            static_assert((... && !detail::is_raw_char_ptr_v<Args>),
+                "[ZRLOG FATAL ERROR] Raw char* / const char* is strictly forbidden for performance and safety! "
+                "Please use std::string_view(ptr, len) or zrlog::literal instead.");
+
             uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
             if (ZRLOG_UNLIKELY(0 == log_id)) {
                 log_id = register_log_meta<FmtProvider, typename std::decay<Args>::type...>(
@@ -806,6 +937,11 @@ namespace zrlog {
         template<typename... Args>
         bool log_runtime(std::atomic<uint32_t>& log_id_atom, LogLevel level, std::string_view file, uint32_t line,
             std::string_view func, std::string_view format, Args&&... args) {
+
+            // 在编译期扫描所有参数，如果有裸指针，直接让编译失败！
+            static_assert((... && !detail::is_raw_char_ptr_v<Args>),
+                "[ZRLOG FATAL ERROR] Raw char* / const char* is strictly forbidden for performance and safety! "
+                "Please use std::string_view(ptr, len) or zrlog::literal instead.");
 
             uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
             if (ZRLOG_UNLIKELY(0 == log_id)) {
@@ -824,13 +960,13 @@ namespace zrlog {
 
             // 标记为崩溃模式，并通知后台消费者立刻醒来
             is_crashed_.store(true, std::memory_order_release);
-            notify_consumer();
+            //notify_consumer();
 
             // 当前线程（发生崩溃的业务线程）自旋阻塞，给后台线程抢救数据的时间。
-            // 设置 3000 毫秒超时，防止磁盘卡死导致进程无法退出 Core Dump。
+            // 设置 crash_drain_wait_ms 超时，防止磁盘卡死导致进程无法退出 Core Dump。
             auto start_time = std::chrono::steady_clock::now();
             while (!crash_drain_done_.load(std::memory_order_acquire)) {
-                if (std::chrono::steady_clock::now() - start_time > std::chrono::milliseconds(3000)) {
+                if (std::chrono::steady_clock::now() - start_time > std::chrono::milliseconds(config_.crash_drain_wait_ms)) {
                     break;
                 }
                 std::this_thread::sleep_for(std::chrono::milliseconds(5));
@@ -925,9 +1061,6 @@ namespace zrlog {
             if constexpr (std::is_same_v<DecayedT, zrlog::string_literal_t>) {
                 return sizeof(zrlog::string_literal_t);
             }
-            else if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
-                return sizeof(uint32_t) + (val ? (uint32_t)strlen(val) : 0);
-            }
             else if constexpr (std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
                 return sizeof(uint32_t) + (uint32_t)val.size();
             }
@@ -957,14 +1090,6 @@ namespace zrlog {
             if constexpr (std::is_same_v<DecayedT, zrlog::string_literal_t>) {
                 std::memcpy(ptr, &val, sizeof(zrlog::string_literal_t));
                 ptr += sizeof(zrlog::string_literal_t);
-            }
-            else if constexpr (std::is_same_v<DecayedT, const char*> || std::is_same_v<DecayedT, char*>) {
-                uint32_t len = val ? (uint32_t)strlen(val) : 0;
-                std::memcpy(ptr, &len, sizeof(uint32_t));
-                if (len > 0) {
-                    std::memcpy(ptr + sizeof(uint32_t), val, len);
-                }
-                ptr += sizeof(uint32_t) + len;
             }
             else if constexpr (std::is_same_v<DecayedT, std::string> || std::is_same_v<DecayedT, std::string_view>) {
                 uint32_t len = (uint32_t)val.size();
@@ -1641,10 +1766,22 @@ namespace zrlog {
         }
 
         void poll_routine() {
+
+            // ========================================================================
+            // 执行后台线程绑核 (CPU Physical Isolation)
+            // ========================================================================
+            if (!config_.background_thread_core_ids.empty()) {
+                if (!zrlog::pin_thread_to_cores(config_.background_thread_core_ids)) {
+                    const char err_msg[] = "[ZRLOG WARNING] Failed to pin background thread to specified CPU cores.\n";
+                    ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
+                }
+            }
+
             std::vector<LogMeta> local_log_metas;
             local_log_metas.reserve(1000);
             IOBuffer io_buf(appender_.get(), config_.io_buffer_size);
 
+            auto last_force_flush_time = std::chrono::steady_clock::now();            
             while (log_thread_running_.load(std::memory_order_relaxed)) {
 
                 // 【崩溃检测】发现发生严重崩溃，立即启动抢救式全量 Drain
@@ -1657,9 +1794,25 @@ namespace zrlog {
                 }
 
                 size_t process_count = consume_buffers_round_robin(local_log_metas, io_buf, false);
-                if (process_count < 1) {  // idle
-                    io_buf.flush_to_os();
+
+                // ========================================================================
+                // 周期性物理落盘(防断电/内核崩溃)
+                // ========================================================================
+                // 无论系统是处于空闲还是极端高负载，每隔 1 秒，必然触发一次真实的 fsync。
+                // 这保证了在面临机柜断电等最高级别物理灾难时，最多只丢失 force_flush_interval 毫秒的日志。
+                auto now = std::chrono::steady_clock::now();
+                auto force_flush_interval = std::chrono::milliseconds(config_.force_flush_interval_ms);
+                if (ZRLOG_UNLIKELY(now - last_force_flush_time >= force_flush_interval)) {
                     TscClock::instance().sync_system_time();
+
+                    io_buf.flush_force();           // 触发底层的 write + fsync
+                    last_force_flush_time = now;
+                }
+
+                if (process_count < 1) {  // idle
+                    // 空闲时，立刻将当前用户态缓冲交由操作系统 (Page Cache)
+                    // 保证了低延迟情况下的 tail -f 实时可见性
+                    io_buf.flush_to_os();
 
                     idle_wait_flag_.store(true, std::memory_order_relaxed);
                     {
