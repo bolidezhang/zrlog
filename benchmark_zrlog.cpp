@@ -260,6 +260,7 @@ int main(int argc, char* argv[]) {
 
     double thread_buffer_size = 1.0;   //default value: 1 MB
     zrlog::BufferFullPolicy buffer_full_policy = zrlog::BufferFullPolicy::Discard;
+    bool enable_huge_page = false;
     if (argc > 1) {
         thread_buffer_size = atof(argv[1]);
         if (thread_buffer_size < 0) {
@@ -272,6 +273,10 @@ int main(int argc, char* argv[]) {
         if (policy <= static_cast<uint32_t>(zrlog::BufferFullPolicy::Retry)) {
             buffer_full_policy = static_cast<zrlog::BufferFullPolicy>(policy);
         }
+    }
+
+    if (argc > 3) {
+        enable_huge_page = atoi(argv[3]);
     }
 
     std::cout << "============================================" << std::endl;
@@ -293,6 +298,7 @@ int main(int argc, char* argv[]) {
     //config.io_buffer_size = 1024 * 512;             // 512KB IO buffer
     config.buffer_full_policy = buffer_full_policy;
     //config.background_thread_core_ids = { 0,1 };
+    config.enable_huge_page = enable_huge_page;
     std::cout << "config.thread_buffer_size:" << config.thread_buffer_size
         << " buffer_full_policy:" << static_cast<uint32_t>(buffer_full_policy) << std::endl;
 
@@ -315,7 +321,7 @@ int main(int argc, char* argv[]) {
     
     // Run benchmarks
     benchmark_clock();
-    //benchmark_frontend_latency(1000);
+    benchmark_frontend_latency(1000);
     benchmark_frontend_latency(500000);
     //benchmark_message_types(2);
     benchmark_message_types(100000);

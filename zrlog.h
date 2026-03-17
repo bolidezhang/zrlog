@@ -1,8 +1,8 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.4.0
-#define ZRLOG_VERSION 20400
+// 如：2.4.1
+#define ZRLOG_VERSION 20401
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
@@ -41,9 +41,9 @@
 
 // 获取当前 CPU 架构的 L1 Cache Line 大小 (C++17)
 #ifdef __cpp_lib_hardware_interference_size
-constexpr size_t CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
+constexpr size_t ZRLOG_CACHE_LINE_SIZE = std::hardware_destructive_interference_size;
 #else
-constexpr size_t CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
+constexpr size_t ZRLOG_CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 #endif
 
 // 跨平台分支预测宏
@@ -112,6 +112,10 @@ inline uint64_t zrlog_rdtsc() {
 #include <x86intrin.h>
 #endif
 
+#if defined(__linux__)
+#include <sys/mman.h>
+#endif
+
 #define ZRLOG_OPEN(path, flags, mode)   ::open(path, flags, mode)
 #define ZRLOG_WRITE(fd, data, len)      ::write(fd, data, len)
 #define ZRLOG_CLOSE(fd)                 ::close(fd)
@@ -121,7 +125,6 @@ inline uint64_t zrlog_rdtsc() {
 #define ZRLOG_S_FLAGS                   (0644)
 #define ZRLOG_F_OK                      F_OK
 #define ZRLOG_FAST_THREAD_LOCAL         __thread
-
 
 #if defined(__x86_64__) || defined(__i386__)
 #define ZRLOG_CPU_PAUSE() __asm__ volatile("pause")
@@ -428,78 +431,151 @@ namespace zrlog {
         Anchor anchor_{ 0, 0 };
     };
 
-    inline uint64_t get_thread_id() {
-        static thread_local uint64_t tid_ = []() -> uint64_t {
-#ifdef  _WIN32
-            return static_cast<uint64_t>(::GetCurrentThreadId());
-#elif defined(__linux__)
-            return static_cast<uint64_t>(::syscall(SYS_gettid));
-#elif defined(__APPLE__)
-            uint64_t tid;
-            pthread_threadid_np(NULL, &tid);
-            return tid;
-#else
-            //return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
-            static std::atomic<uint64_t> global_tid_{ 0 };
-            return global_tid_.fetch_add(1, std::memory_order_relaxed) + 1; // 绝对安全的 fallback
-#endif
-        }();
-        return tid_;
-    }
+    namespace util {
 
-    /**
-       * @brief 将当前线程绑定到一组指定的 CPU 核心上
-       *
-       * @param core_ids 核心 ID 列表，例如 {1, 2, 3}。如果传空，则不限制调度。
-       * @return true  绑定成功，或列表为空
-       * @return false 绑定失败，或当前系统不支持
-       */
-    inline bool pin_thread_to_cores(const std::vector<int>& core_ids) {
-        if (core_ids.empty()) {
-            return true; // 不要求绑核
-        }
+        // ============================================================================
+        // 跨平台大页内存分配器 (HugeTLB Allocator)
+        // ============================================================================
+        struct MemoryBlock {
+            void  *ptr = nullptr;
+            size_t actual_size = 0;
+            bool   is_huge_page = false;
+        };
 
+        inline MemoryBlock allocate_block(size_t size, bool enable_huge_page = false) {
+            MemoryBlock block;
 #if defined(__linux__)
-        cpu_set_t cpuset;
-        CPU_ZERO(&cpuset);
+            if (enable_huge_page) {
+                // Linux 默认大页大小为 2MB。必须按 2MB 向上取整才能分配成功
+                const size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;
+                block.actual_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
 
-        // 遍历激活掩码中对应的多个核心位
-        for (int core_id : core_ids) {
-            if (core_id >= 0) {
-                CPU_SET(core_id, &cpuset);
+                // 1. 尝试分配大页
+                block.ptr = ::mmap(nullptr, block.actual_size, PROT_READ | PROT_WRITE,
+                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+
+                if (block.ptr != MAP_FAILED) {
+                    block.is_huge_page = true;
+                    return block;
+                }
             }
-        }
 
-        int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
-        return (rc == 0);
-
+            // 2. 优雅降级：退回到普通匿名映射
+            block.actual_size = size;
+            block.ptr = ::mmap(nullptr, block.actual_size, PROT_READ | PROT_WRITE, 
+                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+            return block;
 #elif defined(_WIN32)
-        DWORD_PTR mask = 0;
-
-        // 遍历并进行位或运算，合成最终的多核掩码
-        for (int core_id : core_ids) {
-            if (core_id >= 0 && core_id < 64) { // Windows 默认 DWORD_PTR 限制 64 核内
-                mask |= (static_cast<DWORD_PTR>(1) << core_id);
+            if (enable_huge_page) {
+                // Windows 大页支持较为复杂，需要 SeLockMemoryPrivilege 权限
+                // 这里提供一个尝试机制，失败则退回普通 VirtualAlloc
+                const size_t HUGE_PAGE_SIZE = GetLargePageMinimum();
+                if (HUGE_PAGE_SIZE > 0) {
+                    block.actual_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
+                    block.ptr = VirtualAlloc(NULL, block.actual_size, 
+                        MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE);
+                    if (block.ptr) {
+                        block.is_huge_page = true;
+                        return block;
+                    }
+                }
             }
-        }
 
-        HANDLE thread = GetCurrentThread();
-        DWORD_PTR result = SetThreadAffinityMask(thread, mask);
-        return (result != 0);
+            block.actual_size = size;
+            block.ptr = VirtualAlloc(NULL, block.actual_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
+            return block;
 #else
-        return false;
+            block.actual_size = size;
+            block.ptr = std::malloc(block.actual_size);
+            return block;
 #endif
-    }
-
-    /**
-     * @brief 便利重载：绑定到单个核心
-     */
-    inline bool pin_thread_to_core(int core_id) {
-        if (core_id < 0) {
-            return true;
         }
-        return pin_thread_to_cores(std::vector<int>{core_id});
-    }
+
+        inline void free_block(const MemoryBlock& block) {
+            if (!block.ptr) {
+                return;
+            }
+#if defined(__linux__)
+            ::munmap(block.ptr, block.actual_size);
+#elif defined(_WIN32)
+            VirtualFree(block.ptr, 0, MEM_RELEASE);
+#else
+            std::free(block.ptr);
+#endif
+        }
+
+        inline uint64_t get_thread_id() {
+            static thread_local uint64_t tid_ = []() -> uint64_t {
+ #ifdef  _WIN32
+                return static_cast<uint64_t>(::GetCurrentThreadId());
+ #elif defined(__linux__)
+                return static_cast<uint64_t>(::syscall(SYS_gettid));
+ #elif defined(__APPLE__)
+                uint64_t tid;
+                pthread_threadid_np(NULL, &tid);
+                return tid;
+ #else
+                //return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
+                static std::atomic<uint64_t> global_tid_{ 0 };
+                return global_tid_.fetch_add(1, std::memory_order_relaxed) + 1; // 绝对安全的 fallback
+ #endif
+            }();
+            return tid_;
+        }
+
+        /**
+        * @brief 将当前线程绑定到一组指定的 CPU 核心上
+        * @param core_ids 核心 ID 列表，例如 {1, 2, 3}。如果传空，则不限制调度。
+        * @return true  绑定成功，或列表为空
+        * @return false 绑定失败，或当前系统不支持
+        */
+        inline bool pin_thread_to_cores(const std::vector<int>& core_ids) {
+            if (core_ids.empty()) {
+                return true; // 不要求绑核
+            }
+
+ #if defined(__linux__)
+            cpu_set_t cpuset;
+            CPU_ZERO(&cpuset);
+
+            // 遍历激活掩码中对应的多个核心位
+            for (int core_id : core_ids) {
+                if (core_id >= 0) {
+                    CPU_SET(core_id, &cpuset);
+                }
+            }
+
+            int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
+            return (rc == 0);
+
+ #elif defined(_WIN32)
+            DWORD_PTR mask = 0;
+
+            // 遍历并进行位或运算，合成最终的多核掩码
+            for (int core_id : core_ids) {
+                if (core_id >= 0 && core_id < 64) { // Windows 默认 DWORD_PTR 限制 64 核内
+                    mask |= (static_cast<DWORD_PTR>(1) << core_id);
+                }
+            }
+
+            HANDLE thread = GetCurrentThread();
+            DWORD_PTR result = SetThreadAffinityMask(thread, mask);
+            return (result != 0);
+ #else
+            return false;
+ #endif
+        }
+
+        /**
+         * @brief 便利重载：绑定到单个核心
+         */
+        inline bool pin_thread_to_core(int core_id) {
+            if (core_id < 0) {
+                return true;
+            }
+            return pin_thread_to_cores(std::vector<int>{core_id});
+        }
+    } // namespace util
 
     enum class LogLevel : uint8_t {
         TRACE = 0, DEBUG, INFO, WARN, ERR, FATAL
@@ -545,6 +621,7 @@ namespace zrlog {
         uint32_t idle_wait_interval_us = 1000;          //空闲等待间隔(微秒)
         uint32_t force_flush_interval_ms = 3000;        //强制刷盘间隔(毫秒)
         uint32_t crash_drain_wait_ms = 3000;            //发生崩溃的业务线程自旋阻塞，给后台线程抢救数据的时长(毫秒)
+        bool     enable_huge_page = false;              //启用OS的HugePage内存分配
 
         // 支持将日志后台线程绑定到多个核心 (如 {0, 1, 2})
         // 默认空列表表示由 OS 全局调度
@@ -622,7 +699,7 @@ namespace zrlog {
         }
 
     private:
-        int fd_ = -1;
+        int fd_{ -1 };
     };
 
     class RotatingFileLogAppender : public ILogAppender {
@@ -773,9 +850,9 @@ namespace zrlog {
         std::string base_path_;
         size_t max_size_;
         uint32_t max_files_;
-        size_t current_size_ = 0;
+        size_t current_size_{ 0 };
         size_t next_roll_size_;
-        int fd_ = -1;
+        int fd_{ -1 };
     };
 
     class ConsoleLogAppender : public ILogAppender {
@@ -1081,6 +1158,7 @@ namespace zrlog {
 
         template <typename... Args>
         static constexpr uint32_t calculate_args_size_all(const Args&... args) noexcept {
+        //static uint32_t calculate_args_size_all(const Args&... args) noexcept {
             return (0 + ... + arg_size(args));
         }
 
@@ -1311,19 +1389,35 @@ namespace zrlog {
 
         class ThreadBuffer {
         public:
-            explicit ThreadBuffer(uint32_t size, uint64_t tid) : size_(normalize_size(size)), thread_id_(tid) {
+            explicit ThreadBuffer(uint32_t size, uint64_t tid, bool enable_huge_page) : size_(normalize_size(size)), thread_id_(tid) {
                 mask_ = size_ - 1;
-                buffer_.resize(size_);
+                //buffer_.resize(size_);
+
+                // ========================================================================
+                // [核心修改]：放弃 std::vector，使用大页分配器获取底层连续物理内存
+                // ========================================================================
+                mem_block_ = util::allocate_block(size_, enable_huge_page);
+                if (!mem_block_.ptr) {
+                    throw std::bad_alloc();
+                }
 
                 // 【按页预热 Fast Page Pre-faulting】
-                // 每 4096 字节写一个 0，强迫操作系统映射所有物理页，比全量 memset 快几倍
-                volatile char *p = buffer_.data();
-                for (size_t i = 0; i < size_; i += 4096) {
-                    p[i] = 0;
+                // 如果成功吃到了大页，内核已经锁定了连续物理内存，无需预热。
+                // 只有在降级到普通 4KB 内存时，才执行原版的强制映射循环。
+                if (!mem_block_.is_huge_page) {
+                    volatile char *p = static_cast<char*>(mem_block_.ptr);
+                    for (size_t i = 0; i < size_; i += 4096) {
+                        p[i] = 0;
+                    }
                 }
             }
 
-            ~ThreadBuffer() = default;
+            ~ThreadBuffer() {
+                // ========================================================================
+                // [核心修改]：释放 OS 级别内存
+                // ========================================================================
+                zrlog::util::free_block(mem_block_);
+            }
 
             inline uint64_t thread_id() const {
                 return thread_id_;
@@ -1351,7 +1445,7 @@ namespace zrlog {
 
                 // 物理尾部连续空间足够，直接分配
                 if (ZRLOG_LIKELY(len <= tail_free)) {
-                    return buffer_.data() + phys_w;
+                    return static_cast<char *>(mem_block_.ptr) + phys_w;
                 }
 
                 // 物理尾部空间不够，必须绕回 (Wrap around)
@@ -1376,7 +1470,7 @@ namespace zrlog {
                 // 提前发布 Padding，让消费者可以看到绕回动作
                 write_index_.store(w, std::memory_order_release);
 
-                return buffer_.data();
+                return static_cast<char *>(mem_block_.ptr);
             }
 
             inline void commit(uint32_t len) {
@@ -1417,7 +1511,7 @@ namespace zrlog {
                         continue;
                     }
 
-                    LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(buffer_.data() + phys_r);
+                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(static_cast<char*>(mem_block_.ptr) + phys_r);
 
                     // 2. 显式 Padding
                     if (ZRLOG_UNLIKELY(header->log_id == PADDING_ID)) {
@@ -1514,7 +1608,7 @@ namespace zrlog {
             }
 
             inline void write_padding_local(uint32_t pos, uint32_t pad_size) {
-                LogEntryHeader* p = reinterpret_cast<LogEntryHeader*>(buffer_.data() + pos);
+                LogEntryHeader *p = reinterpret_cast<LogEntryHeader *>(static_cast<char*>(mem_block_.ptr) + pos);
                 p->log_id = PADDING_ID;
                 p->total_size = pad_size;
                 p->time = 0;
@@ -1527,21 +1621,26 @@ namespace zrlog {
 
             // --- 生产者独占缓存行 (写入端) ---
             // 内存对齐并独占一行，只有前端线程会高频读写这里的变量
-            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
-            uint64_t                 cached_read_index_{ 0 };
+            alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
+            uint64_t cached_read_index_{ 0 };
 
             // --- 消费者独占缓存行 (读取端) ---
             // 物理隔离！只有后台消费者线程会高频读写这里的变量
-            alignas(CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
-            uint64_t                 cached_write_index_{ 0 };
-            uint64_t                 local_read_index_{ 0 };
+            alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
+            uint64_t cached_write_index_{ 0 };
+            uint64_t local_read_index_{ 0 };
 
             // --- 其他共享元数据 ---
             // 独立在一行，防止被游标的高频变动波及
-            alignas(CACHE_LINE_SIZE) uint32_t size_;
-            uint32_t                 mask_;
-            uint64_t                 thread_id_;
-            std::vector<char>        buffer_;
+            alignas(ZRLOG_CACHE_LINE_SIZE) uint32_t size_;
+            uint32_t mask_;
+            uint64_t thread_id_;
+
+            // ========================================================================
+            // [核心修改]：替换 原来的std::vector，使用原生指针与内存块元数据
+            // ========================================================================
+            util::MemoryBlock mem_block_;
+
             bool                     should_deallocate_{ false };
         };
 
@@ -1613,7 +1712,7 @@ namespace zrlog {
 
         ThreadBuffer* get_thread_buffer() {
             if (ZRLOG_UNLIKELY(nullptr == thread_buffer_)) {
-                thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size, get_thread_id());
+                thread_buffer_ = new ThreadBuffer(config_.thread_buffer_size, util::get_thread_id(), config_.enable_huge_page);
                 thread_buffer_destroyer_.init(this);
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
                 thread_buffers_.push_back(thread_buffer_);
@@ -1772,7 +1871,7 @@ namespace zrlog {
             // 执行后台线程绑核 (CPU Physical Isolation)
             // ========================================================================
             if (!config_.background_thread_core_ids.empty()) {
-                if (!zrlog::pin_thread_to_cores(config_.background_thread_core_ids)) {
+                if (!util::pin_thread_to_cores(config_.background_thread_core_ids)) {
                     const char err_msg[] = "[ZRLOG WARNING] Failed to pin background thread to specified CPU cores.\n";
                     [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
                 }
@@ -1799,8 +1898,8 @@ namespace zrlog {
                 // ========================================================================
                 // 周期性物理落盘(防断电/内核崩溃)
                 // ========================================================================
-                // 无论系统是处于空闲还是极端高负载，每隔 1 秒，必然触发一次真实的 fsync。
-                // 这保证了在面临机柜断电等最高级别物理灾难时，最多只丢失 force_flush_interval 毫秒的日志。
+                // 无论系统是处于空闲还是极端高负载，间隔force_flush_interval时长必然触发一次真实的 fsync
+                // 这保证了在面临机柜断电等最高级别物理灾难时，最多只丢失 force_flush_interval 毫秒的日志
                 auto now = std::chrono::steady_clock::now();
                 auto force_flush_interval = std::chrono::milliseconds(config_.force_flush_interval_ms);
                 if (ZRLOG_UNLIKELY(now - last_force_flush_time >= force_flush_interval)) {
@@ -1871,7 +1970,7 @@ namespace zrlog {
 
         std::mutex              idle_wait_mutex_;
         std::condition_variable idle_wait_condition_;
-        alignas(CACHE_LINE_SIZE) std::atomic<bool> idle_wait_flag_{ false };
+        alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<bool> idle_wait_flag_{ false };
 
     public:
         //statistics
@@ -1954,7 +2053,6 @@ namespace zrlog {
 // ---------------------------------------------------------------------------
 // 动态宏：支持运行时生成的 format
 // ---------------------------------------------------------------------------
-
 #define ZRLOG_DYN_BODY(level, format, ...)                                                          \
     do {                                                                                            \
         zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                                  \
