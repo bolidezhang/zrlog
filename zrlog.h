@@ -1239,7 +1239,7 @@ namespace zrlog {
             std::apply([&](const auto&... final_args) {
                 size_t space = out.available_size() - 1;  // 预留 1 字节给 \n
                 // 一次性索要充足空间，消除格式化期间的多次空间检查
-                if (ZRLOG_UNLIKELY(space < 2048)) {
+                if (ZRLOG_UNLIKELY(space < 8192)) {
                     out.flush_to_os();
                     space = out.available_size() -1;
                 }
@@ -1281,7 +1281,7 @@ namespace zrlog {
             std::apply([&](const auto&... final_args) {
                 size_t space = out.available_size() - 1; // 预留 1 字节给 \n
                 // 一次性索要充足空间，消除格式化期间的多次空间检查
-                if (ZRLOG_UNLIKELY(space < 2048)) {
+                if (ZRLOG_UNLIKELY(space < 8192)) {
                     out.flush_to_os();
                     space = out.available_size() - 1;
                 }
@@ -1295,7 +1295,7 @@ namespace zrlog {
                         meta.file, meta.line);
 
                     // 严格区分实际写入大小和理论需要大小
-                    size_t actual_hdr_len = std::min<size_t>(hdr_res.size, space);
+                    size_t actual_hdr_len  = std::min<size_t>(hdr_res.size, space);
                     size_t remaining_space = space - actual_hdr_len;
 
                     size_t theoretical_total = hdr_res.size;
@@ -1864,11 +1864,16 @@ namespace zrlog {
                 }
             }
 
+            // 定义 TSC 同步间隔：1 小时 (既能消除长期漂移，又避免被 NTP 频繁干扰)
+            constexpr auto tsc_sync_interval = std::chrono::hours(1);
+
             std::vector<LogMeta> local_log_metas;
             local_log_metas.reserve(1000);
             IOBuffer io_buf(appender_.get(), config_.io_buffer_size);
 
-            auto last_force_flush_time = std::chrono::steady_clock::now();            
+            auto last_force_flush_time = std::chrono::steady_clock::now();
+            auto last_tsc_sync_time = last_force_flush_time;
+
             while (log_thread_running_.load(std::memory_order_relaxed)) {
 
                 // 【崩溃检测】发现发生严重崩溃，立即启动抢救式全量 Drain
@@ -1882,18 +1887,25 @@ namespace zrlog {
 
                 size_t process_count = consume_buffers_round_robin(local_log_metas, io_buf, false);
 
+                auto now = std::chrono::steady_clock::now();
                 // ========================================================================
                 // 周期性物理落盘(防断电/内核崩溃)
                 // ========================================================================
                 // 无论系统是处于空闲还是极端高负载，间隔force_flush_interval时长必然触发一次真实的 fsync
                 // 这保证了在面临机柜断电等最高级别物理灾难时，最多只丢失 force_flush_interval 毫秒的日志
-                auto now = std::chrono::steady_clock::now();
                 auto force_flush_interval = std::chrono::milliseconds(config_.force_flush_interval_ms);
                 if (ZRLOG_UNLIKELY(now - last_force_flush_time >= force_flush_interval)) {
-                    TscClock::instance().sync_system_time();
-
-                    io_buf.flush_force();           // 触发底层的 write + fsync
+                    io_buf.flush_force();
                     last_force_flush_time = now;
+                }
+                // ========================================================================
+                // 周期性 TSC 时钟漂移校准 (以tsc_sync_interval为间隔)
+                // ========================================================================
+                if (ZRLOG_UNLIKELY(now - last_tsc_sync_time >= tsc_sync_interval)) {
+                    // 使用已有的 sync_system_time，它利用 seq_ 实现了 Seqlock，
+                    // 保证前端线程读取时间时绝不会读到撕裂的 base_ns 和 base_tsc
+                    TscClock::instance().sync_system_time();
+                    last_tsc_sync_time = now;
                 }
 
                 if (process_count < 1) {  // idle
