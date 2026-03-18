@@ -529,6 +529,11 @@ namespace zrlog {
                     block.is_huge_page = true;
                     return block;
                 }
+
+                // 优雅降级：退回到std::malloc
+                block.actual_size = size;
+                block.ptr = static_cast<char*>(std::malloc(size));
+                return block;
 #elif defined(_WIN32)
                 // Windows 大页支持较为复杂，需要 SeLockMemoryPrivilege 权限
                 // 这里提供一个尝试机制，失败则退回普通 VirtualAlloc
@@ -541,12 +546,20 @@ namespace zrlog {
                         return block;
                     }
                 }
+
+                // 优雅降级：退回到std::malloc
+                block.actual_size = size;
+                block.ptr = static_cast<char*>(std::malloc(size));
+                return block;
+#else
+                block.actual_size = size;
+                block.ptr = static_cast<char*>(std::malloc(size));
+                return block;
 #endif
             }
 
-            // 优雅降级：退回到std::malloc
             block.actual_size = size;
-            block.ptr = static_cast<char *>(std::malloc(size));
+            block.ptr = static_cast<char*>(std::malloc(size));
             return block;
         }
 
@@ -560,6 +573,8 @@ namespace zrlog {
             }
 #elif defined(_WIN32)
                 ::VirtualFree(block.ptr, 0, MEM_RELEASE);
+#else
+                std::free(block.ptr);
 #endif
             }
             else {
