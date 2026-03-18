@@ -83,9 +83,11 @@ LIBS := -L/usr/lib -lpthread
 ifneq (YES, ${DEBUG})
     # -march=native : 针对当前 CPU 架构自动启用最高指令集（如 AVX2、SSE4.2）
     # -flto        : 链接时优化，允许跨文件内联、消除无用代码，需同时用于编译和链接
-    CFLAGS   += -march=native -flto
-    CXXFLAGS += -march=native -flto
-    LDFLAGS  += -flto
+    #CFLAGS   += -march=native -flto
+    #CXXFLAGS += -march=native -flto
+    #LDFLAGS  += -flto
+    CFLAGS   += -march=native
+    CXXFLAGS += -march=native
 endif
 
 #****************************************************************************

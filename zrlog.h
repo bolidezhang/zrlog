@@ -1,8 +1,8 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.4.1
-#define ZRLOG_VERSION 20401
+// 如：2.4.2
+#define ZRLOG_VERSION 20402
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
@@ -114,6 +114,9 @@ inline uint64_t zrlog_rdtsc() {
 
 #if defined(__linux__)
 #include <sys/mman.h>
+#ifndef MAP_HUGETLB
+#define MAP_HUGETLB 0x40000
+#endif
 #endif
 
 #define ZRLOG_OPEN(path, flags, mode)   ::open(path, flags, mode)
@@ -432,93 +435,22 @@ namespace zrlog {
     };
 
     namespace util {
-
-        // ============================================================================
-        // 跨平台大页内存分配器 (HugeTLB Allocator)
-        // ============================================================================
-        struct MemoryBlock {
-            void  *ptr = nullptr;
-            size_t actual_size = 0;
-            bool   is_huge_page = false;
-        };
-
-        inline MemoryBlock allocate_block(size_t size, bool enable_huge_page = false) {
-            MemoryBlock block;
-#if defined(__linux__)
-            if (enable_huge_page) {
-                // Linux 默认大页大小为 2MB。必须按 2MB 向上取整才能分配成功
-                const size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;
-                block.actual_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
-
-                // 1. 尝试分配大页
-                block.ptr = ::mmap(nullptr, block.actual_size, PROT_READ | PROT_WRITE,
-                    MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
-
-                if (block.ptr != MAP_FAILED) {
-                    block.is_huge_page = true;
-                    return block;
-                }
-            }
-
-            // 2. 优雅降级：退回到普通匿名映射
-            block.actual_size = size;
-            block.ptr = ::mmap(nullptr, block.actual_size, PROT_READ | PROT_WRITE, 
-                MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
-            return block;
-#elif defined(_WIN32)
-            if (enable_huge_page) {
-                // Windows 大页支持较为复杂，需要 SeLockMemoryPrivilege 权限
-                // 这里提供一个尝试机制，失败则退回普通 VirtualAlloc
-                const size_t HUGE_PAGE_SIZE = GetLargePageMinimum();
-                if (HUGE_PAGE_SIZE > 0) {
-                    block.actual_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
-                    block.ptr = VirtualAlloc(NULL, block.actual_size, 
-                        MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE);
-                    if (block.ptr) {
-                        block.is_huge_page = true;
-                        return block;
-                    }
-                }
-            }
-
-            block.actual_size = size;
-            block.ptr = VirtualAlloc(NULL, block.actual_size, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE);
-            return block;
-#else
-            block.actual_size = size;
-            block.ptr = std::malloc(block.actual_size);
-            return block;
-#endif
-        }
-
-        inline void free_block(const MemoryBlock& block) {
-            if (!block.ptr) {
-                return;
-            }
-#if defined(__linux__)
-            ::munmap(block.ptr, block.actual_size);
-#elif defined(_WIN32)
-            VirtualFree(block.ptr, 0, MEM_RELEASE);
-#else
-            std::free(block.ptr);
-#endif
-        }
-
+        
         inline uint64_t get_thread_id() {
             static thread_local uint64_t tid_ = []() -> uint64_t {
- #ifdef  _WIN32
+#ifdef  _WIN32
                 return static_cast<uint64_t>(::GetCurrentThreadId());
- #elif defined(__linux__)
+#elif defined(__linux__)
                 return static_cast<uint64_t>(::syscall(SYS_gettid));
- #elif defined(__APPLE__)
+#elif defined(__APPLE__)
                 uint64_t tid;
                 pthread_threadid_np(NULL, &tid);
                 return tid;
- #else
+#else
                 //return static_cast<uint64_t>(std::hash<std::thread::id>{}(std::this_thread::get_id()));
                 static std::atomic<uint64_t> global_tid_{ 0 };
                 return global_tid_.fetch_add(1, std::memory_order_relaxed) + 1; // 绝对安全的 fallback
- #endif
+#endif
             }();
             return tid_;
         }
@@ -534,23 +466,20 @@ namespace zrlog {
                 return true; // 不要求绑核
             }
 
- #if defined(__linux__)
+#if defined(__linux__)
             cpu_set_t cpuset;
             CPU_ZERO(&cpuset);
-
             // 遍历激活掩码中对应的多个核心位
             for (int core_id : core_ids) {
                 if (core_id >= 0) {
                     CPU_SET(core_id, &cpuset);
                 }
             }
-
             int rc = pthread_setaffinity_np(pthread_self(), sizeof(cpu_set_t), &cpuset);
             return (rc == 0);
 
- #elif defined(_WIN32)
+#elif defined(_WIN32)
             DWORD_PTR mask = 0;
-
             // 遍历并进行位或运算，合成最终的多核掩码
             for (int core_id : core_ids) {
                 if (core_id >= 0 && core_id < 64) { // Windows 默认 DWORD_PTR 限制 64 核内
@@ -561,9 +490,9 @@ namespace zrlog {
             HANDLE thread = GetCurrentThread();
             DWORD_PTR result = SetThreadAffinityMask(thread, mask);
             return (result != 0);
- #else
+#else
             return false;
- #endif
+#endif
         }
 
         /**
@@ -575,6 +504,68 @@ namespace zrlog {
             }
             return pin_thread_to_cores(std::vector<int>{core_id});
         }
+
+        // ============================================================================
+        // 跨平台大页内存分配器 (HugeTLB Allocator)
+        // ============================================================================
+        struct MemoryBlock {
+            char  *ptr{ nullptr };
+            size_t actual_size{ 0 };
+            bool   is_huge_page{ false };
+        };
+
+        inline MemoryBlock allocate_block(size_t size, bool enable_huge_page = false) {
+            MemoryBlock block;
+            if (enable_huge_page) {
+#if defined(__linux__)
+                // Linux 默认大页大小为 2MB。必须按 2MB 向上取整才能分配成功
+                const size_t HUGE_PAGE_SIZE = 2 * 1024 * 1024;
+                block.actual_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
+
+                // 尝试分配大页
+                void *ptr = ::mmap(nullptr, block.actual_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS | MAP_HUGETLB, -1, 0);
+                if (ptr != MAP_FAILED) {
+                    block.ptr = static_cast<char *>(ptr);
+                    block.is_huge_page = true;
+                    return block;
+                }
+#elif defined(_WIN32)
+                // Windows 大页支持较为复杂，需要 SeLockMemoryPrivilege 权限
+                // 这里提供一个尝试机制，失败则退回普通 VirtualAlloc
+                const size_t HUGE_PAGE_SIZE = GetLargePageMinimum();
+                if (HUGE_PAGE_SIZE > 0) {
+                    block.actual_size = (size + HUGE_PAGE_SIZE - 1) & ~(HUGE_PAGE_SIZE - 1);
+                    block.ptr = static_cast<char *>(VirtualAlloc(NULL, block.actual_size, MEM_COMMIT | MEM_RESERVE | MEM_LARGE_PAGES, PAGE_READWRITE));
+                    if (block.ptr) {
+                        block.is_huge_page = true;
+                        return block;
+                    }
+                }
+#endif
+            }
+
+            // 优雅降级：退回到std::malloc
+            block.actual_size = size;
+            block.ptr = static_cast<char *>(std::malloc(size));
+            return block;
+        }
+
+        inline void free_block(const MemoryBlock& block) {
+            if (!block.ptr) {
+                return;
+            }
+            if (block.is_huge_page) {
+#if defined(__linux__)
+                ::munmap(block.ptr, block.actual_size);
+            }
+#elif defined(_WIN32)
+                ::VirtualFree(block.ptr, 0, MEM_RELEASE);
+#endif
+            }
+            else {
+                std::free(block.ptr);
+            }
+        }   
     } // namespace util
 
     enum class LogLevel : uint8_t {
@@ -953,7 +944,8 @@ namespace zrlog {
                     appender_ = std::make_unique<FileLogAppender>(config_.filename);
                 }
                 else if (config_.appender == AppenderType::RotatingFile) {
-                    appender_ = std::make_unique<RotatingFileLogAppender>(config_.filename, config_.rotating_file_size, config_.rotating_max_files);
+                    appender_ = std::make_unique<RotatingFileLogAppender>(config_.filename, 
+                        config_.rotating_file_size, config_.rotating_max_files);
                 }
                 else {
                     appender_ = std::make_unique<ConsoleLogAppender>();
@@ -1063,10 +1055,11 @@ namespace zrlog {
                 return false;
             }
 
-            uint32_t args_size = calculate_args_size_all(args...);
-            uint32_t total_size = sizeof(LogEntryHeader) + args_size;
-            char* ptr = buffer->alloc(total_size);
+            uint32_t total_size = sizeof(LogEntryHeader) + calculate_args_size_all(args...);
+            //内存地址对齐,所在将总长度向上对齐到 8 字节！
+            uint32_t aligned_len = (total_size + 7) & ~7u;
 
+            char *ptr = buffer->alloc(aligned_len);
             if (ZRLOG_UNLIKELY(nullptr == ptr)) {
                 switch (config_.buffer_full_policy) {
                 case BufferFullPolicy::Discard:
@@ -1086,7 +1079,7 @@ namespace zrlog {
                             std::this_thread::yield();
                         }
                         ++spin_count;
-                        ptr = buffer->alloc(total_size);
+                        ptr = buffer->alloc(aligned_len);
                     } while (ZRLOG_UNLIKELY(nullptr == ptr));
                 }
                 break;
@@ -1108,7 +1101,7 @@ namespace zrlog {
                             std::this_thread::yield();
                         }
                         ++spin_count;
-                        ptr = buffer->alloc(total_size);
+                        ptr = buffer->alloc(aligned_len);
                     } while (ZRLOG_UNLIKELY(nullptr == ptr));
                 }
                 break;
@@ -1119,12 +1112,12 @@ namespace zrlog {
             }
 
             // 分配成功，进行真正的极速序列化
-            LogEntryHeader* header = reinterpret_cast<LogEntryHeader*>(ptr);
-            header->total_size = total_size;
+            LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
+            header->total_size = aligned_len;
             header->log_id = log_id;
             header->time = TscClock::now_ns_i();
             serialize_args_all(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
-            buffer->commit(total_size);
+            buffer->commit(aligned_len);
             notify_consumer();
 
             return true;
@@ -1157,8 +1150,8 @@ namespace zrlog {
         }
 
         template <typename... Args>
-        static constexpr uint32_t calculate_args_size_all(const Args&... args) noexcept {
-        //static uint32_t calculate_args_size_all(const Args&... args) noexcept {
+        //static constexpr uint32_t calculate_args_size_all(const Args&... args) noexcept {
+        static uint32_t calculate_args_size_all(const Args&... args) noexcept {
             return (0 + ... + arg_size(args));
         }
 
@@ -1391,21 +1384,13 @@ namespace zrlog {
         public:
             explicit ThreadBuffer(uint32_t size, uint64_t tid, bool enable_huge_page) : size_(normalize_size(size)), thread_id_(tid) {
                 mask_ = size_ - 1;
-                //buffer_.resize(size_);
-
-                // ========================================================================
-                // [核心修改]：放弃 std::vector，使用大页分配器获取底层连续物理内存
-                // ========================================================================
                 mem_block_ = util::allocate_block(size_, enable_huge_page);
-                if (!mem_block_.ptr) {
-                    throw std::bad_alloc();
-                }
 
                 // 【按页预热 Fast Page Pre-faulting】
                 // 如果成功吃到了大页，内核已经锁定了连续物理内存，无需预热。
                 // 只有在降级到普通 4KB 内存时，才执行原版的强制映射循环。
                 if (!mem_block_.is_huge_page) {
-                    volatile char *p = static_cast<char*>(mem_block_.ptr);
+                    volatile char *p = mem_block_.ptr;
                     for (size_t i = 0; i < size_; i += 4096) {
                         p[i] = 0;
                     }
@@ -1413,9 +1398,6 @@ namespace zrlog {
             }
 
             ~ThreadBuffer() {
-                // ========================================================================
-                // [核心修改]：释放 OS 级别内存
-                // ========================================================================
                 zrlog::util::free_block(mem_block_);
             }
 
@@ -1445,7 +1427,7 @@ namespace zrlog {
 
                 // 物理尾部连续空间足够，直接分配
                 if (ZRLOG_LIKELY(len <= tail_free)) {
-                    return static_cast<char *>(mem_block_.ptr) + phys_w;
+                    return mem_block_.ptr + phys_w;
                 }
 
                 // 物理尾部空间不够，必须绕回 (Wrap around)
@@ -1470,7 +1452,7 @@ namespace zrlog {
                 // 提前发布 Padding，让消费者可以看到绕回动作
                 write_index_.store(w, std::memory_order_release);
 
-                return static_cast<char *>(mem_block_.ptr);
+                return mem_block_.ptr;
             }
 
             inline void commit(uint32_t len) {
@@ -1511,7 +1493,7 @@ namespace zrlog {
                         continue;
                     }
 
-                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(static_cast<char*>(mem_block_.ptr) + phys_r);
+                    LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(mem_block_.ptr + phys_r);
 
                     // 2. 显式 Padding
                     if (ZRLOG_UNLIKELY(header->log_id == PADDING_ID)) {
@@ -1608,7 +1590,7 @@ namespace zrlog {
             }
 
             inline void write_padding_local(uint32_t pos, uint32_t pad_size) {
-                LogEntryHeader *p = reinterpret_cast<LogEntryHeader *>(static_cast<char*>(mem_block_.ptr) + pos);
+                LogEntryHeader *p = reinterpret_cast<LogEntryHeader *>(mem_block_.ptr + pos);
                 p->log_id = PADDING_ID;
                 p->total_size = pad_size;
                 p->time = 0;
@@ -1641,7 +1623,7 @@ namespace zrlog {
             // ========================================================================
             util::MemoryBlock mem_block_;
 
-            bool                     should_deallocate_{ false };
+            bool should_deallocate_{ false };
         };
 
         class ThreadBufferDestroyer {
@@ -1665,7 +1647,8 @@ namespace zrlog {
         };
 
         template<typename FmtProvider, typename... Args>
-        uint32_t register_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, std::string_view file, uint32_t line, std::string_view func) {
+        uint32_t register_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, 
+            std::string_view file, uint32_t line, std::string_view func) {
             std::lock_guard<SpinMutex> lock(log_metas_mutex_);
             uint32_t id = log_id_atom.load(std::memory_order_relaxed);
             if (id != 0) {
@@ -1687,7 +1670,8 @@ namespace zrlog {
         }
 
         template<typename... Args>
-        uint32_t register_runtime_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, std::string_view file, uint32_t line, std::string_view func, std::string_view format) {
+        uint32_t register_runtime_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, 
+            std::string_view file, uint32_t line, std::string_view func, std::string_view format) {
             std::lock_guard<SpinMutex> lock(log_metas_mutex_);
             uint32_t id = log_id_atom.load(std::memory_order_relaxed);
             if (id != 0) {
