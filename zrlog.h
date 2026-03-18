@@ -1058,9 +1058,8 @@ namespace zrlog {
             if (ZRLOG_UNLIKELY(nullptr == buffer)) {
                 return false;
             }
-
             uint32_t total_size = sizeof(LogEntryHeader) + calculate_args_size_all(args...);
-            //内存地址对齐,所在将总长度向上对齐到 8 字节！
+            //为了内存地址对齐,所以将总长度向上对齐到 8 字节！
             uint32_t aligned_len = (total_size + 7) & ~7u;
 
             char *ptr = buffer->alloc(aligned_len);
@@ -1623,7 +1622,7 @@ namespace zrlog {
             uint64_t thread_id_;
 
             // ========================================================================
-            // [核心修改]：替换 原来的std::vector，使用原生指针与内存块元数据
+            // 替换 原来的std::vector，使用原生指针与内存块元数据
             // ========================================================================
             util::MemoryBlock mem_block_;
 
