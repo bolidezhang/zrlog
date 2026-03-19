@@ -1,8 +1,8 @@
 ﻿#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.4.2
-#define ZRLOG_VERSION 20402
+// 如：2.4.3
+#define ZRLOG_VERSION 20403
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
@@ -17,6 +17,12 @@
 #include <fmt/format.h>
 #include <fmt/compile.h>  // 必须引入，以支持 FMT_COMPILE 宏
 
+#include <cstdlib>
+#include <cstdio>
+#include <cinttypes>
+#include <ctime>
+#include <csignal>        // 用于崩溃信号捕获
+#include <filesystem>
 #include <vector>
 #include <list>
 #include <thread>
@@ -31,13 +37,9 @@
 #include <functional>
 #include <algorithm>
 #include <type_traits>
-#include <cstdio>
-#include <cinttypes>
-#include <ctime>
 #include <charconv>
 #include <memory>
 #include <new>
-#include <csignal>        // 用于崩溃信号捕获
 
 // 获取当前 CPU 架构的 L1 Cache Line 大小 (C++17)
 #ifdef __cpp_lib_hardware_interference_size
@@ -615,6 +617,7 @@ namespace zrlog {
         uint32_t per_thread_quota = 256;                //每个线程的格式化日志的配额(防止线程产生日志太快,公平处理每个线程日志)
         uint32_t idle_wait_interval_us = 1000;          //空闲等待间隔(微秒)
         uint32_t force_flush_interval_ms = 3000;        //强制刷盘间隔(毫秒)
+        uint32_t tsc_sync_interval_s = 3600;            //Tsc时钟同步间隔(秒) (默认:1小时 既能消除长期漂移，又避免被 NTP 频繁干扰)
         uint32_t crash_drain_wait_ms = 3000;            //发生崩溃的业务线程自旋阻塞，给后台线程抢救数据的时长(毫秒)
         bool     enable_huge_page = false;              //启用OS的HugePage内存分配
 
@@ -701,6 +704,13 @@ namespace zrlog {
     public:
         RotatingFileLogAppender(const std::string& path, size_t max_size, uint32_t max_files)
             : base_path_(path), max_size_(max_size), max_files_(max_files), next_roll_size_(max_size) {
+
+            // 1. 扫描历史日志目录，确定下一个滚动序号，并清理残留的孤儿文件
+            if (max_files_ > 0) {
+                init_next_file_index();
+            }
+
+            // 2. 打开当前的活跃文件 (永远是 base_path_)
             open_current_file();
         }
 
@@ -729,11 +739,8 @@ namespace zrlog {
                 current_size_ += ret;
             }
             else if (ret < 0) {
-                // 【修复 BUG】：写失败 (如 ENOSPC 磁盘满)。
-                // 虽然 fd 还开着，但数据写不进去了！必须立刻兜底到 stderr 防止数据丢失。
+                // 写失败 (如 ENOSPC 磁盘满)，立刻兜底到 stderr 防止数据丢失。
                 [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, data, len);
-
-                // 强制累加 current_size_，确保后续能触发 roll() 尝试重新整理文件系统状态
                 current_size_ += len;
             }
             return ret;
@@ -747,12 +754,66 @@ namespace zrlog {
         }
 
     private:
+        void init_next_file_index() {
+            next_file_idx_ = 1;
+            try {
+                std::filesystem::path p(base_path_);
+                auto dir = p.parent_path();
+                if (dir.empty()) {
+                    dir = ".";
+                }
+                std::string filename = p.filename().string();
+
+                std::vector<uint64_t> existing_indices;
+                std::error_code ec;
+
+                // 遍历同级目录，找出形如 "app.log.123" 的所有备份文件
+                for (const auto& entry : std::filesystem::directory_iterator(dir, ec)) {
+                    if (entry.is_regular_file(ec)) {
+                        std::string name = entry.path().filename().string();
+                        // 匹配前缀 "app.log."
+                        if (name.length() > filename.length() + 1 &&
+                            name.compare(0, filename.length() + 1, filename + ".") == 0) {
+                            const char* num_str = name.c_str() + filename.length() + 1;
+                            char* end_ptr = nullptr;
+                            uint64_t idx = std::strtoull(num_str, &end_ptr, 10);
+                            if (*end_ptr == '\0') {
+                                existing_indices.push_back(idx);
+                            }
+                        }
+                    }
+                }
+
+                if (!existing_indices.empty()) {
+                    std::sort(existing_indices.begin(), existing_indices.end());
+                    // 下一个将要被滚动的后缀，必然是当前存在的最大序号 + 1
+                    next_file_idx_ = existing_indices.back() + 1;
+
+                    // 【鲁棒性修复：清理孤儿文件】
+                    // 防止程序之前在 max_files=10 时运行，后来配置改成了 max_files=3，导致旧文件永远泄漏
+                    if (existing_indices.size() > max_files_) {
+                        size_t to_delete = existing_indices.size() - max_files_;
+                        char old_path[4096];
+                        for (size_t i = 0; i < to_delete; ++i) {
+                            auto res = fmt::format_to_n(old_path, sizeof(old_path) - 1, "{}.{}", base_path_, existing_indices[i]);
+                            old_path[std::min<size_t>(res.size, sizeof(old_path) - 1)] = '\0';
+                            std::remove(old_path);
+                        }
+                    }
+                }
+            }
+            catch (...) {
+                // 若发生无权限等文件系统异常，优雅降级，默认序号从 1 开始
+            }
+        }
+
         void open_current_file() {
+            // 永远打开固定的 base_path_ (例如 app.log)
             fd_ = ZRLOG_OPEN(base_path_.c_str(), ZRLOG_O_FLAGS, ZRLOG_S_FLAGS);
             if (fd_ != -1) {
                 struct stat st;
                 if (fstat(fd_, &st) == 0) {
-                    current_size_ = st.st_size;
+                    current_size_ = st.st_size; // 如果进程重启，继承现存 app.log 的大小，继续追加
                 }
                 else {
                     current_size_ = 0;
@@ -762,7 +823,7 @@ namespace zrlog {
             else {
                 // 文件打开失败的严重报警与退避设定
                 const char err_msg[] = "\n[ZRLOG CRITICAL] Failed to open log file! Fallback to stderr.\n";
-                [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
+                [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg) - 1);
                 current_size_ = 0;
 
                 size_t retry_interval = max_size_ / 10;
@@ -782,57 +843,50 @@ namespace zrlog {
 
         void roll() {
             close();
-
             bool rename_success = true;
 
             if (max_files_ > 0) {
                 if (ZRLOG_ACCESS(base_path_.c_str(), ZRLOG_F_OK) == 0) {
-                    // 【修复 BUG】：真正的纯栈内存分配 (避免 std::string 触发 malloc)
-                    // 4096 (PATH_MAX) 足够容纳任何合法的文件路径
-                    char src_buf[4096];
-                    char dst_buf[4096];
 
-                    if (base_path_.size() + 16 < sizeof(src_buf)) {
-                        size_t base_len = base_path_.size();
-                        std::memcpy(src_buf, base_path_.data(), base_len);
-                        std::memcpy(dst_buf, base_path_.data(), base_len);
+                    // ==========================================================
+                    // 核心 O(1) 滑动窗口滚动逻辑：仅 1 次 Rename，1 次 Remove
+                    // ==========================================================
+                    char backup_path[4096];
+                    auto res = fmt::format_to_n(backup_path, sizeof(backup_path) - 1, "{}.{}", base_path_, next_file_idx_);
+                    // 严格边界检查：防止格式化超长引发栈溢出
+                    backup_path[std::min<size_t>(res.size, sizeof(backup_path) - 1)] = '\0';
 
-                        for (uint32_t i = max_files_ - 1; i >= 1; --i) {
-                            auto src_res = fmt::format_to(src_buf + base_len, ".{}", i);
-                            *src_res = '\0';
+                    std::remove(backup_path); // 极小概率冲突下的防御性清除
 
-                            if (ZRLOG_ACCESS(src_buf, ZRLOG_F_OK) != 0) {
-                                continue;
-                            }
-
-                            auto dst_res = fmt::format_to(dst_buf + base_len, ".{}", i + 1);
-                            *dst_res = '\0';
-
-                            std::remove(dst_buf);
-                            std::rename(src_buf, dst_buf);
+                    // 1. 将 app.log 重命名为 app.log.N (N 递增不回头)
+                    if (std::rename(base_path_.c_str(), backup_path) != 0) {
+                        rename_success = false;
+                        const char err_msg[] = "\n[ZRLOG ERROR] Rotate rename failed!\n";
+                        [[maybe_unused]] auto w_res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg) - 1);
+                    }
+                    else {
+                        // 2. 淘汰超出滑动窗口最左端的老文件
+                        // 若 max_files = 3，当前给备份命名的序号是 6，说明应该删除 6 - 3 = 3
+                        if (next_file_idx_ > max_files_) {
+                            char old_path[4096];
+                            auto old_res = fmt::format_to_n(old_path, sizeof(old_path) - 1, "{}.{}", base_path_, next_file_idx_ - max_files_);
+                            old_path[std::min<size_t>(old_res.size, sizeof(old_path) - 1)] = '\0';
+                            std::remove(old_path);
                         }
-
-                        auto dst_res = fmt::format_to(dst_buf + base_len, ".1");
-                        *dst_res = '\0';
-                        std::remove(dst_buf);
-
-                        if (std::rename(base_path_.c_str(), dst_buf) != 0) {
-                            rename_success = false;
-                            const char err_msg[] = "\n[ZRLOG ERROR] Rotate failed! Appending to existing file.\n";
-                            [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
-                        }
+                        // 序号推进
+                        ++next_file_idx_;
                     }
                 }
             }
             else {
-                // 【修复 BUG】：当 max_files_ == 0 时，绝不能保留原文件，否则死循环。
-                // 必须无条件删除，让 open_current_file() 重头创建一个 0 字节的新文件。
+                // 如果 max_files == 0，即不保留任何备份，则直接删除旧日志重新开始
                 std::remove(base_path_.c_str());
             }
 
+            // 重新创建全新的 app.log 并分配新的 Inode
             open_current_file();
 
-            // 退避策略：如果重命名失败且我们还在往老文件里写，延迟下一次重试时间
+            // 异常退避策略：若重命名失败，延长重试间距以防疯狂拉起 I/O 导致磁盘 I/O 挂起
             if (max_files_ > 0 && !rename_success && fd_ != -1) {
                 size_t backoff_step = max_size_ / 10;
                 if (backoff_step < 1024 * 1024) {
@@ -848,6 +902,8 @@ namespace zrlog {
         size_t current_size_{ 0 };
         size_t next_roll_size_;
         int fd_{ -1 };
+
+        uint64_t next_file_idx_{ 1 }; // uint64_t 保证无穷滚动，标识下一个生成的备份后缀
     };
 
     class ConsoleLogAppender : public ILogAppender {
@@ -1864,9 +1920,6 @@ namespace zrlog {
                 }
             }
 
-            // 定义 TSC 同步间隔：1 小时 (既能消除长期漂移，又避免被 NTP 频繁干扰)
-            constexpr auto tsc_sync_interval = std::chrono::hours(1);
-
             std::vector<LogMeta> local_log_metas;
             local_log_metas.reserve(1000);
             IOBuffer io_buf(appender_.get(), config_.io_buffer_size);
@@ -1886,8 +1939,8 @@ namespace zrlog {
                 }
 
                 size_t process_count = consume_buffers_round_robin(local_log_metas, io_buf, false);
-
                 auto now = std::chrono::steady_clock::now();
+
                 // ========================================================================
                 // 周期性物理落盘(防断电/内核崩溃)
                 // ========================================================================
@@ -1901,6 +1954,7 @@ namespace zrlog {
                 // ========================================================================
                 // 周期性 TSC 时钟漂移校准 (以tsc_sync_interval为间隔)
                 // ========================================================================
+                auto tsc_sync_interval = std::chrono::seconds(config_.tsc_sync_interval_s);
                 if (ZRLOG_UNLIKELY(now - last_tsc_sync_time >= tsc_sync_interval)) {
                     // 使用已有的 sync_system_time，它利用 seq_ 实现了 Seqlock，
                     // 保证前端线程读取时间时绝不会读到撕裂的 base_ns 和 base_tsc
