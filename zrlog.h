@@ -53,7 +53,7 @@ constexpr size_t ZRLOG_CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 #define ZRLOG_LIKELY(x)   __builtin_expect(!!(x), 1)
 #define ZRLOG_UNLIKELY(x) __builtin_expect(!!(x), 0)
 #else
-    // MSVC 或其他编译器不提供静态预测，直接返回表达式本身
+// MSVC 或其他编译器不提供静态预测，直接返回表达式本身
 #define ZRLOG_LIKELY(x)   (x)
 #define ZRLOG_UNLIKELY(x) (x)
 #endif
@@ -1457,7 +1457,7 @@ namespace zrlog {
             }
 
             ~ThreadBuffer() {
-                zrlog::util::free_block(mem_block_);
+                util::free_block(mem_block_);
             }
 
             inline uint64_t thread_id() const {
@@ -1498,10 +1498,8 @@ namespace zrlog {
                     }
                 }
 
-                constexpr uint32_t HEADER_SIZE = sizeof(LogEntryHeader);
-
                 // 写入 Padding 占位符
-                if (ZRLOG_LIKELY(tail_free >= HEADER_SIZE)) {
+                if (ZRLOG_LIKELY(tail_free >= sizeof(LogEntryHeader))) {
                     write_padding_local(phys_w, tail_free);
                 }
 
@@ -1541,10 +1539,9 @@ namespace zrlog {
                 while (ZRLOG_LIKELY(skips < MAX_SKIPS && r < cached_write_index_)) {
                     uint32_t phys_r = r & mask_;
                     uint32_t tail_avail = size_ - phys_r;
-                    constexpr uint32_t HEADER_SIZE = sizeof(LogEntryHeader);
 
                     // 1. 隐式 Padding：尾部连 Header 都读不全
-                    if (ZRLOG_UNLIKELY(tail_avail < HEADER_SIZE)) {
+                    if (ZRLOG_UNLIKELY(tail_avail < sizeof(LogEntryHeader))) {
                         r += tail_avail;
                         local_read_index_ = r;
                         // 绕回时为了防止生产者卡死，强制推送一次游标
@@ -1557,7 +1554,7 @@ namespace zrlog {
                     // 2. 显式 Padding
                     if (ZRLOG_UNLIKELY(header->log_id == PADDING_ID)) {
                         uint32_t claimed = header->total_size;
-                        if (ZRLOG_UNLIKELY(claimed < HEADER_SIZE || claimed > tail_avail)) {
+                        if (ZRLOG_UNLIKELY(claimed < sizeof(LogEntryHeader) || claimed > tail_avail)) {
                             return nullptr;
                         }
                         r += claimed;
@@ -1627,8 +1624,10 @@ namespace zrlog {
         private:
             static const uint32_t PADDING_ID = 0xFFFFFFFF;
 
+            // 归一化为 2 的幂，最小 1024，最大 2^30
             static uint32_t normalize_size(uint32_t n) {
-                constexpr uint32_t MIN_SIZE = 1024, MAX_POW2 = 1u << 30;
+                constexpr uint32_t MIN_SIZE = 1024;
+                constexpr uint32_t MAX_POW2 = 1u << 30;
                 if (n < MIN_SIZE) {
                     n = MIN_SIZE;
                 }
