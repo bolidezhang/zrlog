@@ -1,8 +1,30 @@
-﻿#pragma once
+﻿/*
+Copyright (c) 2024 Bolide Zhang <bolidezhang@gmail.com>
+
+Permission is hereby granted, free of charge, to any person obtaining a copy
+of this software and associated documentation files (the "Software"), to deal
+in the Software without restriction, including without limitation the rights
+to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+copies of the Software, and to permit persons to whom the Software is
+furnished to do so, subject to the following conditions:
+
+The above copyright notice and this permission notice shall be included in all
+copies or substantial portions of the Software.
+
+THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+SOFTWARE.
+ */
+
+#pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.4.3
-#define ZRLOG_VERSION 20403
+// 如：2.4.4
+#define ZRLOG_VERSION 20404
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
@@ -1662,13 +1684,13 @@ namespace zrlog {
             // --- 生产者独占缓存行 (写入端) ---
             // 内存对齐并独占一行，只有前端线程会高频读写这里的变量
             alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
-            uint64_t cached_read_index_{ 0 };
+            alignas(ZRLOG_CACHE_LINE_SIZE) uint64_t cached_read_index_{ 0 };
 
             // --- 消费者独占缓存行 (读取端) ---
             // 物理隔离！只有后台消费者线程会高频读写这里的变量
             alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
-            uint64_t cached_write_index_{ 0 };
-            uint64_t local_read_index_{ 0 };
+            alignas(ZRLOG_CACHE_LINE_SIZE) uint64_t cached_write_index_{ 0 };
+            alignas(ZRLOG_CACHE_LINE_SIZE) uint64_t local_read_index_{ 0 };
 
             // --- 其他共享元数据 ---
             // 独立在一行，防止被游标的高频变动波及
