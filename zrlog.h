@@ -310,6 +310,18 @@ namespace zrlog {
             fast_u32_to_2digits(buf + 5, d4);
             fast_u32_to_2digits(buf + 7, d5);
         }
+
+        // FNV-1a 64 位哈希：用于 DYN 格式串变化检测的快路径（无锁、race-free）。
+        // 修复：同一调用点的 DYN 格式串运行时可变（含 std::string 原地修改，data() 指针不变），
+        // 必须按内容判断是否重注册，不能只比较指针。
+        inline uint64_t fnv1a_hash(std::string_view s) noexcept {
+            uint64_t h = 1469598103934665603ull;
+            for (char c : s) {
+                h ^= static_cast<unsigned char>(c);
+                h *= 1099511628211ull;
+            }
+            return h;
+        }
     }  //end namespace detail
 
     // ---------------------------------------------------------------------------
@@ -1087,7 +1099,8 @@ namespace zrlog {
         // Frontend: 动态日志入口 (支持运行时 std::string format)
         // ========================================================================
         template<typename... Args>
-        bool log_runtime(std::atomic<uint32_t>& log_id_atom, LogLevel level, std::string_view file, uint32_t line,
+        bool log_runtime(std::atomic<uint32_t>& log_id_atom, std::atomic<uint64_t>& fmt_hash_cache,
+            LogLevel level, std::string_view file, uint32_t line,
             std::string_view func, std::string_view format, Args&&... args) {
 
             // 在编译期扫描所有参数，如果有裸指针，直接让编译失败！
@@ -1095,10 +1108,15 @@ namespace zrlog {
                 "[ZRLOG FATAL ERROR] Raw char* / const char* is strictly forbidden for performance and safety! "
                 "Please use std::string_view(ptr, len) or zrlog::literal instead.");
 
+            // DYN 语义：格式串允许运行时变化。快路径用 64 位内容哈希做无锁校验，
+            // 首次调用或哈希不一致才进入锁内重注册（修复：旧实现只注册首次格式串，
+            // 同一调用点之后更换格式串会被静默忽略，按旧格式渲染）。
+            uint64_t fmt_hash = detail::fnv1a_hash(format);
             uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
-            if (ZRLOG_UNLIKELY(0 == log_id)) {
+            if (ZRLOG_UNLIKELY(0 == log_id || fmt_hash != fmt_hash_cache.load(std::memory_order_relaxed))) {
                 log_id = register_runtime_log_meta<typename std::decay<Args>::type...>(
                     log_id_atom, level, file, line, func, format);
+                fmt_hash_cache.store(fmt_hash, std::memory_order_relaxed);
             }
 
             return push_log_entry(log_id, std::forward<Args>(args)...);
@@ -1148,6 +1166,11 @@ namespace zrlog {
 
                 case BufferFullPolicy::Block: {
                     notify_consumer();
+                    // 修复：单条日志超过整个线程缓冲容量时永远无法入队（即使缓冲全空也放不下），
+                    // 直接放弃，避免业务线程在此永久自旋（活锁）直到 fini()
+                    if (aligned_len >= buffer->capacity()) {
+                        return false;
+                    }
                     uint32_t spin_count = 0;
                     do {
                         if (!log_thread_running_.load(std::memory_order_relaxed)) {
@@ -1167,6 +1190,10 @@ namespace zrlog {
 
                 case BufferFullPolicy::Retry: {
                     notify_consumer();
+                    // 同 Block：容量不够的条目永远放不下，快速放弃而非空转 256 次重试
+                    if (aligned_len >= buffer->capacity()) {
+                        return false;
+                    }
                     uint32_t spin_count = 0;
                     do {
                         if (!log_thread_running_.load(std::memory_order_relaxed)) {
@@ -1315,12 +1342,12 @@ namespace zrlog {
 
             // 用大括号初始化列表保证严格的从左到右求值顺序，同时彻底消灭默认构造！
             std::apply([&](const auto&... final_args) {
-                size_t space = out.available_size() - 1;  // 预留 1 字节给 \n
-                // 一次性索要充足空间，消除格式化期间的多次空间检查
-                if (ZRLOG_UNLIKELY(space < 8192)) {
+                // 修复：先判可用量再减 1。若上一条日志恰好填满缓冲（available_size()==0），
+                // 旧的"先减后判"会下溢成 SIZE_MAX，绕过 8192 检查导致 format_to_n 越界写堆
+                if (ZRLOG_UNLIKELY(out.available_size() < 8192)) {
                     out.flush_to_os();
-                    space = out.available_size() -1;
                 }
+                size_t space = out.available_size() - 1;  // 预留 1 字节给 \n
 
                 auto res = fmt::format_to_n(out.current_ptr(), space, FmtProvider::compile(),
                     fmt::string_view(time_str, 19), nano,
@@ -1357,12 +1384,11 @@ namespace zrlog {
             const char* time_str = get_time_format_cache(header.time, nano);
 
             std::apply([&](const auto&... final_args) {
-                size_t space = out.available_size() - 1; // 预留 1 字节给 \n
-                // 一次性索要充足空间，消除格式化期间的多次空间检查
-                if (ZRLOG_UNLIKELY(space < 8192)) {
+                // 修复：同上，先判可用量再减 1，防止 available_size()==0 时下溢成 SIZE_MAX
+                if (ZRLOG_UNLIKELY(out.available_size() < 8192)) {
                     out.flush_to_os();
-                    space = out.available_size() - 1;
                 }
+                size_t space = out.available_size() - 1; // 预留 1 字节给 \n
 
                 try {
                     // 1. 【第一次尝试：极速渲染头部】
@@ -1624,10 +1650,12 @@ namespace zrlog {
             // 杂项与监控接口
             // ------------------------------------------------------------------------
             inline bool should_deallocate() const {
-                return should_deallocate_;
+                // 修复：跨线程读写（垂死线程写、后台线程轮询读），改为原子消除 data race；
+                // 冷路径元数据，原子化零性能成本
+                return should_deallocate_.load(std::memory_order_acquire);
             }
             inline void mark_deallocate() {
-                should_deallocate_ = true;
+                should_deallocate_.store(true, std::memory_order_release);
             }
             inline uint32_t capacity() const {
                 return size_;
@@ -1703,7 +1731,7 @@ namespace zrlog {
             // ========================================================================
             util::MemoryBlock mem_block_;
 
-            bool should_deallocate_{ false };
+            std::atomic<bool> should_deallocate_{ false };
         };
 
         class ThreadBufferDestroyer {
@@ -1750,12 +1778,22 @@ namespace zrlog {
         }
 
         template<typename... Args>
-        uint32_t register_runtime_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level, 
+        uint32_t register_runtime_log_meta(std::atomic<uint32_t>& log_id_atom, LogLevel level,
             std::string_view file, uint32_t line, std::string_view func, std::string_view format) {
             std::lock_guard<SpinMutex> lock(log_metas_mutex_);
             uint32_t id = log_id_atom.load(std::memory_order_relaxed);
             if (id != 0) {
-                return id;
+                // 幂等快路径：格式串内容与注册时一致则直接复用
+                if (id < global_log_metas_.size()) {
+                    const std::string& reg_fmt = global_log_metas_[id].format;
+                    if (reg_fmt.size() == format.size() &&
+                        (format.empty() || std::memcmp(reg_fmt.data(), format.data(), format.size()) == 0)) {
+                        return id;
+                    }
+                }
+                // 格式串内容已变化（DYN 语义允许运行时更换格式串）：追加新的 LogMeta 并切换 log_id。
+                // 同一调用点的参数类型固定，因此新旧 meta 共享同一个 decoder；
+                // 旧 meta 保留在表中，环形缓冲里历史日志条目的 log_id 仍指向它，渲染不受影响。
             }
 
             uint32_t new_id = static_cast<uint32_t>(global_log_metas_.size());
@@ -2097,8 +2135,8 @@ namespace zrlog {
 
 #define ZRLOG_BODY(level, format, ...)                                                              \
     do {                                                                                            \
-        /* 如果 format 是变量，"" format "" 这一步就会报清晰的错误： */                             \
-        /* "error: expected ';' before 'format'" -> 提醒用户不要传变量 */                           \
+        /* 如果 format 是变量，"" format "" 这一步就会报清晰的错误： */                                \
+        /* "error: expected ';' before 'format'" -> 提醒用户不要传变量 */                            \
         constexpr const char* _check_literal = ZRLOG_ENSURE_STRING_LITERAL(format);                 \
         (void)_check_literal;                                                                       \
                                                                                                     \
@@ -2107,7 +2145,7 @@ namespace zrlog {
             static std::atomic<uint32_t> log_id{0};                                                 \
             struct FmtProvider {                                                                    \
                 static constexpr auto compile() {                                                   \
-                    /* 将固定日志头与用户日志格式完美拼接 */                                        \
+                    /* 将固定日志头与用户日志格式完美拼接 */                                           \
                     return FMT_COMPILE(ZRLOG_HEADER_FMT format);                                    \
                 }                                                                                   \
             };                                                                                      \
@@ -2132,9 +2170,10 @@ namespace zrlog {
         zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                                  \
         if (logger.check_level(level)) {                                                            \
             static std::atomic<uint32_t> log_id{0};                                                 \
+            static std::atomic<uint64_t> fmt_hash_cache{0};                                         \
             std::string_view file { __FILE__, sizeof(__FILE__) - 1 };                               \
             std::string_view func { __func__, sizeof(__func__) - 1 };                               \
-            logger.log_runtime(log_id, level, file, __LINE__, func, format, ##__VA_ARGS__);         \
+            logger.log_runtime(log_id, fmt_hash_cache, level, file, __LINE__, func, format, ##__VA_ARGS__); \
         }                                                                                           \
     } while (0)
 
