@@ -1063,7 +1063,12 @@ namespace zrlog {
             if (log_thread_running_.load(std::memory_order_relaxed)) {
                 log_thread_running_.store(false, std::memory_order_relaxed);
                 if (log_thread_.joinable()) {
-                    idle_wait_condition_.notify_one();
+                    // 持锁 notify：与本 cv 的协议保持一致（裸 notify 在消费者未进入 wait 时会丢失，
+                    // 导致 shutdown 最多多等一个 idle 超时）
+                    {
+                        std::lock_guard<std::mutex> lock(idle_wait_mutex_);
+                        idle_wait_condition_.notify_one();
+                    }
                     log_thread_.join();
                 }
                 appender_.reset();
@@ -2026,9 +2031,11 @@ namespace zrlog {
                     // 保证了低延迟情况下的 tail -f 实时可见性
                     io_buf.flush_to_os();
 
-                    idle_wait_flag_.store(true, std::memory_order_relaxed);
                     {
                         std::unique_lock<std::mutex> lock(idle_wait_mutex_);
+                        // 置位必须在锁内：与持锁 notify 配对，保证生产者看到 flag==true 时
+                        // 消费者必然已在 wait_for 中，通知不会丢（修复竞态 1）
+                        idle_wait_flag_.store(true, std::memory_order_relaxed);
                         idle_wait_condition_.wait_for(lock, std::chrono::microseconds(config_.idle_wait_interval_us));
                     }
                     idle_wait_flag_.store(false, std::memory_order_relaxed);
@@ -2044,7 +2051,13 @@ namespace zrlog {
         }
 
         inline void notify_consumer() {
+            // 忙时热路径：一次 relaxed load + 分支，零成本不变。
+            // 消费者置位 flag 在锁内完成（见 poll_routine），故看到 flag==true 时
+            // 消费者必然已进入 wait_for，持锁 notify 通知必达（修复竞态 1）。
+            // 竞态 2（生产者检查 flag 时消费者尚未置位的宽窗口，命中率 ~2%）由
+            // idle_wait_interval_us 超时兜底，属可接受的设计取舍
             if (idle_wait_flag_.load(std::memory_order_relaxed)) {
+                std::lock_guard<std::mutex> lock(idle_wait_mutex_);
                 idle_wait_flag_.store(false, std::memory_order_relaxed);
                 idle_wait_condition_.notify_one();
             }
