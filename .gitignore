@@ -1,0 +1,9 @@
+# Build artifacts
+*.o
+*.obj
+benchmark_zrlog
+benchmark_zrlog.exe
+build/
+
+# Benchmark / test log output
+*.log
