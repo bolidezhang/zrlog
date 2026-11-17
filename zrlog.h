@@ -1791,25 +1791,27 @@ namespace zrlog {
             static const uint32_t PADDING_ID = 0xFFFFFFFF;
 
             // 归一化为 2 的幂，最小 1024，最大 2^30
-            static uint32_t normalize_size(uint32_t n) {
+            inline constexpr uint32_t normalize_size(uint32_t n) noexcept {
                 constexpr uint32_t MIN_SIZE = 1024;
-                constexpr uint32_t MAX_POW2 = 1u << 30;
-                if (n < MIN_SIZE) {
-                    n = MIN_SIZE;
+                constexpr uint32_t MAX_SIZE = 1u << 30;
+
+                if (n <= MIN_SIZE) {
+                    return MIN_SIZE;
                 }
-                n--;
+
+                if (n >= MAX_SIZE) {
+                    return MAX_SIZE;
+                }
+
+                --n;
+
                 n |= n >> 1;
                 n |= n >> 2;
                 n |= n >> 4;
                 n |= n >> 8;
                 n |= n >> 16;
-                n++;
-                if (n == 0) {
-                    n = MIN_SIZE;
-                }
-                if (n > MAX_POW2) {
-                    n = MAX_POW2;
-                }
+
+                ++n;
                 return n;
             }
 
