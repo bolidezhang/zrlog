@@ -1,60 +1,61 @@
 cmake_minimum_required(VERSION 3.10)
 project(benchmark_zrlog LANGUAGES CXX)
 
-# C++17 ±ØĞè£¨std::to_chars£©
+# C++17 å¿…éœ€ï¼ˆstd::to_charsï¼‰
 set(CMAKE_CXX_STANDARD 17)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Ä¬ÈÏÊ¹ÓÃ Release ¹¹½¨£¨¿ÉÍ¨¹ı -DCMAKE_BUILD_TYPE=Debug ¸²¸Ç£©
+# é»˜è®¤ä½¿ç”¨ Release æ„å»ºï¼ˆå¯é€šè¿‡ -DCMAKE_BUILD_TYPE=Debug è¦†ç›–ï¼‰
 if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# Ïß³Ì¿â£¨ÓÃÓÚ std::thread£©
+# çº¿ç¨‹åº“ï¼ˆç”¨äº std::threadï¼‰
 find_package(Threads REQUIRED)
 
-# ¿ÉÖ´ĞĞÎÄ¼ş ¡ª¡ª ±ØĞëÏÈ´´½¨Ä¿±ê
+# å¯æ‰§è¡Œæ–‡ä»¶ â€”â€” å¿…é¡»å…ˆåˆ›å»ºç›®æ ‡
 add_executable(benchmark_zrlog benchmark_zrlog.cpp)
 
-# ===== fmt Í·ÎÄ¼şÂ·¾¶£¨ÔÚÄ¿±ê´´½¨ºóÌí¼Ó£©=====
-# ¼ÙÉèÍ·ÎÄ¼şÎ»ÓÚ ./fmt Ä¿Â¼ÏÂ£¨ÀıÈç ./fmt/fmt/core.h£©
-# Èç¹ûÊµ¼ÊÂ·¾¶ÊÇ ./fmt/include£¬ÇëÏàÓ¦ĞŞ¸Ä
+# ===== fmt å¤´æ–‡ä»¶è·¯å¾„ï¼ˆåœ¨ç›®æ ‡åˆ›å»ºåæ·»åŠ ï¼‰=====
+# å‡è®¾å¤´æ–‡ä»¶ä½äº ./fmt ç›®å½•ä¸‹ï¼ˆä¾‹å¦‚ ./fmt/fmt/core.hï¼‰
+# å¦‚æœå®é™…è·¯å¾„æ˜¯ ./fmt/includeï¼Œè¯·ç›¸åº”ä¿®æ”¹
 target_include_directories(benchmark_zrlog PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/fmt/include)
 
-# Á´½Ó¿â£º½öĞèÒª Threads£¨fmt ÎŞĞèÁ´½Ó£©
+# é“¾æ¥åº“ï¼šä»…éœ€è¦ Threadsï¼ˆfmt æ— éœ€é“¾æ¥ï¼‰
 target_link_libraries(benchmark_zrlog PRIVATE
     Threads::Threads
 )
 
-# ---------- ±àÒëÑ¡Ïî ----------
-# 1. Release ÓÅ»¯±êÖ¾£¨ÏÔÊ½ÆôÓÃ -O3 »ò /O2£©
+# ---------- ç¼–è¯‘é€‰é¡¹ ----------
+# 1. Release ä¼˜åŒ–æ ‡å¿—ï¼ˆæ˜¾å¼å¯ç”¨ -O3 æˆ– /O2ï¼‰
 if(MSVC)
+    target_compile_options(benchmark_zrlog PRIVATE /utf-8)
     target_compile_options(benchmark_zrlog PRIVATE
         $<$<CONFIG:Release>:/O2>
         $<$<CONFIG:RelWithDebInfo>:/O2>
-        # MSVC ¸ß¼¶ÓÅ»¯Ñ¡Ïî
-        $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/GL>  # È«³ÌĞòÓÅ»¯
+        # MSVC é«˜çº§ä¼˜åŒ–é€‰é¡¹
+        $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/GL>  # å…¨ç¨‹åºä¼˜åŒ–
     )
-    # MSVC Á´½ÓÊ±ÓÅ»¯
+    # MSVC é“¾æ¥æ—¶ä¼˜åŒ–
     target_link_options(benchmark_zrlog PRIVATE
-        $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/LTCG> # Á´½ÓÊ±´úÂëÉú³É
+        $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:/LTCG> # é“¾æ¥æ—¶ä»£ç ç”Ÿæˆ
     )
 else()
     target_compile_options(benchmark_zrlog PRIVATE
         $<$<CONFIG:Release>:-O3>
         $<$<CONFIG:RelWithDebInfo>:-O3>
-        # GCC/Clang ³£¼ûÓÅ»¯Ñ¡Ïî
-        $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-march=native>  # Õë¶Ô±¾µØ¼Ü¹¹ÓÅ»¯
-        $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-flto>          # Á´½ÓÊ±ÓÅ»¯£¨Í¬Ê±×÷ÓÃÓÚ±àÒëºÍÁ´½Ó£©
+        # GCC/Clang å¸¸è§ä¼˜åŒ–é€‰é¡¹
+        $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-march=native>  # é’ˆå¯¹æœ¬åœ°æ¶æ„ä¼˜åŒ–
+        $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-flto>          # é“¾æ¥æ—¶ä¼˜åŒ–ï¼ˆåŒæ—¶ä½œç”¨äºç¼–è¯‘å’Œé“¾æ¥ï¼‰
     )
-    # GCC/Clang Á´½ÓÊ±ÓÅ»¯£¨-flto Ò²ĞèÒªÔÚÁ´½Ó½×¶ÎÆôÓÃ£©
+    # GCC/Clang é“¾æ¥æ—¶ä¼˜åŒ–ï¼ˆ-flto ä¹Ÿéœ€è¦åœ¨é“¾æ¥é˜¶æ®µå¯ç”¨ï¼‰
     target_link_options(benchmark_zrlog PRIVATE
         $<$<OR:$<CONFIG:Release>,$<CONFIG:RelWithDebInfo>>:-flto>
     )
 endif()
 
-# 2. ¾¯¸æÑ¡Ïî£¨·ÇÇ¿ÖÆ£¬µ«ÍÆ¼ö£©
+# 2. è­¦å‘Šé€‰é¡¹ï¼ˆéå¼ºåˆ¶ï¼Œä½†æ¨èï¼‰
 if(MSVC)
     target_compile_options(benchmark_zrlog PRIVATE /W4)
 else()

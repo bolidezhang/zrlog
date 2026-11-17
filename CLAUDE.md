@@ -20,24 +20,19 @@ v2.x **不兼容** v1.x，所有格式串必须使用 fmt 语法。修改 `zrlog
 # fmt 是 git submodule，首次 checkout 后需初始化
 git submodule update --init
 
-# 方式一：Makefile（默认 Release，-O3 -march=native，DEBUG=YES 可切换）
-make && ./benchmark_zrlog
-
-# 方式二：CMake（默认 Release，自动加 -O3 -march=native -flto）
+# 方式一：CMake（默认 Release，自动加 -O3 -march=native -flto）
 cmake -B build && cmake --build build && ./build/benchmark_zrlog
 
-# 方式三：直接编译
+# 方式二：直接编译
 g++ -O3 -march=native -flto -std=c++17 -pthread -I./fmt/include benchmark_zrlog.cpp -o benchmark_zrlog
 
 # 运行基准：[线程缓冲区大小MB] [缓冲区满策略 0=Discard 1=Block 2=Retry]
 ./benchmark_zrlog 2.5 2
 ```
 
-**⚠️ Makefile 陷阱**：`%.o: %.h` 是一条空规则，实际上**不会跟踪 `zrlog.h` 的改动**（pattern 依赖的是不存在的同名 .h）。改完 `zrlog.h` 后必须 `rm -f *.o benchmark_zrlog && make` 强制重编，否则跑的是旧二进制——已经踩过一次：回归测试对着旧二进制跑出了误导性结果。
+**⚠️ 构建注意**：改完 `zrlog.h` 后必须重新编译 benchmark（CMake 下会自动跟踪头文件依赖），否则跑的是旧二进制——已经踩过一次：回归测试对着旧二进制跑出了误导性结果。
 
 基准套件：前端延迟（Avg/P50/P99/P99.9）、单/多线程吞吐、不同参数类型序列化开销、TscClock vs system_clock。改动前后端路径后应跑基准对比。注意本开发机（见下）单次运行的吞吐波动可达 ±3 倍，跨次对比只信 p50 类稳定指标。
-
-Windows 侧有 `zrlog.sln` / `zrlog.vcxproj`（MSVC 工程）。
 
 ## 架构
 

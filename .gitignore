@@ -7,3 +7,7 @@ build/
 
 # Benchmark / test log output
 *.log
+*.log.[0-9]*
+
+# Editor / IDE
+.vscode/
