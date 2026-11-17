@@ -348,6 +348,89 @@ TEST(e2e_file_logging) {
 
     const int year = std::atoi(head.substr(0, 4).c_str());
     CHECK(year >= 2020 && year <= 2100);
+
+    // 生产者统计（#7）：本轮共 kMtThreads*kMtPerThread + 5 条全部入队成功。
+    // 注意 stat_produce_* 是线程本地每 1024 条汇总一次，fini() 只冲刷调用线程
+    // 的残留计数；工作线程的残留无法跨线程冲刷，故只断言"有计数且有效数<=尝试数"。
+    const uint64_t produced = logger.stat_produce_count_.load(std::memory_order_relaxed);
+    const uint64_t produced_valid = logger.stat_produce_valid_count_.load(std::memory_order_relaxed);
+    CHECK(produced > 0);                       // 修复前恒为 0
+    CHECK(produced_valid <= produced);
+    CHECK(produced_valid > 0);
+}
+
+// ---------------------------------------------------------------------------
+// DYN 元数据不应无界增长（#5）：同一调用点 A->B->A 反复切换，元数据条数必须收敛
+// ---------------------------------------------------------------------------
+TEST(dyn_meta_no_unbounded_growth) {
+    const char* path = "zrlog_unit_test_dyn.log";
+    std::remove(path);
+
+    zrlog::Config cfg;
+    cfg.appender = zrlog::AppenderType::File;
+    cfg.filename = path;
+    cfg.level = zrlog::LogLevel::INFO;
+    cfg.force_flush_interval_ms = 30;
+    auto& logger = zrlog::NanoLogger::instance();
+    CHECK(logger.init(cfg));
+
+    const size_t meta_before = logger.log_meta_count();
+
+    // 关键：必须是同一个调用点（同一行号），只有格式串内容在变。
+    // 旧实现只比对"上一次注册的格式"，A->B->A 每次切换都新增一条 meta；
+    // 新实现按内容查重，两种格式各注册一次后复用。
+    for (int i = 0; i < 50; ++i) {
+        std::string f = (i % 2 == 0) ? "dynA {}" : "dynB {}";
+        ZRLOG_DYN_INFO(f, i);
+    }
+    const size_t meta_after = logger.log_meta_count();
+    logger.fini();
+
+    // 两种格式串交替 50 次，元数据只应新增 2 条（A、B 各一），
+    // 而不是每切换一次就新增一条（修复前会增长到 ~50 条）。
+    CHECK_EQ(meta_after - meta_before, static_cast<size_t>(2));
+
+    // 两种格式串都应被渲染（证明切换生效）
+    std::ifstream in(path, std::ios::binary);
+    std::stringstream ss; ss << in.rdbuf();
+    const std::string c = ss.str();
+    CHECK(c.find("dynA 0") != std::string::npos);
+    CHECK(c.find("dynB 1") != std::string::npos);
+    CHECK(c.find("dynA 48") != std::string::npos);
+    CHECK(c.find("dynB 49") != std::string::npos);
+    const size_t lines = static_cast<size_t>(std::count(c.begin(), c.end(), '\n'));
+    CHECK_EQ(lines, static_cast<size_t>(50));
+}
+
+// ---------------------------------------------------------------------------
+// 解码长度校验（#6）：长度字段被破坏时不得读穿缓冲
+// ---------------------------------------------------------------------------
+TEST(decode_arg_length_bounds) {
+    // 构造一个声称 len=1000 但实际只有 5 字节的损坏 payload
+    char buf[64] = { 0 };
+    const uint32_t claimed = 1000;
+    std::memcpy(buf, &claimed, sizeof(uint32_t));
+    std::memcpy(buf + 4, "hello", 5);
+
+    char* p = buf;
+    const char* pend = buf + 9;  // 实际只有 4(长度) + 5(内容)
+    auto sv = zrlog::detail::decode_arg<std::string_view>(p, pend);
+
+    // 必须截断到可用长度，绝不能返回 1000 字节的视图
+    CHECK_EQ(sv.size(), static_cast<size_t>(5));
+    CHECK_EQ(std::string(sv), std::string("hello"));
+    CHECK(p <= pend);  // 指针不得越过边界
+
+    // 完全为空时返回空视图
+    char* p2 = buf;
+    auto sv2 = zrlog::detail::decode_arg<std::string_view>(p2, buf);
+    CHECK_EQ(sv2.size(), static_cast<size_t>(0));
+
+    // 标量越界时返回默认值而非读穿
+    char tiny[2] = { 0x11, 0x22 };
+    char* p3 = tiny;
+    auto v = zrlog::detail::decode_arg<uint64_t>(p3, tiny + 2);
+    CHECK_EQ(v, static_cast<uint64_t>(0));
 }
 
 int main() {
