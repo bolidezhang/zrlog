@@ -1,0 +1,60 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Benchmark: Debug (quick)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/benchmark_zrlog.exe",
+            "args": ["0.1", "0"],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "stopAtEntry": false,
+            "preLaunchTask": "cmake: build Debug"
+        },
+        {
+            "name": "Benchmark: Debug (full)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/benchmark_zrlog.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "stopAtEntry": false,
+            "preLaunchTask": "cmake: build Debug"
+        },
+        {
+            "name": "Benchmark: Release (full)",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Release/benchmark_zrlog.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}",
+            "console": "integratedTerminal",
+            "stopAtEntry": false,
+            "preLaunchTask": "cmake: build Release"
+        },
+        {
+            "name": "Unit tests: Debug",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Debug/zrlog_tests.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}/build",
+            "console": "integratedTerminal",
+            "stopAtEntry": false,
+            "preLaunchTask": "cmake: build Debug"
+        },
+        {
+            "name": "Unit tests: Release",
+            "type": "cppvsdbg",
+            "request": "launch",
+            "program": "${workspaceFolder}/build/Release/zrlog_tests.exe",
+            "args": [],
+            "cwd": "${workspaceFolder}/build",
+            "console": "integratedTerminal",
+            "stopAtEntry": false,
+            "preLaunchTask": "cmake: build Release"
+        }
+    ]
+}
