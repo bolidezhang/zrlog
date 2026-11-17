@@ -89,4 +89,33 @@ if(ZRLOG_BUILD_TESTS)
              COMMAND zrlog_tests
              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     set_tests_properties(zrlog_unit_tests PROPERTIES TIMEOUT 120)
+
+    # 异常屏障：自定义 formatter 抛异常时后端线程不得崩溃（进程须存活并输出 [FMT_ERROR]）
+    add_executable(zrlog_exception_test tests/exception_test.cpp)
+    target_link_libraries(zrlog_exception_test PRIVATE zrlog)
+    if(MSVC)
+        target_compile_options(zrlog_exception_test PRIVATE /W4)
+    else()
+        target_compile_options(zrlog_exception_test PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME zrlog_exception_barrier
+             COMMAND zrlog_exception_test
+             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(zrlog_exception_barrier PROPERTIES TIMEOUT 60)
+
+    # 崩溃抢救：子进程触发 SIGSEGV，父进程校验崩溃前日志已落盘
+    # （仅 Windows：使用 CreateProcess 隔离崩溃，避免父进程被信号杀死）
+    if(WIN32)
+        add_executable(zrlog_crash_test tests/crash_test.cpp)
+        target_link_libraries(zrlog_crash_test PRIVATE zrlog)
+        if(MSVC)
+            target_compile_options(zrlog_crash_test PRIVATE /W4)
+        else()
+            target_compile_options(zrlog_crash_test PRIVATE -Wall -Wextra)
+        endif()
+        add_test(NAME zrlog_crash_flush
+                 COMMAND zrlog_crash_test
+                 WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+        set_tests_properties(zrlog_crash_flush PROPERTIES TIMEOUT 60)
+    endif()
 endif()

@@ -227,6 +227,30 @@ namespace zrlog {
             std::is_same_v<std::remove_cv_t<std::remove_reference_t<T>>, char*> ||
             std::is_same_v<std::remove_cv_t<std::remove_reference_t<T>>, const char*>;
 
+        // 编译期特征：参数能否被安全地按位序列化到环形缓冲。
+        //
+        // 前端是把参数逐位 memcpy 进缓冲、后端再 memcpy 出来，所以参数必须
+        // "值语义可拷贝"：拷贝字节后与原件等价。std::string / std::vector 这类
+        // 拥有堆内存的类型逐位拷贝后，后端拿到的是悬垂指针（UAF）。
+        //
+        // 默认规则：
+        //   - 字符串类型（std::string / string_view / string_literal_t）由
+        //     serialize_arg 专门处理（写长度 + 内容 / 指针 + 长度），放行；
+        //   - 其余类型必须是 trivially copyable（标量、枚举、POD 结构体）。
+        //
+        // 逃生舱：确实需要传自定义类型时，可为该类型特化 loggable_arg 为
+        // true_type，但必须自行保证"按值拷贝安全"（例如内部用定长数组而非堆
+        // 指针，且不含指向外部生命周期的裸指针）。
+        template <typename T, typename = void>
+        struct loggable_arg
+            : std::integral_constant<bool, std::is_trivially_copyable_v<std::decay_t<T>>> {};
+
+        template <typename T>
+        struct loggable_arg<T, std::enable_if_t<
+            std::is_same_v<std::decay_t<T>, std::string> ||
+            std::is_same_v<std::decay_t<T>, std::string_view> ||
+            std::is_same_v<std::decay_t<T>, zrlog::string_literal_t>>> : std::true_type {};
+
         // 编译期类型映射 Traits：遇到字符串一律退化为 std::string_view
         template <typename T>
         struct decode_type {
@@ -334,6 +358,11 @@ namespace zrlog {
                 ZRLOG_CPU_PAUSE();
             }
         }
+        // 非阻塞尝试加锁：供崩溃抢救路径使用——若锁被垂死线程持有，
+        // 强行自旋会永久卡住，导致抢救失败。失败时调用方降级跳过。
+        bool try_lock() {
+            return !flag_.test_and_set(std::memory_order_acquire);
+        }
         void unlock() {
             flag_.clear(std::memory_order_release);
         }
@@ -383,6 +412,28 @@ namespace zrlog {
 
         inline uint64_t current_time_ns_i() const {
             return anchor_.base_ns + tsc2ns(zrlog_rdtsc() - anchor_.base_tsc);
+        }
+
+        // 把前端记录的原始 TSC 计数换算成绝对 Unix 纳秒时间戳（供后端解码使用）。
+        // 区别于 tsc2ns()：后者只换算"两个 TSC 之间的差值"，不叠加时间锚点。
+        // 用 seqlock 读取 anchor_，与后台 sync_system_time()/calibrate() 的
+        // 写入互斥，避免读到撕裂的 base_ns/base_tsc（消除原先热路径的数据竞争）。
+        inline uint64_t tsc_to_unix_ns(uint64_t tsc) const {
+            uint32_t seq;
+            Anchor   anc;
+            do {
+                seq = seq_.load(std::memory_order_acquire);
+                anc = anchor_;
+                std::atomic_thread_fence(std::memory_order_acquire);
+            } while (seq != seq_.load(std::memory_order_relaxed) || (seq & 1));
+
+            return anc.base_ns + tsc2ns(tsc - anc.base_tsc);
+        }
+
+        // 每个 TSC tick 对应的纳秒数（用于崩溃路径预算超时，避免信号处理中
+        // 调用 steady_clock）。multiplier_ = rate * 2^shift_，其中 rate 即 ns/tick。
+        double ns_per_tick() const {
+            return static_cast<double>(multiplier_) / static_cast<double>(1ULL << shift_);
         }
 
         inline uint64_t tsc2ns(uint64_t tsc_diff) const {
@@ -969,10 +1020,13 @@ namespace zrlog {
         };
 
         // 【极限压缩】将 LogEntryHeader 压缩至 16 字节，大幅提升缓存命中率与容量
+        // tsc 存的是前端读到的原始 TSC 计数（不是 ns）：前端只做 rdtsc，
+        // 把 TSC->ns 的换算与锚点读取全部推迟到后端解码时完成。
+        // 前提是 invariant TSC（跨核同步），已实测 P 核间偏移 <=1 tick。
         struct LogEntryHeader {
             uint32_t total_size;
             uint32_t log_id;
-            uint64_t time;
+            uint64_t tsc;
         };
 
         class IOBuffer {
@@ -1091,6 +1145,16 @@ namespace zrlog {
                 "[ZRLOG FATAL ERROR] Raw char* / const char* is strictly forbidden for performance and safety! "
                 "Please use std::string_view(ptr, len) or zrlog::literal instead.");
 
+            // 参数必须可按值安全拷贝（前端 memcpy 进环形缓冲、后端 memcpy 出来）。
+            // 含堆内存的类型（如内嵌 std::string 的自定义结构体）逐位拷贝后会在
+            // 后端形成悬垂指针。若确需支持，为该类型特化 detail::loggable_arg。
+            static_assert((... && detail::loggable_arg<Args>::value),
+                "[ZRLOG FATAL ERROR] Log argument is not safely copyable by value. "
+                "Only trivially copyable types, std::string, std::string_view and "
+                "zrlog::string_literal_t are supported. Wrap heap-owning types "
+                "(e.g. nested std::string) into a plain struct/array, or specialize "
+                "zrlog::detail::loggable_arg<T> to std::true_type with your own guarantee.");
+
             uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
             if (ZRLOG_UNLIKELY(0 == log_id)) {
                 log_id = register_log_meta<FmtProvider, typename std::decay<Args>::type...>(
@@ -1113,6 +1177,12 @@ namespace zrlog {
                 "[ZRLOG FATAL ERROR] Raw char* / const char* is strictly forbidden for performance and safety! "
                 "Please use std::string_view(ptr, len) or zrlog::literal instead.");
 
+            // 同 log()：参数必须可按值安全拷贝（见 detail::loggable_arg 注释）。
+            static_assert((... && detail::loggable_arg<Args>::value),
+                "[ZRLOG FATAL ERROR] Log argument is not safely copyable by value. "
+                "Only trivially copyable types, std::string, std::string_view and "
+                "zrlog::string_literal_t are supported. See zrlog::detail::loggable_arg.");
+
             // DYN 语义：格式串允许运行时变化。快路径用 64 位内容哈希做无锁校验，
             // 首次调用或哈希不一致才进入锁内重注册（修复：旧实现只注册首次格式串，
             // 同一调用点之后更换格式串会被静默忽略，按旧格式渲染）。
@@ -1127,24 +1197,36 @@ namespace zrlog {
             return push_log_entry(log_id, std::forward<Args>(args)...);
         }
 
-        // 崩溃兜底紧急刷盘接口
+        // 崩溃路径预热：在正常上下文缓存 ns/tick，供 emergency_flush() 在
+        // 信号处理器内预算超时使用（信号处理中不可调用 steady_clock）。
+        void cache_crash_clock() {
+            crash_ns_per_tick_ = TscClock::instance().ns_per_tick();
+        }
+
+        // 崩溃兜底紧急刷盘：可在信号处理器中安全调用。
+        // 只做 async-signal-safe 的动作：原子标志 + rdtsc 忙等，绝不调用
+        // sleep_for / steady_clock / instance()（后三者会加锁或非信号安全）。
         void emergency_flush() {
             if (!log_thread_running_.load(std::memory_order_relaxed)) {
                 return;
             }
 
-            // 标记为崩溃模式，并通知后台消费者立刻醒来
+            // 标记崩溃模式，后台线程每轮循环都会检查此标志并立即全量 drain
             is_crashed_.store(true, std::memory_order_release);
-            //notify_consumer();
 
-            // 当前线程（发生崩溃的业务线程）自旋阻塞，给后台线程抢救数据的时间。
-            // 设置 crash_drain_wait_ms 超时，防止磁盘卡死导致进程无法退出 Core Dump。
-            auto start_time = std::chrono::steady_clock::now();
+            // 用 rdtsc 计算超时，避免 steady_clock（可能走系统调用）与 sleep_for。
+            // ns_per_tick 由 install_crash_handler() 在正常上下文预先缓存。
+            const double ns_per_tick =
+                crash_ns_per_tick_ > 0 ? crash_ns_per_tick_ : 1.0;
+            const uint64_t wait_ticks = static_cast<uint64_t>(
+                static_cast<double>(config_.crash_drain_wait_ms) * 1e6 / ns_per_tick);
+            const uint64_t deadline = TscClock::rdtsc() + wait_ticks;
+
             while (!crash_drain_done_.load(std::memory_order_acquire)) {
-                if (std::chrono::steady_clock::now() - start_time > std::chrono::milliseconds(config_.crash_drain_wait_ms)) {
+                if (TscClock::rdtsc() > deadline) {
                     break;
                 }
-                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+                ZRLOG_CPU_PAUSE();
             }
         }
 
@@ -1228,7 +1310,7 @@ namespace zrlog {
             LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
             header->total_size = aligned_len;
             header->log_id = log_id;
-            header->time = TscClock::now_ns_i();
+            header->tsc = TscClock::rdtsc();
             serialize_args_all(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
             buffer->commit(aligned_len);
             notify_consumer();
@@ -1343,41 +1425,70 @@ namespace zrlog {
         template<typename FmtProvider, typename... Args>
         static void generated_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
             uint32_t nano;
-            const char *time_str = get_time_format_cache(header.time, nano);
+            const char *time_str = get_time_format_cache(TscClock::instance().tsc_to_unix_ns(header.tsc), nano);
 
             // 用大括号初始化列表保证严格的从左到右求值顺序，同时彻底消灭默认构造！
             std::apply([&](const auto&... final_args) {
-                // 修复：先判可用量再减 1。若上一条日志恰好填满缓冲（available_size()==0），
-                // 旧的"先减后判"会下溢成 SIZE_MAX，绕过 8192 检查导致 format_to_n 越界写堆
-                if (ZRLOG_UNLIKELY(out.available_size() < 8192)) {
-                    out.flush_to_os();
-                }
-                size_t space = out.available_size() - 1;  // 预留 1 字节给 \n
+                // 异常屏障：后端消费线程里任何未捕获异常都会 std::terminate 整个进程。
+                // 静态 decoder 用 FMT_COMPILE 生成格式化代码，正常情况下不会抛
+                // （格式串是编译期校验过的），但自定义类型的 formatter、内存不足
+                // 等仍可能抛，这里兜底成一行 [FMT_ERROR]，绝不让进程挂掉。
+                try {
+                    // 修复：先判可用量再减 1。若上一条日志恰好填满缓冲（available_size()==0），
+                    // 旧的"先减后判"会下溢成 SIZE_MAX，绕过 8192 检查导致 format_to_n 越界写堆
+                    if (ZRLOG_UNLIKELY(out.available_size() < 8192)) {
+                        out.flush_to_os();
+                    }
+                    size_t space = out.available_size() - 1;  // 预留 1 字节给 \n
 
-                auto res = fmt::format_to_n(out.current_ptr(), space, FmtProvider::compile(),
-                    fmt::string_view(time_str, 19), nano,
-                    loglevel_to_string(meta.level), thread_id,
-                    meta.file, meta.line, final_args...);
-
-                // 处理缓冲区写满换行逻辑
-                if (ZRLOG_LIKELY(res.size <= space)) {
-                    out.current_ptr()[res.size] = '\n';
-                    out.advance(res.size + 1);
-                }
-                else {
-                    out.flush_to_os();
-                    space = out.available_size() - 1;
-
-                    res = fmt::format_to_n(out.current_ptr(), space, FmtProvider::compile(),
+                    auto res = fmt::format_to_n(out.current_ptr(), space, FmtProvider::compile(),
                         fmt::string_view(time_str, 19), nano,
                         loglevel_to_string(meta.level), thread_id,
                         meta.file, meta.line, final_args...);
-                    size_t written = std::min<size_t>(res.size, space);
-                    out.current_ptr()[written] = '\n';
-                    out.advance(written + 1);
+
+                    // 处理缓冲区写满换行逻辑
+                    if (ZRLOG_LIKELY(res.size <= space)) {
+                        out.current_ptr()[res.size] = '\n';
+                        out.advance(res.size + 1);
+                    }
+                    else {
+                        out.flush_to_os();
+                        space = out.available_size() - 1;
+
+                        res = fmt::format_to_n(out.current_ptr(), space, FmtProvider::compile(),
+                            fmt::string_view(time_str, 19), nano,
+                            loglevel_to_string(meta.level), thread_id,
+                            meta.file, meta.line, final_args...);
+                        size_t written = std::min<size_t>(res.size, space);
+                        out.current_ptr()[written] = '\n';
+                        out.advance(written + 1);
+                    }
+                }
+                catch (const std::exception& e) {
+                    write_error_line(out, meta, time_str, nano, e.what());
+                }
+                catch (...) {
+                    write_error_line(out, meta, time_str, nano, "unknown exception");
                 }
 
             }, std::tuple<typename detail::decode_type<Args>::type...>{ detail::decode_arg<Args>(buffer)... });
+        }
+
+        // 解码失败时输出一行 [FMT_ERROR]，保证后端消费线程不因单条日志而终止。
+        // 同样遵守"先判可用量再减 1"，避免下溢。
+        static void write_error_line(IOBuffer& out, const LogMeta& meta, const char* time_str,
+                                     uint32_t nano, const char* what) {
+            if (ZRLOG_UNLIKELY(out.available_size() < 512)) {
+                out.flush_to_os();
+            }
+            size_t err_space = out.available_size() - 1;
+            auto err_msg = fmt::format_to_n(out.current_ptr(), err_space,
+                FMT_COMPILE("[FMT_ERROR] {}.{:09d} {} {}:{} error: '{}'"),
+                fmt::string_view(time_str, 19), nano, loglevel_to_string(meta.level),
+                meta.file, meta.line, what);
+            size_t actual_err_len = std::min<size_t>(err_msg.size, err_space);
+            out.current_ptr()[actual_err_len] = '\n';
+            out.advance(actual_err_len + 1);
         }
 
         // ========================================================================
@@ -1386,7 +1497,7 @@ namespace zrlog {
         template<typename... Args>
         static void generated_runtime_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
             uint32_t nano;
-            const char* time_str = get_time_format_cache(header.time, nano);
+            const char* time_str = get_time_format_cache(TscClock::instance().tsc_to_unix_ns(header.tsc), nano);
 
             std::apply([&](const auto&... final_args) {
                 // 修复：同上，先判可用量再减 1，防止 available_size()==0 时下溢成 SIZE_MAX
@@ -1706,7 +1817,7 @@ namespace zrlog {
                 LogEntryHeader *p = reinterpret_cast<LogEntryHeader *>(mem_block_.ptr + pos);
                 p->log_id = PADDING_ID;
                 p->total_size = pad_size;
-                p->time = 0;
+                p->tsc = 0;
             }
 
             // =========================================================================
@@ -1829,24 +1940,51 @@ namespace zrlog {
 
         size_t consume_buffers_round_robin(std::vector<LogMeta>& local_log_metas, IOBuffer& io_buf, bool full_drain = false) {
             size_t processed_count = 0;
+            // 崩溃抢救路径：垂死线程可能正持有某把锁，此时强自旋会永久卡死，
+            // 使抢救失败。故崩溃模式下改用 try_lock，抢不到就跳过本次同步，
+            // 用已缓存的元数据/缓冲尽力输出剩余日志。
+            const bool crashed = is_crashed_.load(std::memory_order_acquire);
 
             {
                 // 追加日志元数据到本地集合
-                std::lock_guard<SpinMutex> lock(log_metas_mutex_);
-                if (global_log_metas_.size() > local_log_metas.size()) {
-                    local_log_metas.insert(local_log_metas.end(),
-                        global_log_metas_.begin() + local_log_metas.size(),
-                        global_log_metas_.end());
+                if (crashed) {
+                    if (log_metas_mutex_.try_lock()) {
+                        if (global_log_metas_.size() > local_log_metas.size()) {
+                            local_log_metas.insert(local_log_metas.end(),
+                                global_log_metas_.begin() + local_log_metas.size(),
+                                global_log_metas_.end());
+                        }
+                        log_metas_mutex_.unlock();
+                    }
+                }
+                else {
+                    std::lock_guard<SpinMutex> lock(log_metas_mutex_);
+                    if (global_log_metas_.size() > local_log_metas.size()) {
+                        local_log_metas.insert(local_log_metas.end(),
+                            global_log_metas_.begin() + local_log_metas.size(),
+                            global_log_metas_.end());
+                    }
                 }
             }
             {
                 // 【连续内存预取】将新增的 Buffer 高效转移到后台集合
                 // 注意：新加入的 Buffer 都在 vector 尾部，天生属于“非活跃区”，
                 // 下一次纪元扫描时如果有数据，自然会被提拔到前面。
-                std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
-                if (!thread_buffers_.empty()) {
-                    thread_buffers_bg_.insert(thread_buffers_bg_.end(), thread_buffers_.begin(), thread_buffers_.end());
-                    thread_buffers_.clear();
+                if (crashed) {
+                    if (thread_buffers_mutex_.try_lock()) {
+                        if (!thread_buffers_.empty()) {
+                            thread_buffers_bg_.insert(thread_buffers_bg_.end(), thread_buffers_.begin(), thread_buffers_.end());
+                            thread_buffers_.clear();
+                        }
+                        thread_buffers_mutex_.unlock();
+                    }
+                }
+                else {
+                    std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
+                    if (!thread_buffers_.empty()) {
+                        thread_buffers_bg_.insert(thread_buffers_bg_.end(), thread_buffers_.begin(), thread_buffers_.end());
+                        thread_buffers_.clear();
+                    }
                 }
             }
 
@@ -1993,6 +2131,11 @@ namespace zrlog {
 
             while (log_thread_running_.load(std::memory_order_relaxed)) {
 
+                // 顶层异常屏障：filesystem / vector 扩容 / 自定义 formatter 等
+                // 抛出的异常绝不能逃出后台线程（std::thread 里逃逸 = std::terminate）。
+                // 单轮失败只跳过本轮，下轮继续，保证日志系统自身不拖垮进程。
+                try {
+
                 // 【崩溃检测】发现发生严重崩溃，立即启动抢救式全量 Drain
                 if (ZRLOG_UNLIKELY(is_crashed_.load(std::memory_order_acquire))) {
                     while (consume_buffers_round_robin(local_log_metas, io_buf, true) > 0) {
@@ -2039,6 +2182,18 @@ namespace zrlog {
                         idle_wait_condition_.wait_for(lock, std::chrono::microseconds(config_.idle_wait_interval_us));
                     }
                     idle_wait_flag_.store(false, std::memory_order_relaxed);
+                }
+
+                }  // end try
+                catch (const std::exception& e) {
+                    const char msg[] = "[ZRLOG] background consumer exception: ";
+                    [[maybe_unused]] auto r1 = ZRLOG_WRITE(STDERR_FILENO, msg, sizeof(msg) - 1);
+                    [[maybe_unused]] auto r2 = ZRLOG_WRITE(STDERR_FILENO, e.what(), std::strlen(e.what()));
+                    [[maybe_unused]] auto r3 = ZRLOG_WRITE(STDERR_FILENO, "\n", 1);
+                }
+                catch (...) {
+                    const char msg[] = "[ZRLOG] background consumer unknown exception\n";
+                    [[maybe_unused]] auto r = ZRLOG_WRITE(STDERR_FILENO, msg, sizeof(msg) - 1);
                 }
             }
 
@@ -2107,6 +2262,10 @@ namespace zrlog {
         //崩溃状态标识
         std::atomic<bool> is_crashed_{ false };
         std::atomic<bool> crash_drain_done_{ false };
+        // 崩溃路径专用的 ns/tick 缓存：在 install_crash_handler() 的正常上下文
+        // 预先算好，供信号处理器内的 emergency_flush() 使用（信号处理中不能
+        // 调用可能加锁/走系统调用的计时接口）。
+        double crash_ns_per_tick_{ 0.0 };
     };
 
     inline ZRLOG_FAST_THREAD_LOCAL NanoLogger::ThreadBuffer* NanoLogger::thread_buffer_ = nullptr;
@@ -2116,9 +2275,19 @@ namespace zrlog {
     // 崩溃信号捕获 (Crash Handler)
     // ---------------------------------------------------------------------------
     namespace detail {
+        // 预先缓存的实例指针与超时参数：信号处理器内不得调用
+        // NanoLogger::instance()（函数局部 static 的 guard 可能加锁），
+        // 只能通过这个在正常上下文写好的裸指针访问。
+        inline NanoLogger*& crash_logger_ptr() {
+            static NanoLogger* p = nullptr;
+            return p;
+        }
+
         inline void crash_signal_handler(int sig) {
-            // 发生崩溃，触发日志紧急刷盘
-            NanoLogger::instance().emergency_flush();
+            // 仅执行 async-signal-safe 动作：置原子标志 + rdtsc 忙等排空。
+            if (NanoLogger* logger = crash_logger_ptr()) {
+                logger->emergency_flush();
+            }
 
             // 恢复系统默认行为并重新抛出，以生成 Core Dump
             std::signal(sig, SIG_DFL);
@@ -2127,6 +2296,14 @@ namespace zrlog {
     }
 
     inline void install_crash_handler() {
+        // 在正常上下文完成所有可能加锁/走系统调用的准备工作：
+        // 1) 触发单例构造（避免崩溃时才首次构造）
+        // 2) 缓存实例指针供信号处理器使用
+        // 3) 缓存 ns/tick，避免信号处理中调用 steady_clock
+        NanoLogger& logger = NanoLogger::instance();
+        detail::crash_logger_ptr() = &logger;
+        logger.cache_crash_clock();
+
         std::signal(SIGSEGV, detail::crash_signal_handler);
         std::signal(SIGABRT, detail::crash_signal_handler);
         std::signal(SIGFPE, detail::crash_signal_handler);

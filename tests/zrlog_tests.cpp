@@ -316,6 +316,38 @@ TEST(e2e_file_logging) {
 
     const size_t lines = static_cast<size_t>(std::count(content.begin(), content.end(), '\n'));
     CHECK_EQ(lines, static_cast<size_t>(kMtThreads * kMtPerThread + 5));
+
+    // 时间戳正确性：前端只存原始 TSC，后端用 seqlock 换算成 ns。
+    // 解析首行的 "YYYY-MM-DD HH:MM:SS.nnnnnnnnn" 并与系统 UTC 时钟比对，
+    // 防止 TSC->ns 换算写错时输出 1970 年或偏移量级的时间。
+    CHECK(content.size() > 30);
+    const std::string stamp = content.substr(0, 29);  // "YYYY-MM-DD HH:MM:SS.nnnnnnnnn"
+    CHECK_EQ(stamp[4], '-');
+    CHECK_EQ(stamp[7], '-');
+    CHECK_EQ(stamp[10], ' ');
+    CHECK_EQ(stamp[13], ':');
+    CHECK_EQ(stamp[16], ':');
+    CHECK_EQ(stamp[19], '.');
+
+    struct tm tmv{};
+    const std::string head = stamp.substr(0, 19);  // "YYYY-MM-DD HH:MM:SS"
+    tmv.tm_year = std::atoi(head.substr(0, 4).c_str()) - 1900;
+    tmv.tm_mon  = std::atoi(head.substr(5, 2).c_str()) - 1;
+    tmv.tm_mday = std::atoi(head.substr(8, 2).c_str());
+    tmv.tm_hour = std::atoi(head.substr(11, 2).c_str());
+    tmv.tm_min  = std::atoi(head.substr(14, 2).c_str());
+    tmv.tm_sec  = std::atoi(head.substr(17, 2).c_str());
+#if defined(_WIN32)
+    const time_t logged = _mkgmtime(&tmv);
+#else
+    const time_t logged = timegm(&tmv);
+#endif
+    const time_t now = std::time(nullptr);
+    const long long drift = static_cast<long long>(now) - static_cast<long long>(logged);
+    CHECK(drift >= -2 && drift <= 5);  // 允许秒级截断与执行耗时
+
+    const int year = std::atoi(head.substr(0, 4).c_str());
+    CHECK(year >= 2020 && year <= 2100);
 }
 
 int main() {
