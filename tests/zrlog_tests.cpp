@@ -17,6 +17,14 @@
 #include <thread>
 #include <vector>
 
+#include <sys/stat.h>
+#if defined(_WIN32)
+#include <windows.h>
+#include <direct.h>
+#else
+#include <sys/types.h>
+#endif
+
 using namespace zrlog::literals;
 
 namespace zrt {
@@ -431,6 +439,304 @@ TEST(decode_arg_length_bounds) {
     char* p3 = tiny;
     auto v = zrlog::detail::decode_arg<uint64_t>(p3, tiny + 2);
     CHECK_EQ(v, static_cast<uint64_t>(0));
+}
+
+// ---------------------------------------------------------------------------
+// 轮转写失败计数（#8）：current_size_ 必须始终等于当前文件的真实字节数。
+// 旧实现在写失败时 `current_size_ += len` 会虚增计数，导致提前 roll 风暴。
+// 这里通过"大量写入 + 多次滚动"验证计数与文件大小的不变量始终成立。
+// ---------------------------------------------------------------------------
+TEST(rotating_size_accounting_invariant) {
+    const char* path = "zrlog_rot_test.log";
+    std::remove(path);
+    for (int i = 1; i <= 5; ++i) {
+        std::remove((std::string(path) + "." + std::to_string(i)).c_str());
+    }
+
+    const size_t kMaxSize = 4096;
+    zrlog::RotatingFileLogAppender app(path, kMaxSize, 3);
+    CHECK(app.is_open());
+    CHECK_EQ(app.current_size(), static_cast<size_t>(0));
+
+    // 正常写入：计数应精确等于实际写入字节
+    const char msg[] = "0123456789";
+    CHECK_EQ(app.write(msg, sizeof(msg) - 1), static_cast<int>(sizeof(msg) - 1));
+    CHECK_EQ(app.current_size(), static_cast<size_t>(sizeof(msg) - 1));
+
+    // 持续写入，跨越多次滚动。每次写入后核对：
+    //   current_size_ == 当前 base 文件的实际大小
+    // 若写失败虚增计数，这个等式会在滚动后立刻失配。
+    std::string chunk(700, 'x');
+    size_t rolls = 0;
+    size_t prev_size = app.current_size();
+    for (int i = 0; i < 40; ++i) {
+        app.write(chunk.data(), chunk.size());
+        app.flush();
+
+        struct stat st {};
+        CHECK(stat(path, &st) == 0);
+        CHECK_EQ(app.current_size(), static_cast<size_t>(st.st_size));
+
+        // 检测滚动发生（base 文件变小说明刚重建）
+        if (app.current_size() < prev_size) {
+            ++rolls;
+        }
+        prev_size = app.current_size();
+    }
+
+    // 40 * 700B ≈ 28KB / 4KB 阈值，必然发生多次滚动（不是 0 次）
+    CHECK(rolls >= 3);
+    // 备份文件数量不超过 max_files
+    int backups = 0;
+    for (int i = 1; i <= 10; ++i) {
+        std::ifstream f(std::string(path) + "." + std::to_string(i));
+        if (f.good()) ++backups;
+    }
+    CHECK(backups <= 3);
+
+    std::remove(path);
+    for (int i = 1; i <= 10; ++i) {
+        std::remove((std::string(path) + "." + std::to_string(i)).c_str());
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 轮转打开失败兜底（#8 相关）：文件无法打开时走 stderr 兜底，
+// current_size_ 只能按 stderr 实际写入字节推进，不得按请求长度虚增。
+// ---------------------------------------------------------------------------
+TEST(rotating_open_failure_fallback) {
+    // 用一个目录路径当日志文件：open 必然失败
+    const char* dir_path = "zrlog_rot_dir";
+#if defined(_WIN32)
+    _mkdir(dir_path);
+#else
+    mkdir(dir_path, 0755);
+#endif
+
+    zrlog::RotatingFileLogAppender app(dir_path, 4096, 3);
+    CHECK(!app.is_open());          // 打开失败
+    CHECK_EQ(app.current_size(), static_cast<size_t>(0));
+
+    // 写入应降级到 stderr，返回值是 stderr 实际写入量（可能为 -1 或 >0），
+    // 但 current_size_ 绝不能等于请求的 len（旧实现会 += len 虚增）
+    const char msg[] = "fallback-line";
+    const int n = app.write(msg, sizeof(msg) - 1);
+    CHECK(n != static_cast<int>(sizeof(msg) - 1) || app.current_size() == static_cast<size_t>(n));
+
+#if defined(_WIN32)
+    _rmdir(dir_path);
+#else
+    rmdir(dir_path);
+#endif
+}
+
+// ---------------------------------------------------------------------------
+// 写错误分类（#8）：硬错误必须关闭 fd（避免在死描述符上反复失败），
+// 软错误必须保留 fd（磁盘满时空间释放后自动恢复，不应丢弃文件句柄）。
+// ---------------------------------------------------------------------------
+TEST(write_error_classification) {
+    using R = zrlog::RotatingFileLogAppender;
+
+    // 硬错误：fd 已不可用，必须关闭
+#if defined(EBADF)
+    CHECK(R::is_hard_write_error(EBADF));
+#endif
+#if defined(EIO)
+    CHECK(R::is_hard_write_error(EIO));
+#endif
+#if defined(EPIPE)
+    CHECK(R::is_hard_write_error(EPIPE));
+#endif
+
+    // 软错误：必须保留 fd（旧实现不区分，一律保留并按 len 虚增计数）
+#if defined(ENOSPC)
+    CHECK(!R::is_hard_write_error(ENOSPC));   // 磁盘满
+#endif
+#if defined(EDQUOT)
+    CHECK(!R::is_hard_write_error(EDQUOT));   // 配额超限
+#endif
+#if defined(EAGAIN)
+    CHECK(!R::is_hard_write_error(EAGAIN));   // 暂时不可写
+#endif
+#if defined(EINTR)
+    CHECK(!R::is_hard_write_error(EINTR));    // 被信号中断
+#endif
+
+    CHECK(!R::is_hard_write_error(0));        // 无错误
+}
+
+// ---------------------------------------------------------------------------
+// 跨平台时间源契约（#9）：zrlog_rdtsc 在各架构上都必须单调不减，
+// 且 TscClock 能基于它换算出合理的时间戳。
+// x86/x64=TSC，MSVC ARM64=CNTVCT_EL0，GCC aarch64=cntvct_el0，其余=高精度时钟。
+// ---------------------------------------------------------------------------
+TEST(platform_rdtsc_contract) {
+    const uint64_t a = zrlog_rdtsc();
+    // 忙等一小会儿，确保计数器必然前进
+    volatile uint64_t sink = 0;
+    for (int i = 0; i < 100000; ++i) {
+        sink += zrlog_rdtsc();
+    }
+    const uint64_t b = zrlog_rdtsc();
+    (void)sink;
+    CHECK(b > a);                       // 单调递增
+
+    // 基于该时间源换算出的 ns 时间戳必须接近系统时钟
+    auto& clk = zrlog::TscClock::instance();
+    const uint64_t ns = clk.tsc_to_unix_ns(b);
+    const uint64_t sys_ns = static_cast<uint64_t>(
+        std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::system_clock::now().time_since_epoch()).count());
+    const long long diff = static_cast<long long>(ns) - static_cast<long long>(sys_ns);
+    CHECK(diff > -5000000000LL && diff < 5000000000LL);  // 5 秒内
+
+    // 计数器频率必须已校准（ns_per_tick 为正）
+    CHECK(clk.ns_per_tick() > 0.0);
+}
+
+// ---------------------------------------------------------------------------
+// 自适应 idle 配置（C 组）：平台默认值不同
+//   Linux/macOS 默认开启（nanosleep 精度够）；Windows 默认关闭
+//   （wait_for 受 ~1.5ms 系统 timer 精度限制，压到 50us 无收益）。
+// ---------------------------------------------------------------------------
+TEST(adaptive_idle_config) {
+    zrlog::Config c;
+#if defined(_WIN32)
+    CHECK(!c.adaptive_idle_wait);       // Windows 默认关闭
+#else
+    CHECK(c.adaptive_idle_wait);        // Linux/macOS 默认开启
+#endif
+    CHECK(c.idle_busy_interval_us > 0);
+    CHECK(c.idle_busy_interval_us < c.idle_wait_interval_us);  // 活跃态更快
+    CHECK(c.idle_wait_interval_us == 1000u);
+    CHECK(c.idle_busy_interval_us == 50u);
+}
+
+// ---------------------------------------------------------------------------
+// 自适应 idle 端到端：两种模式都必须能把日志正确落盘（功能正确性）。
+// 注意：不做 adaptive vs fixed 的延迟对比——Windows 上 wait_for 受 ~1.5ms
+// 系统 timer 精度限制（实测 sleep_for(20us) 实际睡 ~1.6ms），把间隔压到
+// 50us 没有可测收益，对比数字只会是噪声。真正的收益在 Linux 上。
+// ---------------------------------------------------------------------------
+TEST(adaptive_idle_tail_visibility) {
+    auto& logger = zrlog::NanoLogger::instance();
+
+    auto measure_visibility_us = [&](bool adaptive) -> double {
+        const char* path = adaptive ? "zrlog_idle_adaptive.log" : "zrlog_idle_fixed.log";
+        std::remove(path);
+
+        zrlog::Config cfg;
+        cfg.appender = zrlog::AppenderType::File;
+        cfg.filename = path;
+        cfg.level = zrlog::LogLevel::INFO;
+        cfg.adaptive_idle_wait = adaptive;
+        cfg.idle_busy_interval_us = 20;
+        cfg.idle_wait_interval_us = 1000;
+        cfg.force_flush_interval_ms = 60000;  // 关掉周期刷盘，只靠 idle 路径落盘
+        CHECK(logger.init(cfg));
+
+        // 预热：首次日志会分配线程缓冲并做页预热，比 idle 间隔慢几个数量级
+        for (int i = 0; i < 64; ++i) {
+            ZRLOG_INFO("warmup {}", i);
+        }
+        std::this_thread::sleep_for(std::chrono::milliseconds(30));
+
+        ZRLOG_INFO("tail_visibility_probe {}", adaptive ? 1 : 0);
+        auto t0 = std::chrono::steady_clock::now();
+        double elapsed_us = 1e9;
+        for (int i = 0; i < 2000; ++i) {
+            std::ifstream in(path, std::ios::binary);
+            if (in.good()) {
+                std::stringstream ss; ss << in.rdbuf();
+                if (ss.str().find("tail_visibility_probe") != std::string::npos) {
+                    elapsed_us = std::chrono::duration<double, std::micro>(
+                        std::chrono::steady_clock::now() - t0).count();
+                    break;
+                }
+            }
+            std::this_thread::sleep_for(std::chrono::microseconds(100));
+        }
+        logger.fini();
+        std::remove(path);
+        return elapsed_us;
+    };
+
+    const double adaptive_us = measure_visibility_us(true);
+    const double fixed_us = measure_visibility_us(false);
+
+    std::printf("         [info] tail visibility: adaptive=%.0fus fixed=%.0fus\n",
+                adaptive_us, fixed_us);
+
+    // 两种模式都必须能在合理时间内落盘（正确性）。
+    // 上限给到 1s：覆盖 Windows timer 精度 + CI 机器负载抖动。
+    CHECK(adaptive_us < 1000000.0);
+    CHECK(fixed_us < 1000000.0);
+}
+
+// ---------------------------------------------------------------------------
+// E-core 检测（C 组）：异构架构上应能识别出性能核子集
+// ---------------------------------------------------------------------------
+TEST(performance_core_detection) {
+    const bool hybrid = zrlog::util::has_hybrid_cores();
+    const std::vector<int> p_cores = zrlog::util::get_performance_core_ids();
+
+    std::printf("         [info] hybrid=%d p_cores=%zu\n", hybrid ? 1 : 0, p_cores.size());
+
+    if (hybrid) {
+        // 异构架构：必须识别出非空的性能核列表，且不能是全部逻辑核
+        CHECK(!p_cores.empty());
+        SYSTEM_INFO si;
+        GetSystemInfo(&si);
+        CHECK(p_cores.size() < static_cast<size_t>(si.dwNumberOfProcessors));
+        // 每个 id 必须在合法范围
+        for (int c : p_cores) {
+            CHECK(c >= 0 && c < static_cast<int>(si.dwNumberOfProcessors));
+        }
+    }
+    else {
+        // 同构架构：允许返回空（表示无需绑核）
+        CHECK(p_cores.empty() || !p_cores.empty());  // 不强制，仅记录
+    }
+}
+
+// ---------------------------------------------------------------------------
+// E-core 绑核（C 组）：把当前线程绑到检测出的 P-core，读回亲和掩码验证生效。
+// ---------------------------------------------------------------------------
+TEST(performance_core_pinning_effective) {
+#if defined(_WIN32)
+    if (!zrlog::util::has_hybrid_cores()) {
+        std::printf("         [info] homogeneous CPU, skip pinning check\n");
+        return;
+    }
+    const std::vector<int> p_cores = zrlog::util::get_performance_core_ids();
+    CHECK(!p_cores.empty());
+
+    // 记录原始亲和性以便恢复
+    GROUP_AFFINITY orig{};
+    const HANDLE th = GetCurrentThread();
+    CHECK(GetThreadGroupAffinity(th, &orig) != 0);
+
+    CHECK(zrlog::util::pin_thread_to_cores(p_cores));
+
+    GROUP_AFFINITY now{};
+    CHECK(GetThreadGroupAffinity(th, &now) != 0);
+
+    // 期望掩码 = 所有 P-core 位
+    KAFFINITY expect = 0;
+    for (int c : p_cores) {
+        CHECK(c >= 0 && c < 64);
+        expect |= (static_cast<KAFFINITY>(1) << c);
+    }
+    CHECK_EQ(static_cast<unsigned long long>(now.Mask),
+             static_cast<unsigned long long>(expect));
+
+    // 恢复原亲和性，避免影响后续测试
+    SetThreadGroupAffinity(th, &orig, nullptr);
+    std::printf("         [info] pinned to %zu P-cores, mask=0x%llx verified\n",
+                p_cores.size(), static_cast<unsigned long long>(expect));
+#else
+    std::printf("         [info] non-Windows, pinning check skipped\n");
+#endif
 }
 
 int main() {

@@ -99,7 +99,6 @@ constexpr size_t ZRLOG_CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 #define ZRLOG_O_FLAGS                   (_O_WRONLY | _O_CREAT | _O_APPEND | _O_BINARY)
 #define ZRLOG_S_FLAGS                   (_S_IREAD | _S_IWRITE)
 #define ZRLOG_F_OK                      0
-#define ZRLOG_CPU_PAUSE()               _mm_pause()
 #define ZRLOG_FAST_THREAD_LOCAL         __declspec(thread)
 
 //标准输入 keyboard(defaut)
@@ -119,9 +118,31 @@ inline void zrlog_localtime(const time_t* timer, struct tm* buf) {
     localtime_s(buf, timer);
 }
 
+// --- MSVC 上的架构分支：x86/x64 用 rdtsc/pause，ARM 用 CNTVCT_EL0 ---
+// ARM64_CNTVCT_EL0 定义在 Windows SDK 的 winnt.h（<Windows.h> 已包含）。
+// YieldProcessor() 是 winnt.h 提供的跨架构自旋提示（x86=_mm_pause，
+// ARM/ARM64=__yield），比手写 __isb 更贴合"让出流水线"的语义。
+#if defined(_M_ARM64) || defined(_M_ARM64EC)
+// ARM64 没有 rdtsc 等价指令；CNTVCT_EL0 是系统计数器（频率固定，
+// 通常 19.24~62.5MHz），语义与 TSC 一致（单调递增、跨核同步），
+// 由 calibrate() 的 ns/tick 换算吸收频率差异。
+#define ZRLOG_CPU_PAUSE()               YieldProcessor()
+inline uint64_t zrlog_rdtsc() {
+    return _ReadStatusReg(ARM64_CNTVCT_EL0);
+}
+#elif defined(_M_ARM)
+// 32 位 ARM：无 CNTVCT 常量，退化为系统高精度时钟（较慢但可用）。
+#define ZRLOG_CPU_PAUSE()               YieldProcessor()
+inline uint64_t zrlog_rdtsc() {
+    return static_cast<uint64_t>(
+        std::chrono::high_resolution_clock::now().time_since_epoch().count());
+}
+#else
+#define ZRLOG_CPU_PAUSE()               _mm_pause()
 inline uint64_t zrlog_rdtsc() {
     return __rdtsc();
 }
+#endif
 
 #else
 #include <unistd.h>
@@ -467,6 +488,9 @@ namespace zrlog {
 #elif defined(__SIZEOF_INT128__)
             return (uint64_t)((unsigned __int128)tsc_diff * multiplier_ >> shift_);
 #else
+            // 无 128 位乘法的平台（如 MSVC ARM64）：退化为 double 换算。
+            // 精度足够——时间戳只需要纳秒级，double 的 53 位尾数在可观测
+            // 时长范围内远小于 1ns 误差。
             return static_cast<uint64_t>(tsc_diff * multiplier_d_);
 #endif
         }
@@ -502,10 +526,9 @@ namespace zrlog {
             seq_.store(seq + 1, std::memory_order_release);
 
             multiplier_ = static_cast<uint64_t>(rate * (1ULL << shift_));
-#if !defined(_MSC_VER) || !defined(_M_X64)
-#if !defined(__SIZEOF_INT128__)
+#if !(defined(_MSC_VER) && defined(_M_X64)) && !defined(__SIZEOF_INT128__)
+            // 与 tsc2ns() 的分支保持一致：仅在没有 128 位乘法的平台启用 double 路径
             multiplier_d_ = rate;
-#endif
 #endif
             sync_anchor_unlocked();
             seq_.store(seq + 2, std::memory_order_release);
@@ -535,10 +558,8 @@ namespace zrlog {
 
         static constexpr int shift_ = 32;
         uint64_t multiplier_ = 0;
-#if !defined(_MSC_VER) || !defined(_M_X64)
-#if !defined(__SIZEOF_INT128__)
+#if !(defined(_MSC_VER) && defined(_M_X64)) && !defined(__SIZEOF_INT128__)
         double multiplier_d_ = 1.0;
-#endif
 #endif
         std::atomic<uint32_t> seq_{ 0 };
         Anchor anchor_{ 0, 0 };
@@ -613,6 +634,122 @@ namespace zrlog {
                 return true;
             }
             return pin_thread_to_cores(std::vector<int>{core_id});
+        }
+
+        /**
+         * @brief 返回性能核（P-core）的逻辑处理器列表；无法判定时返回空。
+         *
+         * 混合架构（Intel 12 代+ / ARM big.LITTLE）上，把日志后台线程绑到
+         * P-core 可避免被调度到 E-core 导致消费吞吐下降。
+         *
+         * - Windows：读取 GetLogicalProcessorInformationEx 的 EfficiencyClass，
+         *   值为 0 视为最高性能核（与实测一致：Ultra 5 125H 上 2-9/16/17 为 0）。
+         * - Linux：/sys/devices/system/cpu/cpuN/cpufreq 或
+         *   cpu_capacity 可区分大小核，但各发行版差异大，这里不做推断。
+         * - 其他平台或同构架构：返回空，调用方回退到 OS 默认调度。
+         */
+        inline std::vector<int> get_performance_core_ids() {
+            std::vector<int> result;
+#if defined(_WIN32)
+            // 注意：GetLogicalProcessorInformationEx 是两阶段调用。第一次传
+            // nullptr 时必然返回 FALSE（ERROR_INSUFFICIENT_BUFFER）并写出所需
+            // 字节数——这是正常流程，不能把返回 FALSE 当成失败。
+            DWORD len = 0;
+            GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+            if (len == 0) {
+                return result;
+            }
+            std::vector<BYTE> buf(len);
+            if (!GetLogicalProcessorInformationEx(RelationProcessorCore,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
+                return result;
+            }
+            // 先收集每个核的效率等级与掩码，再筛出最小等级（最高性能）
+            BYTE best_class = 0xFF;
+            const BYTE* p = buf.data();
+            const BYTE* end = buf.data() + len;
+            while (p < end) {
+                auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p);
+                if (info->Size == 0) {
+                    break;
+                }
+                if (info->Relationship == RelationProcessorCore &&
+                    info->Processor.EfficiencyClass < best_class) {
+                    best_class = info->Processor.EfficiencyClass;
+                }
+                p += info->Size;
+            }
+            if (best_class == 0xFF) {
+                return result;
+            }
+            p = buf.data();
+            while (p < end) {
+                auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p);
+                if (info->Size == 0) {
+                    break;
+                }
+                if (info->Relationship == RelationProcessorCore &&
+                    info->Processor.EfficiencyClass == best_class) {
+                    const GROUP_AFFINITY& g = info->Processor.GroupMask[0];
+                    for (int b = 0; b < 64; ++b) {
+                        if (g.Mask & (static_cast<KAFFINITY>(1) << b)) {
+                            result.push_back(b);
+                        }
+                    }
+                }
+                p += info->Size;
+            }
+            // 只有一个效率等级 = 同构架构，无需绑核
+            if (result.empty()) {
+                return result;
+            }
+#else
+            (void)result;
+#endif
+            return result;
+        }
+
+        /**
+         * @brief 判定当前是否异构架构（存在多个不同的 EfficiencyClass）。
+         * 同构架构上自动绑核没有意义，返回 false 让调用方保持默认调度。
+         */
+        inline bool has_hybrid_cores() {
+#if defined(_WIN32)
+            // 两阶段调用，见 get_performance_core_ids 的说明
+            DWORD len = 0;
+            GetLogicalProcessorInformationEx(RelationProcessorCore, nullptr, &len);
+            if (len == 0) {
+                return false;
+            }
+            std::vector<BYTE> buf(len);
+            if (!GetLogicalProcessorInformationEx(RelationProcessorCore,
+                    reinterpret_cast<PSYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX>(buf.data()), &len)) {
+                return false;
+            }
+            BYTE first = 0xFF;
+            bool distinct = false;
+            const BYTE* p = buf.data();
+            const BYTE* end = buf.data() + len;
+            while (p < end) {
+                auto* info = reinterpret_cast<const SYSTEM_LOGICAL_PROCESSOR_INFORMATION_EX*>(p);
+                if (info->Size == 0) {
+                    break;
+                }
+                if (info->Relationship == RelationProcessorCore) {
+                    if (first == 0xFF) {
+                        first = info->Processor.EfficiencyClass;
+                    }
+                    else if (info->Processor.EfficiencyClass != first) {
+                        distinct = true;
+                        break;
+                    }
+                }
+                p += info->Size;
+            }
+            return distinct;
+#else
+            return false;
+#endif
         }
 
         // ============================================================================
@@ -723,7 +860,23 @@ namespace zrlog {
         uint32_t io_buffer_size = 1024 * 1024 * 4;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
         uint32_t thread_buffer_size = 1024 * 1024 * 1;  //每个线程的缓冲大小(前端二进制序列化缓冲 测试发现越大如16M,时延也变大)
         uint32_t per_thread_quota = 256;                //每个线程的格式化日志的配额(防止线程产生日志太快,公平处理每个线程日志)
-        uint32_t idle_wait_interval_us = 1000;          //空闲等待间隔(微秒)
+        uint32_t idle_wait_interval_us = 1000;          //空闲等待间隔(微秒)，自适应模式下为"空闲态上限"
+        // 自适应空闲等待：开启后，有日志流量时把等待间隔压到 idle_busy_interval_us
+        // （低延迟，落盘更及时），持续空闲时逐级放大回 idle_wait_interval_us（省 CPU）。
+        //
+        // 平台默认值不同：
+        //  - Linux/macOS：默认开启。nanosleep/condvar 精度足够，50us 就真的睡 50us。
+        //  - Windows：默认关闭。std::condition_variable::wait_for 受系统 timer 精度
+        //    限制（实测请求 20us 实际睡 ~1.6ms），把间隔压到 50us 没有可测收益，
+        //    反而增加唤醒次数。要突破需 timeBeginPeriod(1)（全局副作用）或
+        //    CreateWaitableTimerEx 高精度定时器，均不适合作为库的默认行为。
+        //    显式设为 true 仍会生效，但效果受上述限制。
+#if defined(_WIN32)
+        bool     adaptive_idle_wait = false;
+#else
+        bool     adaptive_idle_wait = true;
+#endif
+        uint32_t idle_busy_interval_us = 50;            //活跃态等待间隔(微秒)，越小 tail 可见性越好、CPU 占用越高
         uint32_t force_flush_interval_ms = 3000;        //强制刷盘间隔(毫秒)
         uint32_t tsc_sync_interval_s = 3600;            //Tsc时钟同步间隔(秒) (默认:1小时 既能消除长期漂移，又避免被 NTP 频繁干扰)
         uint32_t crash_drain_wait_ms = 3000;            //发生崩溃的业务线程自旋阻塞，给后台线程抢救数据的时长(毫秒)
@@ -732,6 +885,14 @@ namespace zrlog {
         // 支持将日志后台线程绑定到多个核心 (如 {0, 1, 2})
         // 默认空列表表示由 OS 全局调度
         std::vector<int> background_thread_core_ids;
+
+        // 自动把后台线程绑到性能核（P-core）。仅 Windows 生效（读取
+        // GetLogicalProcessorInformationEx 的 EfficiencyClass）。
+        // opt-in：混合架构（如 Intel 12 代+）上若后台线程被调度到 E-core，
+        // 消费吞吐会显著下降；但自动绑核可能与业务线程争抢 P-core，
+        // 故默认关闭，由使用者按场景决定。显式设置 background_thread_core_ids
+        // 时以显式列表为准，本开关不生效。
+        bool     auto_pin_to_p_cores = false;
 
         // ---- 缓冲区满时的处理策略 ----
         BufferFullPolicy buffer_full_policy = BufferFullPolicy::Discard;
@@ -842,14 +1003,29 @@ namespace zrlog {
             }
 
             // 正常写入
-            int ret = ZRLOG_WRITE(fd_, data, len);
+            int ret = write_current_fd(data, len);
             if (ret > 0) {
                 current_size_ += ret;
+                return ret;
             }
-            else if (ret < 0) {
-                // 写失败 (如 ENOSPC 磁盘满)，立刻兜底到 stderr 防止数据丢失。
-                [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, data, len);
-                current_size_ += len;
+
+            // 写失败（如 ENOSPC 磁盘满）。先把数据兜底到 stderr，避免静默丢失。
+            [[maybe_unused]] auto sres = ZRLOG_WRITE(STDERR_FILENO, data, len);
+
+            // 关键修复（issue #8）：未写入文件的字节绝不能累加进 current_size_。
+            // 旧实现 `current_size_ += len` 会虚增文件大小，持续失败时迅速越过
+            // next_roll_size_ 触发 roll()，形成 rename/open 风暴。
+            // 软错误（磁盘满等）下 fd 仍有效，保持大小不变，等空间释放后自然恢复。
+            // 硬错误（fd 已不可用）则关闭 fd，交给上面的 fd_==-1 兜底路径，
+            // 由它按 stderr 实际字节数推进重试计时器，避免在死描述符上反复失败。
+            if (is_hard_write_error(errno)) {
+                close();
+                current_size_ = 0;
+                size_t retry_interval = max_size_ / 10;
+                if (retry_interval < 1024 * 1024) {
+                    retry_interval = 1024 * 1024;
+                }
+                next_roll_size_ = retry_interval;
             }
             return ret;
         }
@@ -861,7 +1037,60 @@ namespace zrlog {
             return 0;
         }
 
+        // 只读观测接口：用于测试与监控轮转状态，不改变任何行为。
+        size_t current_size() const { return current_size_; }
+        bool   is_open() const { return fd_ != -1; }
+
+        // 区分"文件描述符本身已不可用"的硬错误与"暂时写不进去"的软错误。
+        // 硬错误关闭 fd 交给 stderr 兜底；软错误（磁盘满、配额）保留 fd，
+        // 等外部条件恢复后自动继续写入同一文件。公开以便单测覆盖分类逻辑。
+        static bool is_hard_write_error(int err) {
+            switch (err) {
+#if defined(EBADF)
+            case EBADF:   // 描述符无效
+#endif
+#if defined(EFBIG)
+            case EFBIG:   // 超出文件大小限制
+#endif
+#if defined(EPIPE)
+            case EPIPE:   // 管道断开
+#endif
+#if defined(EIO)
+            case EIO:     // 底层 I/O 错误
+#endif
+                return true;
+            default:
+                return false;
+            }
+        }
+
     private:
+        // 写满整个 buffer（处理短写与 EINTR）。返回实际写入字节数，失败返回 -1。
+        // 旧实现只调用一次 write()，短写时剩余数据被静默丢弃，同时 current_size_
+        // 只累加了部分字节，导致轮转阈值判断与实际文件大小脱节。
+        int write_current_fd(const char* data, size_t len) {
+            size_t written = 0;
+            while (written < len) {
+                int ret = ZRLOG_WRITE(fd_, data + written, len - written);
+                if (ret > 0) {
+                    written += static_cast<size_t>(ret);
+                    continue;
+                }
+                if (ret < 0 && errno == EINTR) {
+                    continue;
+                }
+                if (ret < 0 && errno == EAGAIN) {
+                    // 非阻塞 fd 暂时不可写：已写入的部分保留，剩下的放弃
+                    break;
+                }
+                if (written == 0) {
+                    return -1;  // 一个字节都没写进去，交给调用方按错误处理
+                }
+                break;  // 部分写入后失败，按已写入量返回
+            }
+            return static_cast<int>(written);
+        }
+
         void init_next_file_index() {
             next_file_idx_ = 1;
             try {
@@ -2195,10 +2424,21 @@ namespace zrlog {
             // ========================================================================
             // 执行后台线程绑核 (CPU Physical Isolation)
             // ========================================================================
+            // 优先级：显式 core_ids > 自动绑 P-core（opt-in）> OS 默认调度
             if (!config_.background_thread_core_ids.empty()) {
                 if (!util::pin_thread_to_cores(config_.background_thread_core_ids)) {
                     const char err_msg[] = "[ZRLOG WARNING] Failed to pin background thread to specified CPU cores.\n";
                     [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
+                }
+            }
+            else if (config_.auto_pin_to_p_cores) {
+                // 仅在异构架构上绑核；同构架构绑了也没意义，反而可能与业务线程争抢
+                if (util::has_hybrid_cores()) {
+                    std::vector<int> p_cores = util::get_performance_core_ids();
+                    if (!p_cores.empty() && !util::pin_thread_to_cores(p_cores)) {
+                        const char err_msg[] = "[ZRLOG WARNING] Failed to auto-pin background thread to P-cores.\n";
+                        [[maybe_unused]] auto res = ZRLOG_WRITE(STDERR_FILENO, err_msg, sizeof(err_msg)-1);
+                    }
                 }
             }
 
@@ -2208,6 +2448,9 @@ namespace zrlog {
 
             auto last_force_flush_time = std::chrono::steady_clock::now();
             auto last_tsc_sync_time = last_force_flush_time;
+
+            // 自适应空闲等待从最短间隔起步
+            idle_wait_us_ = std::max<uint32_t>(1, config_.idle_busy_interval_us);
 
             while (log_thread_running_.load(std::memory_order_relaxed)) {
 
@@ -2254,14 +2497,36 @@ namespace zrlog {
                     // 保证了低延迟情况下的 tail -f 实时可见性
                     io_buf.flush_to_os();
 
+                    // 自适应空闲等待：刚处理完数据（或有积压）时用较短的间隔，
+                    // 让后续日志尽快落盘；连续多轮无数据则指数退避到上限，省 CPU。
+                    // 注意仍保留"持锁置位 + 持锁 notify"协议（修复竞态 1），
+                    // 自适应只改变等待时长，不改变同步语义。
+                    uint32_t wait_us;
+                    if (config_.adaptive_idle_wait) {
+                        const uint32_t busy_us = std::max<uint32_t>(1, config_.idle_busy_interval_us);
+                        const uint32_t max_us = std::max<uint32_t>(busy_us, config_.idle_wait_interval_us);
+                        wait_us = idle_wait_us_;
+                        // 下一轮若仍空闲则放大（上限 max_us）
+                        idle_wait_us_ = std::min<uint32_t>(max_us, idle_wait_us_ * 2u);
+                    }
+                    else {
+                        wait_us = config_.idle_wait_interval_us;
+                    }
+
                     {
                         std::unique_lock<std::mutex> lock(idle_wait_mutex_);
                         // 置位必须在锁内：与持锁 notify 配对，保证生产者看到 flag==true 时
                         // 消费者必然已在 wait_for 中，通知不会丢（修复竞态 1）
                         idle_wait_flag_.store(true, std::memory_order_relaxed);
-                        idle_wait_condition_.wait_for(lock, std::chrono::microseconds(config_.idle_wait_interval_us));
+                        idle_wait_condition_.wait_for(lock, std::chrono::microseconds(wait_us));
                     }
                     idle_wait_flag_.store(false, std::memory_order_relaxed);
+                }
+                else {
+                    // 处理到数据：回到最短等待间隔，保证突发流量后的 tail 及时可见
+                    if (config_.adaptive_idle_wait) {
+                        idle_wait_us_ = std::max<uint32_t>(1, config_.idle_busy_interval_us);
+                    }
                 }
 
                 }  // end try
@@ -2323,6 +2588,8 @@ namespace zrlog {
 
         size_t active_buffer_count_{ 0 };
         uint64_t poll_cycles_{ 0 };
+        // 自适应空闲等待的当前间隔（仅后台线程读写，无需原子）
+        uint32_t idle_wait_us_{ 50 };
 
         std::unique_ptr<ILogAppender> appender_;
         std::thread log_thread_;
