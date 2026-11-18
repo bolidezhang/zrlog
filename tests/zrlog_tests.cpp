@@ -682,6 +682,8 @@ TEST(performance_core_detection) {
 
     std::printf("         [info] hybrid=%d p_cores=%zu\n", hybrid ? 1 : 0, p_cores.size());
 
+    // 混合架构检测目前只在 Windows 实现；其他平台恒返回 false / 空。
+#if defined(_WIN32)
     if (hybrid) {
         // 异构架构：必须识别出非空的性能核列表，且不能是全部逻辑核
         CHECK(!p_cores.empty());
@@ -697,6 +699,11 @@ TEST(performance_core_detection) {
         // 同构架构：允许返回空（表示无需绑核）
         CHECK(p_cores.empty() || !p_cores.empty());  // 不强制，仅记录
     }
+#else
+    // 非 Windows：检测未实现，只要求接口可用且不崩溃
+    CHECK(p_cores.empty());
+    CHECK(!hybrid);
+#endif
 }
 
 // ---------------------------------------------------------------------------
