@@ -23,8 +23,8 @@ SOFTWARE.
 #pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.5.0
-#define ZRLOG_VERSION 20500
+// 如：2.5.1
+#define ZRLOG_VERSION 20501
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
@@ -880,7 +880,14 @@ namespace zrlog {
         bool     adaptive_idle_wait = true;
 #endif
         uint32_t idle_busy_interval_us = 50;            //活跃态等待间隔(微秒)，越小 tail 可见性越好、CPU 占用越高
-        uint32_t force_flush_interval_ms = 3000;        //强制刷盘间隔(毫秒)
+        // 周期性强制落盘间隔(毫秒)。0 表示关闭周期 fsync：
+        //   - 日志仍会在空闲/缓冲满时 write 到 OS（page cache），进程正常退出
+        //     时也会 fsync，只是不再每隔 N 毫秒强制刷一次。
+        //   - 关闭后断电/内核崩溃最多丢失 page cache 中的未刷数据。
+        // 适用场景：部署在 SSD/tmpfs 且追求后端吞吐（实测本机 4MB flush 约
+        // 4.1ms，其中 write 1.3ms + fsync 2.8ms，占缓冲填满间隔约 3%）。
+        // 慢盘/网络存储应保持默认值，因为单次 fsync 可达数十毫秒。
+        uint32_t force_flush_interval_ms = 3000;        //强制刷盘间隔(毫秒)，0=关闭周期 fsync
         uint32_t tsc_sync_interval_s = 3600;            //Tsc时钟同步间隔(秒) (默认:1小时 既能消除长期漂移，又避免被 NTP 频繁干扰)
         uint32_t crash_drain_wait_ms = 3000;            //发生崩溃的业务线程自旋阻塞，给后台线程抢救数据的时长(毫秒)
         bool     enable_huge_page = false;              //启用OS的HugePage内存分配
@@ -1897,9 +1904,26 @@ namespace zrlog {
         // 动态 decoder 的错误输出。format_error 时带上原始格式串便于定位；
         // 其他异常只报消息，避免在异常路径上再做一次可能失败的格式化。
         // 本函数自身绝不向外抛异常（A2）。
+        //
+        // 限流：解码失败会逐条计数，但只输出前 kMaxDecodeErrorLines 行。
+        // 若某个 formatter 有 bug 导致大量失败，日志文件不会被错误行淹没；
+        // 通过 NanoLogger::decode_error_count() 仍能看到总数。
+        static constexpr uint64_t kMaxDecodeErrorLines = 100;
+
+        // 解码失败计数器。decoder 是 static 成员，因此计数用函数内静态量而非
+        // 实例成员；消费线程只有一个，但公开访问可能来自其他线程，故用原子量。
+        static std::atomic<uint64_t>& decode_error_count_ref() {
+            static std::atomic<uint64_t> counter{ 0 };
+            return counter;
+        }
+
         static void write_runtime_error_line(IOBuffer& out, const LogMeta& meta,
                                              const char* time_str, uint32_t nano,
                                              const char* what, bool include_format) noexcept {
+            const uint64_t seen = decode_error_count_ref().fetch_add(1, std::memory_order_relaxed) + 1;
+            if (seen > kMaxDecodeErrorLines) {
+                return;  // 已达输出上限，只计数不再写行
+            }
             try {
                 if (ZRLOG_UNLIKELY(out.available_size() < 512)) {
                     out.flush_to_os();
@@ -2030,7 +2054,7 @@ namespace zrlog {
             // 后台（消费者）接口
             // ------------------------------------------------------------------------
             LogEntryHeader* try_read() {
-                // 【消费者全本地化】
+                //【消费者全本地化】
                 // 消费者直接使用本地游标 local_read_index_，完全避开 atomic load
                 uint64_t r = local_read_index_;
 
@@ -2528,75 +2552,78 @@ namespace zrlog {
                 // 单轮失败只跳过本轮，下轮继续，保证日志系统自身不拖垮进程。
                 try {
 
-                // 【崩溃检测】发现发生严重崩溃，立即启动抢救式全量 Drain
-                if (ZRLOG_UNLIKELY(is_crashed_.load(std::memory_order_acquire))) {
-                    while (consume_buffers_round_robin(local_log_metas, io_buf, true) > 0) {
+                    // 【崩溃检测】发现发生严重崩溃，立即启动抢救式全量 Drain
+                    if (ZRLOG_UNLIKELY(is_crashed_.load(std::memory_order_acquire))) {
+                        while (consume_buffers_round_robin(local_log_metas, io_buf, true) > 0) {
+                        }
+                        io_buf.flush_force();
+                        crash_drain_done_.store(true, std::memory_order_release);
+                        return; // 抢救完毕，安全退出
                     }
-                    io_buf.flush_force();
-                    crash_drain_done_.store(true, std::memory_order_release);
-                    return; // 抢救完毕，安全退出
-                }
 
-                size_t process_count = consume_buffers_round_robin(local_log_metas, io_buf, false);
-                auto now = std::chrono::steady_clock::now();
+                    size_t process_count = consume_buffers_round_robin(local_log_metas, io_buf, false);
+                    auto now = std::chrono::steady_clock::now();
 
-                // ========================================================================
-                // 周期性物理落盘(防断电/内核崩溃)
-                // ========================================================================
-                // 无论系统是处于空闲还是极端高负载，间隔force_flush_interval时长必然触发一次真实的 fsync
-                // 这保证了在面临机柜断电等最高级别物理灾难时，最多只丢失 force_flush_interval 毫秒的日志
-                auto force_flush_interval = std::chrono::milliseconds(config_.force_flush_interval_ms);
-                if (ZRLOG_UNLIKELY(now - last_force_flush_time >= force_flush_interval)) {
-                    io_buf.flush_force();
-                    last_force_flush_time = now;
-                }
-                // ========================================================================
-                // 周期性 TSC 时钟漂移校准 (以tsc_sync_interval为间隔)
-                // ========================================================================
-                auto tsc_sync_interval = std::chrono::seconds(config_.tsc_sync_interval_s);
-                if (ZRLOG_UNLIKELY(now - last_tsc_sync_time >= tsc_sync_interval)) {
-                    // 使用已有的 sync_system_time，它利用 seq_ 实现了 Seqlock，
-                    // 保证前端线程读取时间时绝不会读到撕裂的 base_ns 和 base_tsc
-                    TscClock::instance().sync_system_time();
-                    last_tsc_sync_time = now;
-                }
+                    // ========================================================================
+                    // 周期性物理落盘(防断电/内核崩溃)
+                    // ========================================================================
+                    // 无论系统是处于空闲还是极端高负载，间隔force_flush_interval时长必然触发一次真实的 fsync
+                    // 这保证了在面临机柜断电等最高级别物理灾难时，最多只丢失 force_flush_interval 毫秒的日志
+                    // force_flush_interval_ms == 0 表示关闭周期 fsync（见 Config 注释）。
+                    if (ZRLOG_UNLIKELY(config_.force_flush_interval_ms != 0)) {
+                        auto force_flush_interval = std::chrono::milliseconds(config_.force_flush_interval_ms);
+                        if (ZRLOG_UNLIKELY(now - last_force_flush_time >= force_flush_interval)) {
+                            io_buf.flush_force();
+                            last_force_flush_time = now;
+                        }
+                    }
+                    // ========================================================================
+                    // 周期性 TSC 时钟漂移校准 (以tsc_sync_interval为间隔)
+                    // ========================================================================
+                    auto tsc_sync_interval = std::chrono::seconds(config_.tsc_sync_interval_s);
+                    if (ZRLOG_UNLIKELY(now - last_tsc_sync_time >= tsc_sync_interval)) {
+                        // 使用已有的 sync_system_time，它利用 seq_ 实现了 Seqlock，
+                        // 保证前端线程读取时间时绝不会读到撕裂的 base_ns 和 base_tsc
+                        TscClock::instance().sync_system_time();
+                        last_tsc_sync_time = now;
+                    }
 
-                if (process_count < 1) {  // idle
-                    // 空闲时，立刻将当前用户态缓冲交由操作系统 (Page Cache)
-                    // 保证了低延迟情况下的 tail -f 实时可见性
-                    io_buf.flush_to_os();
+                    if (process_count < 1) {  // idle
+                        // 空闲时，立刻将当前用户态缓冲交由操作系统 (Page Cache)
+                        // 保证了低延迟情况下的 tail -f 实时可见性
+                        io_buf.flush_to_os();
 
-                    // 自适应空闲等待：刚处理完数据（或有积压）时用较短的间隔，
-                    // 让后续日志尽快落盘；连续多轮无数据则指数退避到上限，省 CPU。
-                    // 注意仍保留"持锁置位 + 持锁 notify"协议（修复竞态 1），
-                    // 自适应只改变等待时长，不改变同步语义。
-                    uint32_t wait_us;
-                    if (config_.adaptive_idle_wait) {
-                        const uint32_t busy_us = std::max<uint32_t>(1, config_.idle_busy_interval_us);
-                        const uint32_t max_us = std::max<uint32_t>(busy_us, config_.idle_wait_interval_us);
-                        wait_us = idle_wait_us_;
-                        // 下一轮若仍空闲则放大（上限 max_us）
-                        idle_wait_us_ = std::min<uint32_t>(max_us, idle_wait_us_ * 2u);
+                        // 自适应空闲等待：刚处理完数据（或有积压）时用较短的间隔，
+                        // 让后续日志尽快落盘；连续多轮无数据则指数退避到上限，省 CPU。
+                        // 注意仍保留"持锁置位 + 持锁 notify"协议（修复竞态 1），
+                        // 自适应只改变等待时长，不改变同步语义。
+                        uint32_t wait_us;
+                        if (config_.adaptive_idle_wait) {
+                            const uint32_t busy_us = std::max<uint32_t>(1, config_.idle_busy_interval_us);
+                            const uint32_t max_us = std::max<uint32_t>(busy_us, config_.idle_wait_interval_us);
+                            wait_us = idle_wait_us_;
+                            // 下一轮若仍空闲则放大（上限 max_us）
+                            idle_wait_us_ = std::min<uint32_t>(max_us, idle_wait_us_ * 2u);
+                        }
+                        else {
+                            wait_us = config_.idle_wait_interval_us;
+                        }
+
+                        {
+                            std::unique_lock<std::mutex> lock(idle_wait_mutex_);
+                            // 置位必须在锁内：与持锁 notify 配对，保证生产者看到 flag==true 时
+                            // 消费者必然已在 wait_for 中，通知不会丢（修复竞态 1）
+                            idle_wait_flag_.store(true, std::memory_order_relaxed);
+                            idle_wait_condition_.wait_for(lock, std::chrono::microseconds(wait_us));
+                        }
+                        idle_wait_flag_.store(false, std::memory_order_relaxed);
                     }
                     else {
-                        wait_us = config_.idle_wait_interval_us;
+                        // 处理到数据：回到最短等待间隔，保证突发流量后的 tail 及时可见
+                        if (config_.adaptive_idle_wait) {
+                            idle_wait_us_ = std::max<uint32_t>(1, config_.idle_busy_interval_us);
+                        }
                     }
-
-                    {
-                        std::unique_lock<std::mutex> lock(idle_wait_mutex_);
-                        // 置位必须在锁内：与持锁 notify 配对，保证生产者看到 flag==true 时
-                        // 消费者必然已在 wait_for 中，通知不会丢（修复竞态 1）
-                        idle_wait_flag_.store(true, std::memory_order_relaxed);
-                        idle_wait_condition_.wait_for(lock, std::chrono::microseconds(wait_us));
-                    }
-                    idle_wait_flag_.store(false, std::memory_order_relaxed);
-                }
-                else {
-                    // 处理到数据：回到最短等待间隔，保证突发流量后的 tail 及时可见
-                    if (config_.adaptive_idle_wait) {
-                        idle_wait_us_ = std::max<uint32_t>(1, config_.idle_busy_interval_us);
-                    }
-                }
 
                 }  // end try
                 catch (const std::exception& e) {
@@ -2687,6 +2714,12 @@ namespace zrlog {
         size_t log_meta_count() const {
             std::lock_guard<SpinMutex> lock(const_cast<SpinMutex&>(log_metas_mutex_));
             return global_log_metas_.size();
+        }
+
+        // 解码失败总数（含因限流未输出到日志文件的部分）。
+        // 非零说明有 formatter 抛异常或格式串与参数不匹配，值得排查。
+        uint64_t decode_error_count() const {
+            return decode_error_count_ref().load(std::memory_order_relaxed);
         }
 
         //崩溃状态标识

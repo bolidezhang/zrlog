@@ -225,7 +225,7 @@ TEST(config_defaults) {
     CHECK_EQ(c.rotating_file_size, 100u * 1024u * 1024u);
     CHECK_EQ(c.rotating_max_files, 5u);
 
-    CHECK_EQ(static_cast<uint32_t>(ZRLOG_VERSION), 20500u);
+    CHECK_EQ(static_cast<uint32_t>(ZRLOG_VERSION), 20501u);
 }
 
 // ---------------------------------------------------------------------------
@@ -792,6 +792,106 @@ TEST(late_registration_not_lost) {
 
     const size_t lines = static_cast<size_t>(std::count(c.begin(), c.end(), '\n'));
     CHECK_EQ(lines, static_cast<size_t>(200 + 50 + 50));
+}
+
+// ---------------------------------------------------------------------------
+// 解码错误计数与限流（C 组）：大量 formatter 失败时，
+//   1) decode_error_count() 反映真实失败次数
+//   2) 日志文件里的 [FMT_ERROR] 行数被限制在 kMaxDecodeErrorLines 以内
+// ---------------------------------------------------------------------------
+struct AlwaysThrows {};
+template <>
+struct fmt::formatter<AlwaysThrows> {
+    constexpr auto parse(format_parse_context& ctx) { return ctx.begin(); }
+    template <typename Ctx>
+    auto format(const AlwaysThrows&, Ctx& ctx) const -> decltype(ctx.out()) {
+        throw std::runtime_error("always throws");
+    }
+};
+
+TEST(decode_error_counting_and_throttle) {
+    const char* path = "zrlog_err_count.log";
+    std::remove(path);
+
+    zrlog::Config cfg;
+    cfg.appender = zrlog::AppenderType::File;
+    cfg.filename = path;
+    cfg.level = zrlog::LogLevel::INFO;
+    cfg.force_flush_interval_ms = 30;
+    auto& logger = zrlog::NanoLogger::instance();
+    CHECK(logger.init(cfg));
+
+    const uint64_t before = logger.decode_error_count();
+
+    // 投 300 条必失败的日志（超过 100 行的输出上限）
+    constexpr int kFailures = 300;
+    for (int i = 0; i < kFailures; ++i) {
+        ZRLOG_DYN_INFO(std::string("boom {}"), AlwaysThrows{});
+    }
+    // 再来一条正常日志，确认系统仍可用
+    ZRLOG_INFO("still_alive {}", 1);
+    std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    logger.fini();
+
+    const uint64_t after = logger.decode_error_count();
+    const uint64_t delta = after - before;
+
+    std::ifstream in(path, std::ios::binary);
+    std::stringstream ss; ss << in.rdbuf();
+    const std::string c = ss.str();
+    std::remove(path);
+
+    // 统计文件中 [FMT_ERROR] 出现次数
+    size_t err_lines = 0;
+    for (size_t pos = c.find("[FMT_ERROR]"); pos != std::string::npos;
+         pos = c.find("[FMT_ERROR]", pos + 1)) {
+        ++err_lines;
+    }
+
+    std::printf("         [info] decode_errors=%llu err_lines_in_file=%zu\n",
+                (unsigned long long)delta, err_lines);
+
+    // 失败计数必须接近实际投毒条数（可能因缓冲丢弃略少，但不该为 0）
+    CHECK(delta > 0);
+    CHECK(delta <= static_cast<uint64_t>(kFailures));
+    // 输出行数必须被限流（上限 100），不能等于 300
+    CHECK(err_lines > 0);
+    CHECK(err_lines <= static_cast<size_t>(100));
+    // 正常日志不受影响
+    CHECK(c.find("still_alive 1") != std::string::npos);
+}
+
+// ---------------------------------------------------------------------------
+// 周期 fsync 可关闭（C 组）：force_flush_interval_ms = 0 时
+// 日志仍能正常落盘（靠空闲/缓冲满/退出时的 flush），只是没有周期 fsync。
+// ---------------------------------------------------------------------------
+TEST(force_flush_can_be_disabled) {
+    const char* path = "zrlog_no_periodic_fsync.log";
+    std::remove(path);
+
+    zrlog::Config cfg;
+    cfg.appender = zrlog::AppenderType::File;
+    cfg.filename = path;
+    cfg.level = zrlog::LogLevel::INFO;
+    cfg.force_flush_interval_ms = 0;   // 关闭周期 fsync
+    auto& logger = zrlog::NanoLogger::instance();
+    CHECK(logger.init(cfg));
+
+    for (int i = 0; i < 200; ++i) {
+        ZRLOG_INFO("no_periodic_fsync {}", i);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    logger.fini();   // 退出路径仍会 flush_force
+
+    std::ifstream in(path, std::ios::binary);
+    std::stringstream ss; ss << in.rdbuf();
+    const std::string c = ss.str();
+    std::remove(path);
+
+    CHECK(c.find("no_periodic_fsync 0") != std::string::npos);
+    CHECK(c.find("no_periodic_fsync 199") != std::string::npos);
+    const size_t lines = static_cast<size_t>(std::count(c.begin(), c.end(), '\n'));
+    CHECK_EQ(lines, static_cast<size_t>(200));
 }
 
 int main() {
