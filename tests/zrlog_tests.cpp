@@ -739,6 +739,61 @@ TEST(performance_core_pinning_effective) {
 #endif
 }
 
+// ---------------------------------------------------------------------------
+// 注册与消费并发（B 组快速路径）：消费者已在运行时才出现新调用点，
+// 新 meta 必须仍被及时同步，日志不得丢失。
+// 快速路径用原子计数判断"是否有新 meta"，此处专门验证该判断不漏。
+// ---------------------------------------------------------------------------
+TEST(late_registration_not_lost) {
+    const char* path = "zrlog_late_reg.log";
+    std::remove(path);
+
+    zrlog::Config cfg;
+    cfg.appender = zrlog::AppenderType::File;
+    cfg.filename = path;
+    cfg.level = zrlog::LogLevel::INFO;
+    cfg.force_flush_interval_ms = 30;
+    cfg.idle_wait_interval_us = 200;
+    auto& logger = zrlog::NanoLogger::instance();
+    CHECK(logger.init(cfg));
+
+    // 先让消费者跑起来并进入稳态（此时还没有 "late" 这个调用点）
+    for (int i = 0; i < 200; ++i) {
+        ZRLOG_INFO("warm {}", i);
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(80));
+
+    // 现在才首次使用一个新的调用点 -> 触发注册
+    for (int i = 0; i < 50; ++i) {
+        ZRLOG_WARN("late_marker {}", i);
+    }
+    // 另一个新调用点，由独立线程在消费进行中注册
+    std::thread late_thread([] {
+        for (int i = 0; i < 50; ++i) {
+            ZRLOG_ERROR("late_thread_marker {}", i);
+        }
+    });
+    late_thread.join();
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(150));
+    logger.fini();
+
+    std::ifstream in(path, std::ios::binary);
+    std::stringstream ss; ss << in.rdbuf();
+    const std::string c = ss.str();
+    std::remove(path);
+
+    // 两个后注册的调用点都必须完整渲染，不能因快速路径跳过同步而丢失/错乱
+    CHECK(c.find("late_marker 0") != std::string::npos);
+    CHECK(c.find("late_marker 49") != std::string::npos);
+    CHECK(c.find("late_thread_marker 0") != std::string::npos);
+    CHECK(c.find("late_thread_marker 49") != std::string::npos);
+    CHECK(c.find("warm 199") != std::string::npos);
+
+    const size_t lines = static_cast<size_t>(std::count(c.begin(), c.end(), '\n'));
+    CHECK_EQ(lines, static_cast<size_t>(200 + 50 + 50));
+}
+
 int main() {
     std::cout << "zrlog unit tests (" << zrt::registry().size() << " cases)\n";
     int failed = 0;

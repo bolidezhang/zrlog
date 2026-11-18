@@ -454,8 +454,11 @@ namespace zrlog {
             return anc.base_ns + tsc2ns(tsc - anc.base_tsc);
         }
 
+        // 当前时刻的 ns 时间戳（"i" 表示不保证与系统时钟严格一致，用于低开销场景）。
+        // 走与 tsc_to_unix_ns 相同的 seqlock，避免读到被 sync_system_time()
+        // 撕裂的 base_ns/base_tsc。
         inline uint64_t current_time_ns_i() const {
-            return anchor_.base_ns + tsc2ns(zrlog_rdtsc() - anchor_.base_tsc);
+            return tsc_to_unix_ns(zrlog_rdtsc());
         }
 
         // 把前端记录的原始 TSC 计数换算成绝对 Unix 纳秒时间戳（供后端解码使用）。
@@ -2231,6 +2234,7 @@ namespace zrlog {
             new_log.func = func;
             new_log.decoder = &generated_decoder<FmtProvider, Args...>;
             global_log_metas_.push_back(std::move(new_log));
+            meta_count_hint_.store(global_log_metas_.size(), std::memory_order_release);
 
             log_id_atom.store(new_id, std::memory_order_relaxed);
             return new_id;
@@ -2266,6 +2270,7 @@ namespace zrlog {
             new_log.format = std::string(format);
             new_log.decoder = &generated_runtime_decoder<Args...>;
             global_log_metas_.push_back(std::move(new_log));
+            meta_count_hint_.store(global_log_metas_.size(), std::memory_order_release);
 
             log_id_atom.store(new_id, std::memory_order_relaxed);
             return new_id;
@@ -2277,35 +2282,48 @@ namespace zrlog {
                 thread_buffer_destroyer_.init(this);
                 std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
                 thread_buffers_.push_back(thread_buffer_);
+                buffer_count_hint_.store(buffer_count_hint_.load(std::memory_order_relaxed) + 1,
+                                         std::memory_order_release);
             }
             return thread_buffer_;
         }
 
         size_t consume_buffers_round_robin(std::vector<LogMeta>& local_log_metas, IOBuffer& io_buf, bool full_drain = false) {
             size_t processed_count = 0;
+            // 消费侧统计：本轮在局部变量里累加，函数末尾一次性提交到原子量。
+            // 每条日志做两次 fetch_add（lock xadd，约 20 周期）在高吞吐下是
+            // 可观的开销，而消费者本来就是单线程，没有并发写者。
+            uint64_t local_consumed = 0;
+            uint64_t local_consumed_valid = 0;
             // 崩溃抢救路径：垂死线程可能正持有某把锁，此时强自旋会永久卡死，
             // 使抢救失败。故崩溃模式下改用 try_lock，抢不到就跳过本次同步，
             // 用已缓存的元数据/缓冲尽力输出剩余日志。
             const bool crashed = is_crashed_.load(std::memory_order_acquire);
 
             {
-                // 追加日志元数据到本地集合
-                if (crashed) {
-                    if (log_metas_mutex_.try_lock()) {
+                // 快速路径：注册计数没变化就不必抢锁。这个判断是无锁的，
+                // 高频轮询（每轮都会走到这里）时可省掉一次自旋锁的
+                // test_and_set + 缓存行失效。
+                const bool maybe_new_meta =
+                    meta_count_hint_.load(std::memory_order_acquire) > local_log_metas.size();
+                if (maybe_new_meta) {
+                    if (crashed) {
+                        if (log_metas_mutex_.try_lock()) {
+                            if (global_log_metas_.size() > local_log_metas.size()) {
+                                local_log_metas.insert(local_log_metas.end(),
+                                    global_log_metas_.begin() + local_log_metas.size(),
+                                    global_log_metas_.end());
+                            }
+                            log_metas_mutex_.unlock();
+                        }
+                    }
+                    else {
+                        std::lock_guard<SpinMutex> lock(log_metas_mutex_);
                         if (global_log_metas_.size() > local_log_metas.size()) {
                             local_log_metas.insert(local_log_metas.end(),
                                 global_log_metas_.begin() + local_log_metas.size(),
                                 global_log_metas_.end());
                         }
-                        log_metas_mutex_.unlock();
-                    }
-                }
-                else {
-                    std::lock_guard<SpinMutex> lock(log_metas_mutex_);
-                    if (global_log_metas_.size() > local_log_metas.size()) {
-                        local_log_metas.insert(local_log_metas.end(),
-                            global_log_metas_.begin() + local_log_metas.size(),
-                            global_log_metas_.end());
                     }
                 }
             }
@@ -2313,20 +2331,28 @@ namespace zrlog {
                 // 【连续内存预取】将新增的 Buffer 高效转移到后台集合
                 // 注意：新加入的 Buffer 都在 vector 尾部，天生属于“非活跃区”，
                 // 下一次纪元扫描时如果有数据，自然会被提拔到前面。
-                if (crashed) {
-                    if (thread_buffers_mutex_.try_lock()) {
+                // 与"累计并入数"比较，而非 bg_.size()：线程退出会从 bg_ 删除条目，
+                // 用 size() 会让该不等式永久成立、快速路径失效。
+                const bool maybe_new_buffer =
+                    buffer_count_hint_.load(std::memory_order_acquire) > buffers_merged_total_;
+                if (maybe_new_buffer) {
+                    if (crashed) {
+                        if (thread_buffers_mutex_.try_lock()) {
+                            if (!thread_buffers_.empty()) {
+                                buffers_merged_total_ += thread_buffers_.size();
+                                thread_buffers_bg_.insert(thread_buffers_bg_.end(), thread_buffers_.begin(), thread_buffers_.end());
+                                thread_buffers_.clear();
+                            }
+                            thread_buffers_mutex_.unlock();
+                        }
+                    }
+                    else {
+                        std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
                         if (!thread_buffers_.empty()) {
+                            buffers_merged_total_ += thread_buffers_.size();
                             thread_buffers_bg_.insert(thread_buffers_bg_.end(), thread_buffers_.begin(), thread_buffers_.end());
                             thread_buffers_.clear();
                         }
-                        thread_buffers_mutex_.unlock();
-                    }
-                }
-                else {
-                    std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
-                    if (!thread_buffers_.empty()) {
-                        thread_buffers_bg_.insert(thread_buffers_bg_.end(), thread_buffers_.begin(), thread_buffers_.end());
-                        thread_buffers_.clear();
                     }
                 }
             }
@@ -2357,7 +2383,7 @@ namespace zrlog {
                 // --- 业务消费逻辑开始 ---
                 while ((quota > 0) && (header = tb->try_read())) {
                     current_buffer_has_data = true; // 标记本轮读到了数据
-                    stat_consume_count_.fetch_add(1, std::memory_order_relaxed);
+                    ++local_consumed;
                     ++processed_count;
                     --quota;
 
@@ -2370,7 +2396,7 @@ namespace zrlog {
                         const LogMeta& meta = local_log_metas[header->log_id];
                         char* args_ptr = (char*)header + sizeof(LogEntryHeader);
                         meta.decoder(args_ptr, meta, *header, tb->thread_id(), io_buf);
-                        stat_consume_valid_count_.fetch_add(1, std::memory_order_relaxed);
+                        ++local_consumed_valid;
                     }
                     else {  // header->log_id 无效时，尝试再次拉取元数据
                         {
@@ -2386,7 +2412,7 @@ namespace zrlog {
                             const LogMeta& meta = local_log_metas[header->log_id];
                             char* args_ptr = (char*)header + sizeof(LogEntryHeader);
                             meta.decoder(args_ptr, meta, *header, tb->thread_id(), io_buf);
-                            stat_consume_valid_count_.fetch_add(1, std::memory_order_relaxed);
+                            ++local_consumed_valid;
                         }
                     }
                 }
@@ -2453,6 +2479,12 @@ namespace zrlog {
                 }
             } // end for
 
+            if (local_consumed != 0) {
+                stat_consume_count_.fetch_add(local_consumed, std::memory_order_relaxed);
+            }
+            if (local_consumed_valid != 0) {
+                stat_consume_valid_count_.fetch_add(local_consumed_valid, std::memory_order_relaxed);
+            }
             return processed_count;
         }
 
@@ -2625,6 +2657,13 @@ namespace zrlog {
 
         size_t active_buffer_count_{ 0 };
         uint64_t poll_cycles_{ 0 };
+        // 无锁"是否有新注册"提示：注册侧 store 总条数，消费侧先读它，
+        // 只有确实变多了才去抢自旋锁。省掉高频轮询时的无谓加锁。
+        std::atomic<size_t> meta_count_hint_{ 1 };    // 1 = 占位 meta(id=0)
+        std::atomic<size_t> buffer_count_hint_{ 0 };
+        // 累计已并入后台集合的 buffer 数（仅消费线程写）。与 buffer_count_hint_
+        // 比较判断是否有新 buffer，不受线程退出删除条目影响。
+        size_t buffers_merged_total_{ 0 };
         // 自适应空闲等待的当前间隔（仅后台线程读写，无需原子）
         uint32_t idle_wait_us_{ 50 };
 
