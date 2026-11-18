@@ -1318,7 +1318,8 @@ namespace zrlog {
     class NanoLogger {
     public:
         class IOBuffer;
-        class ThreadBuffer;
+        // ThreadBuffer 是内部实现，前置声明放在 private 区（与定义同区，
+        // 否则 GCC 报 "redeclared with different access"；MSVC 容忍该写法）。
         struct LogMeta;
         struct LogEntryHeader;
         using DecoderFn = void(*)(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out);
@@ -1616,6 +1617,8 @@ namespace zrlog {
         }
 
     private:
+
+        class ThreadBuffer;
 
         // 生产者统计：热路径只累加 ThreadBuffer 内的生产者私有计数器（前端已持有
         // buffer 指针，无额外 TLS 寻址），每 1024 次才汇总到全局原子量。直接在每条
