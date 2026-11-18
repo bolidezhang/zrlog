@@ -13,6 +13,9 @@ endif()
 
 option(ZRLOG_BUILD_BENCHMARK "构建性能基准 benchmark_zrlog" ON)
 option(ZRLOG_BUILD_TESTS "构建单元测试" ON)
+# 跨库对比基准（spdlog/fmtlog/NanoLog）。默认关闭：配置时需要联网克隆
+# 第三方仓库，不适合作为默认构建的一部分。
+option(ZRLOG_BUILD_CROSS_BENCH "构建跨库对比基准 bench/（需联网下载第三方库）" OFF)
 
 find_package(Threads REQUIRED)
 
@@ -67,6 +70,14 @@ if(ZRLOG_BUILD_BENCHMARK)
     add_executable(benchmark_zrlog benchmark_zrlog.cpp)
     target_link_libraries(benchmark_zrlog PRIVATE zrlog)
     zrlog_apply_build_flags(benchmark_zrlog)
+endif()
+
+# ============================================================================
+# 跨库对比基准（zrlog vs spdlog / fmtlog / NanoLog）
+# ============================================================================
+if(ZRLOG_BUILD_CROSS_BENCH)
+    enable_testing()   # FetchContent 内部可能用到
+    add_subdirectory(bench)
 endif()
 
 # ============================================================================

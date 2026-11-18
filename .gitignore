@@ -4,9 +4,11 @@
 benchmark_zrlog
 benchmark_zrlog.exe
 build/
+build-bench/
 
 # Benchmark executables and object files (sources under bench/ are tracked)
 bench/bin/
+_bench_deps/
 
 # Benchmark / test log output
 *.log

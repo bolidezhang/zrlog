@@ -21,14 +21,40 @@ code in `bench_common.h` is shared so the methodology is identical.
 
 ## Requirements
 
-Third-party sources are not vendored. Provide a directory containing:
+Third-party sources are not vendored. `bench/CMakeLists.txt` fetches them at
+configure time (spdlog v1.17.0, fmtlog main, NanoLog master), so the simplest
+route needs only network access:
+
+```sh
+cmake -S . -B build-bench -DZRLOG_BUILD_CROSS_BENCH=ON
+cmake --build build-bench --config Release
+```
+
+To use pre-cloned sources instead (offline / slow network), point at a root
+that holds `spdlog/`, `fmtlog/` and `nanolog/`:
+
+```sh
+cmake -S . -B build-bench -DZRLOG_BUILD_CROSS_BENCH=ON \
+      -DZRLOG_BENCH_FETCH_DEPS=OFF -DZRLOG_BENCH_DEPS=/path/to/deps
+```
+
+Per-dependency overrides also work: `-DFETCHCONTENT_SOURCE_DIR_SPDLOG=...`,
+`_FMTLOG=...`, `_NANOLOG=...`.
+
+Expected layout of a pre-cloned deps root:
 
 ```
-<spdlog>/include/      gabime/spdlog v1.x
-<fmtlog>/              MengRao/fmtlog (fmtlog.h, fmtlog-inl.h, fmtlog.cc)
+<deps>/
+  spdlog/include/            gabime/spdlog v1.x
+  fmtlog/                    MengRao/fmtlog (fmtlog.cc)
+  nanolog/runtime/           PlatformLab/NanoLog, after `make libNanoLog.a`
 ```
 
-NanoLog is Linux-only (POSIX AIO) and is skipped on Windows.
+fmtlog's own fmt submodule is empty upstream; the CMake build reuses the fmt
+bundled with zrlog. NanoLog is Linux-only and is skipped on Windows.
+
+Binaries land in `build-bench/bench/bin/<config>/` (multi-config generators
+add the config directory).
 
 ## Windows
 
