@@ -26,7 +26,11 @@ for ((r=0; r<ROUNDS; ++r)); do
   done
   echo "== round $r order: ${rotated[*]} =="
   for lib in "${rotated[@]}"; do
-    timeout 300 "$BIN_DIR/bin_$lib" "$THREADS" "$PER" both \
+    if [ ! -x "$BIN_DIR/bin/bench_$lib" ]; then
+      echo "  $lib: binary missing, run build_bench.sh first" >&2
+      continue
+    fi
+    timeout 300 "$BIN_DIR/bin/bench_$lib" "$THREADS" "$PER" both \
       | grep -E 'LATENCY|THROUGHPUT|^  ' >> "$OUT/$lib.txt"
     echo "  $lib done"
   done

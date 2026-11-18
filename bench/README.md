@@ -47,16 +47,18 @@ topology tool to find them.
 
 ## Linux
 
-Build the same three sources with GCC/Clang plus NanoLog:
-
 ```sh
-# NanoLog runtime first
-git clone https://github.com/PlatformLab/NanoLog && cd NanoLog/runtime && make libNanoLog.a
+# 1) NanoLog runtime first (Linux only)
+git clone https://github.com/PlatformLab/NanoLog
+make -C NanoLog/runtime libNanoLog.a
 
-g++ -std=c++17 -O3 -march=native -DNDEBUG -pthread -I. -Ifmt/include \
-    bench/bench_zrlog.cpp -o bin_zrlog
-# spdlog / fmtlog / nanolog similarly (see run_bench.sh for the loop)
+# 2) build (spdlog/fmtlog/nanolog auto-skipped if absent)
+export ZRLOG_BENCH_DEPS=/path/to/deps   # holds spdlog/, fmtlog/, nanolog/
+bench/build_bench.sh
+
+# 3) run
 bench/run_bench.sh 7 4 4000000
+python3 bench/aggregate.py bench/results
 ```
 
 ## Reading the results
