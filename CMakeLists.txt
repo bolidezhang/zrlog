@@ -114,6 +114,19 @@ if(ZRLOG_BUILD_TESTS)
              WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
     set_tests_properties(zrlog_exception_barrier PROPERTIES TIMEOUT 60)
 
+    # 毒丸消息：decoder 抛任意异常时不得堵塞后台线程（曾导致 fini() 永久挂起）
+    add_executable(zrlog_poison_test tests/poison_test.cpp)
+    target_link_libraries(zrlog_poison_test PRIVATE zrlog)
+    if(MSVC)
+        target_compile_options(zrlog_poison_test PRIVATE /W4)
+    else()
+        target_compile_options(zrlog_poison_test PRIVATE -Wall -Wextra)
+    endif()
+    add_test(NAME zrlog_poison_pill
+             COMMAND zrlog_poison_test
+             WORKING_DIRECTORY ${CMAKE_CURRENT_BINARY_DIR})
+    set_tests_properties(zrlog_poison_pill PROPERTIES TIMEOUT 60)
+
     # 崩溃抢救：子进程触发 SIGSEGV，父进程校验崩溃前日志已落盘
     # （仅 Windows：使用 CreateProcess 隔离崩溃，避免父进程被信号杀死）
     if(WIN32)

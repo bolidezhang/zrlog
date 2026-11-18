@@ -908,28 +908,26 @@ namespace zrlog {
         virtual ~ILogAppender() = default;
 
         int writen(const char* data, size_t len) {
-            char* ptr = const_cast<char*>(data);
+            const char* ptr = data;
             size_t nleft = len;
-            int ret;
 
-            do {
-                ret = write(ptr, nleft);
+            while (nleft > 0) {
+                int ret = write(ptr, nleft);
                 if (ret > 0) {
-                    nleft -= ret;
+                    nleft -= static_cast<size_t>(ret);
                     ptr += ret;
+                    continue;
                 }
-                else if (ret < 0) {
-                    if (errno == EINTR || errno == EAGAIN) {
-                        continue;
-                    }
-                    break;
+                if (ret < 0 && errno == EINTR) {
+                    continue;  // 被信号打断，重试是安全的
                 }
-                else {
-                    break;
-                }
-            } while (nleft > 0);
+                // EAGAIN/EWOULDBLOCK 表示 fd 暂时不可写。旧实现直接 continue，
+                // 会在非阻塞 fd 上无限忙等并占满消费线程。这里改为放弃剩余部分，
+                // 让调用方（IOBuffer）按已写字节数处理。
+                break;
+            }
 
-            return (len - nleft);
+            return static_cast<int>(len - nleft);
         }
 
         virtual int write(const char* data, size_t len) = 0;
@@ -1769,30 +1767,13 @@ namespace zrlog {
                     }
                 }
                 catch (const std::exception& e) {
-                    write_error_line(out, meta, time_str, nano, e.what());
+                    write_runtime_error_line(out, meta, time_str, nano, e.what(), false);
                 }
                 catch (...) {
-                    write_error_line(out, meta, time_str, nano, "unknown exception");
+                    write_runtime_error_line(out, meta, time_str, nano, "unknown exception", false);
                 }
 
             }, std::tuple<typename detail::decode_type<Args>::type...>{ detail::decode_arg<Args>(buffer, args_end)... });
-        }
-
-        // 解码失败时输出一行 [FMT_ERROR]，保证后端消费线程不因单条日志而终止。
-        // 同样遵守"先判可用量再减 1"，避免下溢。
-        static void write_error_line(IOBuffer& out, const LogMeta& meta, const char* time_str,
-                                     uint32_t nano, const char* what) {
-            if (ZRLOG_UNLIKELY(out.available_size() < 512)) {
-                out.flush_to_os();
-            }
-            size_t err_space = out.available_size() - 1;
-            auto err_msg = fmt::format_to_n(out.current_ptr(), err_space,
-                FMT_COMPILE("[FMT_ERROR] {}.{:09d} {} {}:{} error: '{}'"),
-                fmt::string_view(time_str, 19), nano, loglevel_to_string(meta.level),
-                meta.file, meta.line, what);
-            size_t actual_err_len = std::min<size_t>(err_msg.size, err_space);
-            out.current_ptr()[actual_err_len] = '\n';
-            out.advance(actual_err_len + 1);
         }
 
         // ========================================================================
@@ -1896,18 +1877,71 @@ namespace zrlog {
                     }
                 }
                 catch (const fmt::format_error& e) {
-                    // 对于异常捕获，同样保留 1 字节并安全换行
-                    size_t err_space = out.available_size() - 1;
-                    auto err_msg = fmt::format_to_n(out.current_ptr(), err_space,
-                        FMT_COMPILE("[FMT_ERROR] {}.{:09d} {} {}:{} format: '{}' error: '{}'"),
-                        fmt::string_view(time_str, 19), nano, loglevel_to_string(meta.level), meta.file, meta.line,
-                        fmt::string_view(meta.format.data(), meta.format.size()), e.what());
-
-                    size_t actual_err_len = std::min<size_t>(err_msg.size, err_space);
-                    out.current_ptr()[actual_err_len] = '\n';
-                    out.advance(actual_err_len + 1);
+                    // 格式串与参数不匹配（DYN 场景下不同线程并发使用不同格式串）
+                    write_runtime_error_line(out, meta, time_str, nano, e.what(), true);
+                }
+                catch (const std::exception& e) {
+                    // 其他异常（bad_alloc、自定义 formatter 抛错等）同样必须被吞掉，
+                    // 否则会逃逸到 poll_routine 顶层，导致这条日志被反复重试。
+                    write_runtime_error_line(out, meta, time_str, nano, e.what(), false);
+                }
+                catch (...) {
+                    write_runtime_error_line(out, meta, time_str, nano, "unknown exception", false);
                 }
             }, std::tuple<typename detail::decode_type<Args>::type...>{ detail::decode_arg<Args>(buffer, args_end)... });
+        }
+
+        // 动态 decoder 的错误输出。format_error 时带上原始格式串便于定位；
+        // 其他异常只报消息，避免在异常路径上再做一次可能失败的格式化。
+        // 本函数自身绝不向外抛异常（A2）。
+        static void write_runtime_error_line(IOBuffer& out, const LogMeta& meta,
+                                             const char* time_str, uint32_t nano,
+                                             const char* what, bool include_format) noexcept {
+            try {
+                if (ZRLOG_UNLIKELY(out.available_size() < 512)) {
+                    out.flush_to_os();
+                }
+                size_t err_space = out.available_size() - 1;
+                size_t actual_err_len;
+                if (include_format) {
+                    auto err_msg = fmt::format_to_n(out.current_ptr(), err_space,
+                        FMT_COMPILE("[FMT_ERROR] {}.{:09d} {} {}:{} format: '{}' error: '{}'"),
+                        fmt::string_view(time_str, 19), nano, loglevel_to_string(meta.level),
+                        meta.file, meta.line,
+                        fmt::string_view(meta.format.data(), meta.format.size()), what);
+                    actual_err_len = std::min<size_t>(err_msg.size, err_space);
+                }
+                else {
+                    auto err_msg = fmt::format_to_n(out.current_ptr(), err_space,
+                        FMT_COMPILE("[FMT_ERROR] {}.{:09d} {} {}:{} error: '{}'"),
+                        fmt::string_view(time_str, 19), nano, loglevel_to_string(meta.level),
+                        meta.file, meta.line, what);
+                    actual_err_len = std::min<size_t>(err_msg.size, err_space);
+                }
+                out.current_ptr()[actual_err_len] = '\n';
+                out.advance(actual_err_len + 1);
+            }
+            catch (...) {
+                // 兜底：连错误行都写不出来时，退化为不经 fmt 的纯文本，绝不外抛。
+                write_plain_error(out, "[FMT_ERROR] (error line formatting failed)\n");
+            }
+        }
+
+        // 不经 fmt 的纯文本兜底，异常安全。
+        static void write_plain_error(IOBuffer& out, const char* text) noexcept {
+            const size_t len = std::strlen(text);
+            try {
+                if (ZRLOG_UNLIKELY(out.available_size() < len + 1)) {
+                    out.flush_to_os();
+                }
+                if (out.available_size() >= len) {
+                    std::memcpy(out.current_ptr(), text, len);
+                    out.advance(len);
+                }
+            }
+            catch (...) {
+                // 无处可写，静默放弃
+            }
         }
 
         class ThreadBuffer {
@@ -2327,6 +2361,11 @@ namespace zrlog {
                     ++processed_count;
                     --quota;
 
+                    // 先推进游标再解码：即使 decoder 抛出任何异常，这条记录也
+                    // 不会在下一轮被重复读到（否则会形成"毒丸"死循环，把后台
+                    // 线程和 fini() 一起永久卡死）。
+                    tb->consume(header->total_size);
+
                     if (header->log_id > 0 && header->log_id < local_log_metas.size()) {
                         const LogMeta& meta = local_log_metas[header->log_id];
                         char* args_ptr = (char*)header + sizeof(LogEntryHeader);
@@ -2350,8 +2389,6 @@ namespace zrlog {
                             stat_consume_valid_count_.fetch_add(1, std::memory_order_relaxed);
                         }
                     }
-
-                    tb->consume(header->total_size);
                 }
 
                 // 一轮消费完了，如果是最后的数据，强制把游标更新出去
