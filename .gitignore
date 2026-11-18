@@ -5,6 +5,9 @@ benchmark_zrlog
 benchmark_zrlog.exe
 build/
 
+# Benchmark executables and object files (sources under bench/ are tracked)
+bench/bin/
+
 # Benchmark / test log output
 *.log
 *.log.[0-9]*
