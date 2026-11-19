@@ -56,13 +56,27 @@ fmtlog's own fmt submodule is empty upstream; the CMake build reuses the fmt
 bundled with zrlog. quill is header-only and cross-platform. NanoLog is
 Linux-only and is skipped on Windows.
 
-quill is configured with a 32 MB initial queue: its default 128 KB queue
-reallocates during a run, and that reallocation blocks the logging call for
-~3.7 ms, which lands in max and drags avg up (one such sample raises avg of
-200k by ~19 ns). The benchmark also sets
-`log_timestamp_ordering_grace_period = 0` (quill's default is 5 us) - a
-deliberate deviation that reduces backend latency, so quill numbers here are
-not its stock configuration.
+quill runs with a tuned configuration (the only library here that deviates
+from its defaults):
+
+- `initial_queue_capacity = 32 MB`. The stock 128 KB queue reallocates
+  several times during a latency run, and each reallocation blocks the
+  logging call for ~1.5-2 ms, which lands in max and drags avg up.
+- `log_timestamp_ordering_grace_period = 0` (stock is 5 us), which lets the
+  backend drain sooner.
+- `UnboundedBlocking` (the stock default) - `BoundedBlocking` blocks the
+  producer when full and made the 16M-message throughput test take 28 s.
+
+Measured effect of this tuning (median of 7 rounds, same machine):
+
+| config | avg | p50 | p99 | max | M logs/s |
+|---|---|---|---|---|---|
+| tuned | 20.7 | 20.0 | 28.0 | 46 us | 138.4 |
+| stock | 49.9 | 26.7 | 36.7 | 2386 us | 129.6 |
+
+Stock is kept under `results_win_quill_default/` for reference. Quote the
+tuned numbers when comparing against zrlog/fmtlog (which also run tuned
+configurations for their benchmarks), and say so explicitly when publishing.
 
 Binaries land in `build-bench/bench/bin/<config>/` (multi-config generators
 add the config directory).
