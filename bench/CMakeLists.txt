@@ -81,6 +81,21 @@ endif()
 zrlog_bench_dep_dir(FMTLOG_DIR fmtlog "" "fmtlog")
 
 # ---------------------------------------------------------------------------
+# quill (header-only, cross-platform)
+# ---------------------------------------------------------------------------
+if(ZRLOG_BENCH_FETCH_DEPS AND NOT ZRLOG_BENCH_DEPS)
+    zrlog_bench_git_url(QUILL_URL https://github.com/odygrd/quill.git)
+    FetchContent_Declare(quill
+        GIT_REPOSITORY ${QUILL_URL}
+        GIT_TAG        master
+        GIT_SHALLOW    TRUE
+    )
+    # Populate only: the benchmark needs headers, not quill's own build/tests.
+    FetchContent_Populate(quill)
+endif()
+zrlog_bench_dep_dir(QUILL_INCLUDE quill "include" "quill/include")
+
+# ---------------------------------------------------------------------------
 # NanoLog (Linux only - depends on POSIX AIO)
 # ---------------------------------------------------------------------------
 if(NOT WIN32)
@@ -134,6 +149,14 @@ if(EXISTS "${FMTLOG_DIR}/fmtlog.cc")
     target_compile_definitions(bench_fmtlog PRIVATE FMT_HEADER_ONLY)
 else()
     message(STATUS "bench: fmtlog not found, skipping bench_fmtlog")
+endif()
+
+# quill
+if(EXISTS "${QUILL_INCLUDE}/quill/Backend.h")
+    zrlog_bench_target(bench_quill bench_quill.cpp)
+    target_include_directories(bench_quill PRIVATE "${QUILL_INCLUDE}")
+else()
+    message(STATUS "bench: quill not found, skipping bench_quill")
 endif()
 
 # NanoLog

@@ -1,6 +1,6 @@
 # Cross-library benchmark
 
-Compares zrlog against spdlog, fmtlog and NanoLog on frontend latency and
+Compares zrlog against spdlog, fmtlog, quill and NanoLog on frontend latency and
 throughput. Each library is compiled into its **own** executable because they
 vendor different fmt versions and cannot coexist in one binary; the measurement
 code in `bench_common.h` is shared so the methodology is identical.
@@ -14,7 +14,8 @@ code in `bench_common.h` is shared so the methodology is identical.
 - The latency loop self-spins to throttle (no `sleep`): sleeping wakes with a
   C-state/cache penalty that shows up as a fake microsecond-scale p99.9 tail.
 - The throughput loop is not throttled. Libraries differ in what happens when
-  the queue fills (zrlog Discard, fmtlog discard, NanoLog blocks), so the
+  the queue fills (zrlog Discard, fmtlog discard, quill blocks after growing
+  to its cap, NanoLog blocks), so the
   numbers describe "logs accepted per second", not a lossless rate.
 - `run_win.ps1` runs several rounds, **rotates the library order every round**
   to spread cold-cache bias, and reports the median.
@@ -22,7 +23,7 @@ code in `bench_common.h` is shared so the methodology is identical.
 ## Requirements
 
 Third-party sources are not vendored. `bench/CMakeLists.txt` fetches them at
-configure time (spdlog v1.17.0, fmtlog main, NanoLog master), so the simplest
+configure time (spdlog v1.17.0, fmtlog main, quill master, NanoLog master), so the simplest
 route needs only network access:
 
 ```sh
@@ -31,7 +32,7 @@ cmake --build build-bench --config Release
 ```
 
 To use pre-cloned sources instead (offline / slow network), point at a root
-that holds `spdlog/`, `fmtlog/` and `nanolog/`:
+that holds `spdlog/`, `fmtlog/`, `quill/` and `nanolog/`:
 
 ```sh
 cmake -S . -B build-bench -DZRLOG_BUILD_CROSS_BENCH=ON \
@@ -47,11 +48,21 @@ Expected layout of a pre-cloned deps root:
 <deps>/
   spdlog/include/            gabime/spdlog v1.x
   fmtlog/                    MengRao/fmtlog (fmtlog.cc)
+  quill/include/             odygrd/quill
   nanolog/runtime/           PlatformLab/NanoLog, after `make libNanoLog.a`
 ```
 
 fmtlog's own fmt submodule is empty upstream; the CMake build reuses the fmt
-bundled with zrlog. NanoLog is Linux-only and is skipped on Windows.
+bundled with zrlog. quill is header-only and cross-platform. NanoLog is
+Linux-only and is skipped on Windows.
+
+quill is configured with a 32 MB initial queue: its default 128 KB queue
+reallocates during a run, and that reallocation blocks the logging call for
+~3.7 ms, which lands in max and drags avg up (one such sample raises avg of
+200k by ~19 ns). The benchmark also sets
+`log_timestamp_ordering_grace_period = 0` (quill's default is 5 us) - a
+deliberate deviation that reduces backend latency, so quill numbers here are
+not its stock configuration.
 
 Binaries land in `build-bench/bench/bin/<config>/` (multi-config generators
 add the config directory).
@@ -78,8 +89,8 @@ topology tool to find them.
 git clone https://github.com/PlatformLab/NanoLog
 make -C NanoLog/runtime libNanoLog.a
 
-# 2) build (spdlog/fmtlog/nanolog auto-skipped if absent)
-export ZRLOG_BENCH_DEPS=/path/to/deps   # holds spdlog/, fmtlog/, nanolog/
+# 2) build (spdlog/fmtlog/quill/nanolog auto-skipped if absent)
+export ZRLOG_BENCH_DEPS=/path/to/deps   # holds spdlog/, fmtlog/, quill/, nanolog/
 bench/build_bench.sh
 
 # 3) run

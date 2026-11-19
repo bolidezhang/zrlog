@@ -31,17 +31,25 @@ set "DEPS=%ZRLOG_BENCH_DEPS%"
 set "OUT=bench\bin"
 if not exist "%OUT%" mkdir "%OUT%"
 
-echo [1/4] zrlog
+echo [1/5] zrlog
 cl %FLAGS% -I. -Ifmt\include bench\bench_zrlog.cpp -Fe:%OUT%\bench_zrlog.exe -Fo:%OUT%\ > "%TEMP%\zb.log" 2>&1
 if errorlevel 1 (type "%TEMP%\zb.log" & exit /b 1)
 
-echo [2/4] spdlog
+echo [2/5] spdlog
 cl %FLAGS% -Ibench -I%DEPS%\spdlog\include bench\bench_spdlog.cpp -Fe:%OUT%\bench_spdlog.exe -Fo:%OUT%\ > "%TEMP%\zb.log" 2>&1
 if errorlevel 1 (type "%TEMP%\zb.log" & exit /b 1)
 
-echo [3/4] fmtlog
+echo [3/5] fmtlog
 cl %FLAGS% -DFMT_HEADER_ONLY -Ibench -I%DEPS%\fmtlog -Ifmt\include bench\bench_fmtlog.cpp %DEPS%\fmtlog\fmtlog.cc -Fe:%OUT%\bench_fmtlog.exe -Fo:%OUT%\ > "%TEMP%\zb.log" 2>&1
 if errorlevel 1 (type "%TEMP%\zb.log" & exit /b 1)
 
-echo [4/4] nanolog skipped (Linux only)
+echo [4/5] quill
+if exist "%DEPS%\quill\include" (
+    cl %FLAGS% -Ibench -I"%DEPS%\quill\include" bench\bench_quill.cpp -Fe:%OUT%\bench_quill.exe -Fo:%OUT%\ > "%TEMP%\zb.log" 2>&1
+    if errorlevel 1 (type "%TEMP%\zb.log" & exit /b 1)
+) else (
+    echo   skipped: quill not found under "%DEPS%\quill"
+)
+
+echo [5/5] nanolog skipped (Linux only)
 echo ALL_DONE

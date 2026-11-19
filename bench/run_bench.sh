@@ -5,7 +5,7 @@ set -u
 ROUNDS=${1:-5}
 THREADS=${2:-4}
 PER=${3:-2000000}
-LIBS=(zrlog spdlog fmtlog nanolog)
+LIBS=(zrlog spdlog fmtlog quill nanolog)
 BIN_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUT="$BIN_DIR/results"
 mkdir -p "$OUT"

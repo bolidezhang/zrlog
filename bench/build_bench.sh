@@ -40,6 +40,12 @@ else
     echo "[fmtlog] skipped (no $DEPS/fmtlog)"
 fi
 
+if [ -d "$DEPS/quill/include" ]; then
+    build_one quill -I"$HERE" -I"$DEPS/quill/include" "$HERE/bench_quill.cpp"
+else
+    echo "[quill] skipped (no $DEPS/quill)"
+fi
+
 if [ -f "$DEPS/nanolog/runtime/libNanoLog.a" ]; then
     build_one nanolog -I"$HERE" -I"$DEPS/nanolog/runtime" -Werror=format \
         "$HERE/bench_nanolog.cpp" \

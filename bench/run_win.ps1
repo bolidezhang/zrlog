@@ -8,7 +8,7 @@ $ErrorActionPreference = 'Stop'
 Set-Location (Join-Path $PSScriptRoot 'bin')
 $env:BENCH_CPUS = $Cpus
 
-$libs = [string[]]@('zrlog', 'spdlog', 'fmtlog')
+$libs = [string[]]@('zrlog', 'spdlog', 'fmtlog', 'quill')
 $nlibs = $libs.Length
 $outDir = Join-Path $PWD 'results'
 if (Test-Path $outDir) { Remove-Item $outDir -Recurse -Force }
@@ -31,7 +31,19 @@ for ($r = 0; $r -lt $Rounds; $r++) {
     Write-Host ("== round {0} : {1} ==" -f $r, ($order -join ' '))
     foreach ($lib in $order) {
         $exe = Join-Path $PWD ("bench_" + $lib + ".exe")
-        $lines = @(& $exe $Threads $Per both 2>&1 | Where-Object { $_ -match '^\s{2}\S' })
+        # 有些库（如 quill）会往 stderr 打 INFO，PowerShell 在 Stop 模式下会把
+        # NativeCommandError 当成致命错误中断整个脚本。这里临时放宽，只取
+        # 形如 "  <lib> ..." 的数据行。
+        $prev = $ErrorActionPreference
+        $ErrorActionPreference = 'Continue'
+        try {
+            $lines = @(& $exe $Threads $Per both 2>&1 |
+                       ForEach-Object { "$_" } |
+                       Where-Object { $_ -match '^\s{2}\S' })
+        }
+        finally {
+            $ErrorActionPreference = $prev
+        }
         if ($lines.Length -eq 0) {
             Write-Warning ("{0} produced no data" -f $lib)
         }
