@@ -23,8 +23,8 @@ SOFTWARE.
 #pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.5.2
-#define ZRLOG_VERSION 20502
+// 如：2.5.3
+#define ZRLOG_VERSION 20503
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
@@ -71,6 +71,11 @@ constexpr size_t ZRLOG_CACHE_LINE_SIZE = std::hardware_destructive_interference_
 #else
 constexpr size_t ZRLOG_CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 #endif
+
+// 跨核心高频写字段之间的隔离步长。Intel 的 L2 adjacent-cache-line prefetcher
+// 按 128 字节成对拉取缓存行，因此两个不同核心各自写入的字段只隔一条 64 字节
+// 行时，仍会互相触发 RFO。保守取 128；非 Intel 平台略增内存占用，无害。
+constexpr size_t ZRLOG_CROSS_THREAD_STRIDE = 128;
 
 // 跨平台分支预测宏
 #if defined(__GNUC__) || defined(__clang__)
@@ -912,6 +917,15 @@ namespace zrlog {
         uint32_t io_buffer_size = 1024 * 1024 * 4;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
         uint32_t thread_buffer_size = 1024 * 1024 * 1;  //每个线程的缓冲大小(前端二进制序列化缓冲 测试发现越大如16M,时延也变大)
         uint32_t per_thread_quota = 256;                //每个线程的格式化日志的配额(防止线程产生日志太快,公平处理每个线程日志)
+        // 前端热路径的两个可选开销，默认开启（保持原有语义与可观测性）。
+        // 关闭可换取更低的前端 p50，代价见各自说明：
+        //  - notify_consumer_per_log=false：不再每条日志检查空闲标志。消费者
+        //    完全依赖 idle_wait_interval_us 超时轮询，日志落盘延迟上限变为该
+        //    间隔（默认 1ms），稀疏日志场景更明显。
+        //  - producer_stats=false：不再累加生产统计（stat_produce_count_ /
+        //    stat_produce_valid_count_ 恒为 0），无法统计丢弃率。
+        bool     notify_consumer_per_log = true;
+        bool     producer_stats = true;
         uint32_t idle_wait_interval_us = 1000;          //空闲等待间隔(微秒)，自适应模式下为"空闲态上限"
         // 自适应空闲等待：开启后，有日志流量时把等待间隔压到 idle_busy_interval_us
         // （低延迟，落盘更及时），持续空闲时逐级放大回 idle_wait_interval_us（省 CPU）。
@@ -1623,7 +1637,14 @@ namespace zrlog {
         // 生产者统计：热路径只累加 ThreadBuffer 内的生产者私有计数器（前端已持有
         // buffer 指针，无额外 TLS 寻址），每 1024 次才汇总到全局原子量。直接在每条
         // 日志上做 fetch_add（x86 的 lock xadd，~20+ 周期）会显著抬高前端 p50。
+        //
+        // producer_stats 开关在函数内部判断：调用点只写 note_produced(...) 一行，
+        // 不再每处重复 if (config_.producer_stats)。该开关 init 后不再变化，
+        // 分支预测稳定，开销与调用点判断相同。
         inline void note_produced(ThreadBuffer* tb, bool accepted) {
+            if (ZRLOG_UNLIKELY(!config_.producer_stats)) {
+                return;
+            }
             if (ZRLOG_UNLIKELY(nullptr == tb)) {
                 // 极罕见：缓冲创建失败（OOM）。直接计全局，避免丢失统计。
                 stat_produce_count_.fetch_add(1, std::memory_order_relaxed);
@@ -1741,9 +1762,12 @@ namespace zrlog {
             header->tsc = TscClock::rdtsc();
             serialize_args_all(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
             buffer->commit(aligned_len);
-            notify_consumer();
 
+            if (ZRLOG_LIKELY(config_.notify_consumer_per_log)) {
+                notify_consumer();
+            }
             note_produced(buffer, true);
+
             return true;
         }
 
@@ -2338,30 +2362,36 @@ namespace zrlog {
             }
 
             // =========================================================================
-            // 【极其严格的缓存行物理隔离】
-            // C++17 alignas 将自动填充字节，彻底杜绝 False Sharing
+            // 【跨核缓存行物理隔离】
+            //
+            // 隔离粒度用 128 字节而非 64 字节（ZRLOG_CROSS_THREAD_STRIDE）：
+            // Intel 的 L2 adjacent-cache-line prefetcher 一次会拉取 128 字节对齐
+            // 的【一对】缓存行。若两个被不同核心高频写的字段只隔 64 字节，预取器
+            // 会把对方那条行也带进自己的 L2，跨核所有权转移（RFO）照旧发生——
+            // 64 字节隔离在该架构上并不够。实测缓冲满时生产者每条日志都要读
+            // read_index_（见 alloc），正是这条路径上的争抢。
             // =========================================================================
 
-            // --- 生产者独占缓存行 (写入端) ---
-            // 内存对齐并独占一行，只有前端线程会高频读写这里的变量
-            alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<uint64_t> write_index_{ 0 };
-            alignas(ZRLOG_CACHE_LINE_SIZE) uint64_t cached_read_index_{ 0 };
-            // 生产统计计数：与 cached_read_index_ 同属生产者私有缓存行（消费者
-            // 从不触碰）。原先用独立 thread_local 计数器，每条日志多一次 TLS 寻址；
-            // 并入本结构后前端已持有 buffer 指针，顺带累加，零额外 TLS 开销。
-            // 由 NanoLogger::note_produced 每 1024 条汇总到全局原子量。
+            // --- 生产者独占 (写入端) ---
+            // 只有前端线程高频读写这里的变量
+            alignas(ZRLOG_CROSS_THREAD_STRIDE) std::atomic<uint64_t> write_index_{ 0 };
+            // cached_read_index_ 与 produce_* 都是生产者私有：消费者从不触碰，
+            // 故它们之间无需隔离，合并到同一行以节省空间。
+            uint64_t cached_read_index_{ 0 };
             uint64_t produce_attempts_{ 0 };
             uint64_t produce_accepted_{ 0 };
 
-            // --- 消费者独占缓存行 (读取端) ---
-            // 物理隔离！只有后台消费者线程会高频读写这里的变量
-            alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<uint64_t> read_index_{ 0 };
-            alignas(ZRLOG_CACHE_LINE_SIZE) uint64_t cached_write_index_{ 0 };
-            alignas(ZRLOG_CACHE_LINE_SIZE) uint64_t local_read_index_{ 0 };
+            // --- 消费者独占 (读取端) ---
+            // 与 write_index_ 至少隔 128 字节：两者分属不同核心的写者，是全库
+            // 唯一真正跨核共享的游标对。
+            alignas(ZRLOG_CROSS_THREAD_STRIDE) std::atomic<uint64_t> read_index_{ 0 };
+            uint64_t cached_write_index_{ 0 };
+            uint64_t local_read_index_{ 0 };
 
-            // --- 其他共享元数据 ---
-            // 独立在一行，防止被游标的高频变动波及
-            alignas(ZRLOG_CACHE_LINE_SIZE) uint32_t size_;
+            // --- 只读元数据 ---
+            // size_/mask_ 每条日志都读（热），但只读不写，不会引发所有权转移，
+            // 与冷字段同处一行没有实际代价。
+            alignas(ZRLOG_CROSS_THREAD_STRIDE) uint32_t size_;
             uint32_t mask_;
             uint64_t thread_id_;
 
@@ -2370,7 +2400,9 @@ namespace zrlog {
             // ========================================================================
             util::MemoryBlock mem_block_;
 
-            std::atomic<bool> should_deallocate_{ false };
+            // 线程退出时由垂死线程写、后台线程轮询读；冷路径，单独一行避免
+            // 与热字段共享导致任何形式的干扰。
+            alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<bool> should_deallocate_{ false };
         };
 
         class ThreadBufferDestroyer {
@@ -3023,7 +3055,7 @@ namespace zrlog {
                                                                                                     \
         zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                                  \
         if (logger.check_level(level)) {                                                            \
-            static std::atomic<uint32_t> log_id{0};                                                 \
+            static std::atomic<uint32_t> log_id{ 0 };                                               \
             struct FmtProvider {                                                                    \
                 static constexpr auto compile() {                                                   \
                     /* 将固定日志头与用户日志格式完美拼接 */                                           \
@@ -3050,8 +3082,8 @@ namespace zrlog {
     do {                                                                                            \
         zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                                  \
         if (logger.check_level(level)) {                                                            \
-            /* 高 32 位 log_id | 低 32 位格式串哈希，单原子量保证一致快照 */                          \
-            static std::atomic<uint64_t> dyn_state{0};                                              \
+            /* 高 32 位 log_id | 低 32 位格式串哈希，单原子量保证一致快照 */                            \
+            static std::atomic<uint64_t> dyn_state{ 0 };                                            \
             std::string_view file { __FILE__, sizeof(__FILE__) - 1 };                               \
             std::string_view func { __func__, sizeof(__func__) - 1 };                               \
             logger.log_runtime(dyn_state, level, file, __LINE__, func, format, ##__VA_ARGS__);      \

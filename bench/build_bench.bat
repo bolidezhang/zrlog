@@ -40,7 +40,10 @@ cl %FLAGS% -Ibench -I%DEPS%\spdlog\include bench\bench_spdlog.cpp -Fe:%OUT%\benc
 if errorlevel 1 (type "%TEMP%\zb.log" & exit /b 1)
 
 echo [3/5] fmtlog
-cl %FLAGS% -DFMT_HEADER_ONLY -Ibench -I%DEPS%\fmtlog -Ifmt\include bench\bench_fmtlog.cpp %DEPS%\fmtlog\fmtlog.cc -Fe:%OUT%\bench_fmtlog.exe -Fo:%OUT%\ > "%TEMP%\zb.log" 2>&1
+rem FMTLOG_QUEUE_SIZE must be identical for fmtlog.cc and bench_fmtlog.cpp:
+rem ThreadBuffer is allocated in fmtlog.cc but sized/used by the inlined alloc()
+rem in the bench TU. Mismatch = ODR violation + heap overflow.
+cl %FLAGS% -DFMT_HEADER_ONLY -DFMTLOG_BENCH_QUEUE_MB=8 -Ibench -I%DEPS%\fmtlog -Ifmt\include bench\bench_fmtlog.cpp %DEPS%\fmtlog\fmtlog.cc -Fe:%OUT%\bench_fmtlog.exe -Fo:%OUT%\ > "%TEMP%\zb.log" 2>&1
 if errorlevel 1 (type "%TEMP%\zb.log" & exit /b 1)
 
 echo [4/5] quill

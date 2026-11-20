@@ -34,7 +34,9 @@ else
 fi
 
 if [ -d "$DEPS/fmtlog" ]; then
-    build_one fmtlog -DFMT_HEADER_ONLY -I"$HERE" -I"$DEPS/fmtlog" \
+    # FMTLOG_BENCH_QUEUE_MB must reach both TUs (fmtlog.cc allocates
+    # ThreadBuffer, bench_fmtlog.cpp inlines alloc()); see FINDINGS.md.
+    build_one fmtlog -DFMT_HEADER_ONLY -DFMTLOG_BENCH_QUEUE_MB=8 -I"$HERE" -I"$DEPS/fmtlog" \
         -I"$ROOT/fmt/include" "$HERE/bench_fmtlog.cpp" "$DEPS/fmtlog/fmtlog.cc"
 else
     echo "[fmtlog] skipped (no $DEPS/fmtlog)"

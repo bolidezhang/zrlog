@@ -17,8 +17,14 @@ code in `bench_common.h` is shared so the methodology is identical.
   the queue fills (zrlog Discard, fmtlog discard, quill blocks after growing
   to its cap, NanoLog blocks), so the
   numbers describe "logs accepted per second", not a lossless rate.
+- Queues are sized equally (8 MB) across zrlog and fmtlog so capacity does not
+  confound the comparison. For fmtlog this is set via
+  `-DFMTLOG_BENCH_QUEUE_MB=8` **on the compiler command line** — `fmtlog.cc` is
+  a separate TU that allocates `ThreadBuffer`, so defining it in only one TU
+  would be an ODR violation and a heap overflow.
 - `run_win.ps1` runs several rounds, **rotates the library order every round**
-  to spread cold-cache bias, and reports the median.
+  to spread cold-cache bias, and reports the median. Use ≥9 rounds: single-run
+  spread on this machine is larger than any code difference measured so far.
 
 ## Requirements
 
@@ -91,10 +97,18 @@ powershell -File bench\run_win.ps1 -Rounds 7 -Threads 4 -Per 4000000
 python bench\aggregate.py bench\bin\results
 ```
 
-`run_win.ps1` pins worker threads to `BENCH_CPUS` (default `2,3,4,5`). On hybrid
-CPUs (P-core + E-core) always pin to P-cores - an E-core can halve throughput
-and reverse rankings. Use `zrlog::util::get_performance_core_ids()` or any
-topology tool to find them.
+`run_win.ps1` auto-detects the P-cores (via `GetLogicalProcessorInformationEx`
+and `EfficiencyClass`) and pins one logical CPU per physical core. Pass
+`-Cpus "0,10,12,14"` to override. On this dev machine the hard-coded default
+that used to be here (`2,3,4,5`) turned out to be **E-cores**, which
+understated every library's absolute numbers — see `FINDINGS.md`, caveat 5.
+
+`-BurnMs` (default 100) burns the CPU before the latency loop. This is
+required: without it zrlog's p50 lands at either ~20 or ~50 ns with no code
+change. quill and fmtlog are unaffected.
+
+On hybrid CPUs (P-core + E-core) always pin to P-cores — an E-core can halve
+throughput and reverse rankings.
 
 ## Linux
 

@@ -219,13 +219,15 @@ TEST(config_defaults) {
     CHECK_EQ(c.per_thread_quota, 256u);
     CHECK_EQ(c.idle_wait_interval_us, 1000u);
     CHECK_EQ(c.force_flush_interval_ms, 3000u);
+    CHECK(c.notify_consumer_per_log);
+    CHECK(c.producer_stats);
     CHECK_EQ(c.tsc_sync_interval_s, 3600u);
     CHECK_EQ(c.crash_drain_wait_ms, 3000u);
     CHECK_EQ(c.buffer_full_retry_count, 256u);
     CHECK_EQ(c.rotating_file_size, 100u * 1024u * 1024u);
     CHECK_EQ(c.rotating_max_files, 5u);
 
-    CHECK_EQ(static_cast<uint32_t>(ZRLOG_VERSION), 20502u);
+    CHECK_EQ(static_cast<uint32_t>(ZRLOG_VERSION), 20503u);
 }
 
 // ---------------------------------------------------------------------------

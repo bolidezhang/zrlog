@@ -77,6 +77,11 @@ endif()
 # ============================================================================
 if(ZRLOG_BUILD_CROSS_BENCH)
     enable_testing()   # FetchContent 内部可能用到
+    # 把 FetchContent 的下载目录固定到 bench/_deps（项目内），而不是
+    # build/_deps。必须在任何 FetchContent_Declare 之前设置，且只能在顶层
+    # 设置——子目录里设置时子项目的 populate 已经按顶层缓存目录建好了。
+    set(FETCHCONTENT_BASE_DIR "${CMAKE_CURRENT_SOURCE_DIR}/bench/_deps" CACHE PATH
+        "Where benchmark dependencies are downloaded (default: bench/_deps)")
     add_subdirectory(bench)
 endif()
 

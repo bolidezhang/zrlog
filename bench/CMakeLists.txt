@@ -4,8 +4,12 @@
 # fmt versions and cannot share a binary. The shared measurement code lives in
 # bench_common.h.
 #
-# Third-party sources are fetched at configure time via FetchContent (into the
-# normal ${CMAKE_BINARY_DIR}/_deps). To use pre-cloned sources instead, either
+# Third-party sources are fetched at configure time via FetchContent into
+# bench/_deps, i.e. inside this project rather than under the build tree, so
+# deleting and recreating build-bench/ does not force a re-download. That
+# directory is gitignored.
+#
+# To use pre-cloned sources instead:
 #   -DZRLOG_BENCH_FETCH_DEPS=OFF -DZRLOG_BENCH_DEPS=/path/to/deps
 # or point CMake's standard override at each one:
 #   -DFETCHCONTENT_SOURCE_DIR_SPDLOG=/path/to/spdlog
@@ -14,7 +18,11 @@
 
 include(FetchContent)
 
-option(ZRLOG_BENCH_FETCH_DEPS "Fetch spdlog/fmtlog/NanoLog at configure time" ON)
+# FETCHCONTENT_BASE_DIR is set by the top-level CMakeLists (bench/_deps) before
+# add_subdirectory(bench) - it has to be set there, not here, because the
+# sub-build cache is created at the top level.
+
+option(ZRLOG_BENCH_FETCH_DEPS "Fetch spdlog/fmtlog/quill/NanoLog at configure time" ON)
 set(ZRLOG_BENCH_DEPS "" CACHE PATH
     "Pre-cloned dependency root (spdlog/, fmtlog/, nanolog/); empty = use FetchContent")
 set(ZRLOG_BENCH_GIT_MIRROR "" CACHE STRING
@@ -36,7 +44,7 @@ function(zrlog_bench_dep_dir out_var name fetch_subdir local_subdir)
     if(ZRLOG_BENCH_DEPS AND EXISTS "${ZRLOG_BENCH_DEPS}/${local_subdir}")
         set(${out_var} "${ZRLOG_BENCH_DEPS}/${local_subdir}" PARENT_SCOPE)
     else()
-        set(${out_var} "${CMAKE_BINARY_DIR}/_deps/${name}-src/${fetch_subdir}" PARENT_SCOPE)
+        set(${out_var} "${FETCHCONTENT_BASE_DIR}/${name}-src/${fetch_subdir}" PARENT_SCOPE)
     endif()
 endfunction()
 
@@ -147,6 +155,11 @@ if(EXISTS "${FMTLOG_DIR}/fmtlog.cc")
     zrlog_bench_target(bench_fmtlog bench_fmtlog.cpp "${FMTLOG_DIR}/fmtlog.cc")
     target_include_directories(bench_fmtlog PRIVATE "${FMTLOG_DIR}" "${CMAKE_SOURCE_DIR}/fmt/include")
     target_compile_definitions(bench_fmtlog PRIVATE FMT_HEADER_ONLY)
+    # 队列容量对齐 bench_zrlog 的 8MB 线程缓冲。必须同时作用于 fmtlog.cc 与
+    # bench_fmtlog.cpp：ThreadBuffer 在 fmtlog.cc 里 new、在 bench TU 里内联
+    # alloc，定义不一致会 ODR 冲突并堆越界。target_compile_definitions 天然
+    # 对同一 target 的所有源文件生效。
+    target_compile_definitions(bench_fmtlog PRIVATE FMTLOG_BENCH_QUEUE_MB=8)
 else()
     message(STATUS "bench: fmtlog not found, skipping bench_fmtlog")
 endif()

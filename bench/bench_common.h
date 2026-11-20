@@ -134,6 +134,17 @@ constexpr int kLatencyWarmup = 20000;
 constexpr int kLatencyIters  = 200000;
 constexpr uint64_t kThrottleNs = 20000;
 
+// 诊断用：BENCH_LAT_ITERS 覆盖延迟测试的样本数（默认保持 kLatencyIters）。
+// 用于区分"环形缓冲被填满"与"前端本身变慢"：写入总量变小后若延迟回到快
+// 模式，说明慢模式来自背压而非序列化路径。
+inline int latency_iters() {
+    static const int v = [] {
+        const char* s = std::getenv("BENCH_LAT_ITERS");
+        return (s && *s) ? std::atoi(s) : kLatencyIters;
+    }();
+    return v;
+}
+
 inline void spin_pause_for_ns(uint64_t ns) {
     const uint64_t ticks = static_cast<uint64_t>(static_cast<double>(ns) / g_ns_per_tick);
     const uint64_t start = bench_rdtsc();
@@ -146,14 +157,38 @@ inline void spin_pause_for_ns(uint64_t ns) {
     }
 }
 
+// 诊断用：在测延迟前用固定时长的纯 ALU 负载把核心频率拉到稳态。
+// P-state 爬升需要毫秒级时间；calibrate_tsc() 的 200ms sleep 会把 CPU 压到
+// 低功耗状态，随后只有约 20ms 的延迟测试不足以让它升频，导致整轮落在低频。
+// BENCH_BURN_MS=0 关闭。
+inline void burn_cpu(int ms) {
+    if (ms <= 0) return;
+    const uint64_t deadline = bench_rdtsc() +
+        static_cast<uint64_t>(static_cast<double>(ms) * 1e6 / g_ns_per_tick);
+    volatile uint64_t acc = 0;
+    while (bench_rdtsc() < deadline) {
+        for (int i = 0; i < 512; ++i) acc += static_cast<uint64_t>(i) * 3u;
+    }
+}
+
+inline int burn_ms() {
+    static const int v = [] {
+        const char* s = std::getenv("BENCH_BURN_MS");
+        return (s && *s) ? std::atoi(s) : 0;
+    }();
+    return v;
+}
+
 inline Stats run_latency(const Backend& b) {
     pin_current_thread(0);
     if (b.pre_thread) b.pre_thread();
+    burn_cpu(burn_ms());
     for (int i = 0; i < kLatencyWarmup; ++i) b.log_one();
 
     std::vector<uint64_t> ticks;
-    ticks.reserve(kLatencyIters);
-    for (int i = 0; i < kLatencyIters; ++i) {
+    const int iters = latency_iters();
+    ticks.reserve(static_cast<size_t>(iters));
+    for (int i = 0; i < iters; ++i) {
         const uint64_t t0 = bench_rdtsc();
         b.log_one();
         const uint64_t t1 = bench_rdtsc();

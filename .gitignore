@@ -8,6 +8,8 @@ build-bench/
 
 # Benchmark executables and object files (sources under bench/ are tracked)
 bench/bin/
+# FetchContent download target for bench (CMake puts deps here)
+bench/_deps/
 _bench_deps/
 
 # Benchmark / test log output
