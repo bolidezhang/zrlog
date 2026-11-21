@@ -23,8 +23,8 @@ SOFTWARE.
 #pragma once
 
 // The zrlog library version in the form major * 10000 + minor * 100 + patch.
-// 如：2.5.3
-#define ZRLOG_VERSION 20503
+// 如：2.5.4
+#define ZRLOG_VERSION 20504
 
 // ============================================================================
 // 日志头部统一格式定义 (用于 FMT_COMPILE 极速渲染)
