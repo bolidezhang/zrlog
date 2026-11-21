@@ -27,6 +27,10 @@ void init(const char* logfile) {
     cfg.buffer_full_policy = zrlog::BufferFullPolicy::Discard;
     // 关闭前端逐条空闲通知，测纯序列化+入队的下限；消费者靠 idle 超时轮询。
     cfg.notify_consumer_per_log = false;
+    // 诊断用：ZRLOG_BENCH_NOTIFY=1 开启逐条通知（测通知开销）。
+    if (const char* nt = std::getenv("ZRLOG_BENCH_NOTIFY")) {
+        if (*nt == '1') cfg.notify_consumer_per_log = true;
+    }
     // 诊断用：ZRLOG_BENCH_BG_CORE 指定后端线程绑核（如 10=其他 P 核、
     // 1=生产者 CPU 0 的超线程兄弟、2=E 核）。空 = 不绑（默认行为）。
     if (const char* bg = std::getenv("ZRLOG_BENCH_BG_CORE")) {

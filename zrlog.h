@@ -1112,8 +1112,12 @@ namespace zrlog {
         }
 
         // 只读观测接口：用于测试与监控轮转状态，不改变任何行为。
-        size_t current_size() const { return current_size_; }
-        bool   is_open() const { return fd_ != -1; }
+        size_t current_size() const { 
+            return current_size_; 
+        }
+        bool   is_open() const { 
+            return fd_ != -1; 
+        }
 
         // 区分"文件描述符本身已不可用"的硬错误与"暂时写不进去"的软错误。
         // 硬错误关闭 fd 交给 stderr 兜底；软错误（磁盘满、配额）保留 fd，
@@ -1487,7 +1491,10 @@ namespace zrlog {
                     }
                 }
                 config_ = config;
-                active_level_.store(config_.level, std::memory_order_relaxed);
+                hot_state_.store(
+                    static_cast<uint32_t>(config_.level) |
+                    (config_.notify_consumer_per_log ? kHotNotifyBit : 0u),
+                    std::memory_order_relaxed);
 
                 if (config_.appender == AppenderType::File) {
                     appender_ = std::make_unique<FileLogAppender>(config_.filename);
@@ -1531,14 +1538,21 @@ namespace zrlog {
         }
 
         inline bool check_level(LogLevel level) const {
-            // 读原子量而非 config_.level：消除与 init() 写 config_ 的数据竞争，
+            // 读打包热状态而非 config_.level：消除与 init() 写 config_ 的数据竞争，
             // 并支持运行时调级（relaxed load 在 x86 上与普通 load 同价）。
-            return level >= active_level_.load(std::memory_order_relaxed);
+            return level >= static_cast<LogLevel>(
+                hot_state_.load(std::memory_order_relaxed) & kHotLevelMask);
         }
 
         // 运行时调整日志级别（线程安全，立即生效）。
         inline void set_level(LogLevel level) {
-            active_level_.store(level, std::memory_order_relaxed);
+            // CAS 更新级别位，保留通知位不变。
+            uint32_t old = hot_state_.load(std::memory_order_relaxed);
+            uint32_t val;
+            do {
+                val = (old & ~kHotLevelMask) | static_cast<uint32_t>(level);
+            } while (!hot_state_.compare_exchange_weak(
+                old, val, std::memory_order_relaxed, std::memory_order_relaxed));
         }
 
         // ========================================================================
@@ -1563,13 +1577,19 @@ namespace zrlog {
                 "(e.g. nested std::string) into a plain struct/array, or specialize "
                 "zrlog::detail::loggable_arg<T> to std::true_type with your own guarantee.");
 
+            // 一次 load 同时获取级别与通知开关（见 hot_state_ 注释）。
+            const uint32_t hs = hot_state_.load(std::memory_order_relaxed);
+            if (ZRLOG_UNLIKELY(level < static_cast<LogLevel>(hs & kHotLevelMask))) {
+                return false;
+            }
+
             uint32_t log_id = log_id_atom.load(std::memory_order_relaxed);
             if (ZRLOG_UNLIKELY(0 == log_id)) {
                 log_id = register_log_meta<FmtProvider, typename std::decay<Args>::type...>(
                     log_id_atom, level, file, line, func);
             }
 
-            return push_log_entry(log_id, std::forward<Args>(args)...);
+            return push_log_entry(hs, log_id, std::forward<Args>(args)...);
         }
 
         // ========================================================================
@@ -1612,7 +1632,12 @@ namespace zrlog {
                                 std::memory_order_relaxed);
             }
 
-            return push_log_entry(log_id, std::forward<Args>(args)...);
+            const uint32_t hs = hot_state_.load(std::memory_order_relaxed);
+            if (ZRLOG_UNLIKELY(level < static_cast<LogLevel>(hs & kHotLevelMask))) {
+                return false;
+            }
+
+            return push_log_entry(hs, log_id, std::forward<Args>(args)...);
         }
 
         // 崩溃路径预热：在正常上下文缓存 ns/tick，供 emergency_flush() 在
@@ -1727,7 +1752,7 @@ namespace zrlog {
         }
 
         template<typename... Args>
-        inline bool push_log_entry(uint32_t log_id, Args&&... args) {
+        inline bool push_log_entry(uint32_t hot_state, uint32_t log_id, Args&&... args) {
             ThreadBuffer *buffer = get_thread_buffer();
             if (ZRLOG_UNLIKELY(nullptr == buffer)) {
                 return false;
@@ -1773,7 +1798,7 @@ namespace zrlog {
                 // benchmark 用它测纯序列化+入队下限；消费者靠 idle 超时轮询。
             }
             else {
-                if (ZRLOG_LIKELY(config_.notify_consumer_per_log)) {
+                if (ZRLOG_LIKELY(hot_state & kHotNotifyBit)) {
                     notify_consumer();
                 }
             }
@@ -2177,10 +2202,13 @@ namespace zrlog {
             // ------------------------------------------------------------------------
             // 前端（生产者）接口
             // ------------------------------------------------------------------------
+            // 快路径（热）：空间检查 + 物理位置计算 + 尾部空间判断 + 返回指针，
+            // 约 10 条指令。绕回代码（padding + 游标推进 + 发布）拆到 noinline
+            // alloc_wrap()：8MB 缓冲下每 8MB 才触发一次，独立函数边界让快路径
+            // 保持极小体积，MSVC 内联进 push_log_entry 时不会撑大寄存器压力
+            // （此前 alloc forceinline 退化正是因为把绕回代码一起内联了）。
             char* alloc(uint32_t len) {
                 // 生产者是 write_index_ 的唯一写者，本地游标即最新值，无需 load。
-                // 与普通条目不同：alloc() 本身绝不发布当前写位置，否则消费者会
-                // 读到尚未序列化的条目。发布只在 commit()（或下方绕回 padding）。
                 uint64_t w = local_write_index_;
 
                 // 【消除 P99 抖动】
@@ -2197,12 +2225,23 @@ namespace zrlog {
                 uint32_t phys_w = w & mask_;
                 uint32_t tail_free = size_ - phys_w;
 
-                // 物理尾部连续空间足够，直接分配
+                // 物理尾部连续空间足够，直接分配（绝大多数日志走这条路）
                 if (ZRLOG_LIKELY(len <= tail_free)) {
                     return mem_block_.ptr + phys_w;
                 }
 
-                // 物理尾部空间不够，必须绕回 (Wrap around)
+                // 物理尾部空间不够，必须绕回——冷路径
+                return alloc_wrap(len);
+            }
+
+            // 绕回（冷路径）：写 padding 占位、推进游标到下一圈、提前发布 padding。
+            // 从 local_write_index_ 重新取值（单生产者，安全），避免把 w/phys_w/
+            // tail_free 作为参数传入——那是快路径的寄存器，传参反而增加压力。
+            ZRLOG_NOINLINE char* alloc_wrap(uint32_t len) {
+                uint64_t w = local_write_index_;
+                uint32_t phys_w = w & mask_;
+                uint32_t tail_free = size_ - phys_w;
+
                 // 再次检查逻辑空间 (加上绕回产生的 padding 浪费后) 是否够用
                 if (ZRLOG_UNLIKELY(w + tail_free + len - cached_read_index_ > size_)) {
                     cached_read_index_ = read_index_.load(std::memory_order_acquire);
@@ -2909,7 +2948,9 @@ namespace zrlog {
             // 消费者置位 flag 在锁内完成（见 poll_routine），故看到 flag==true 时
             // 消费者必然已进入 wait_for，持锁 notify 通知必达（修复竞态 1）。
             // 竞态 2（生产者检查 flag 时消费者尚未置位的宽窗口，命中率 ~2%）由
-            // idle_wait_interval_us 超时兜底，属可接受的设计取舍
+            // idle_wait_interval_us 超时兜底，属可接受的设计取舍。
+            // 节流扩大了竞态 2 的窗口（生产者可能跳过检查），但超时兜底
+            // (idle_wait_interval_us, 默认 1ms) >> 节流阈值 (50µs)，安全。
             if (idle_wait_flag_.load(std::memory_order_relaxed)) {
                 std::lock_guard<std::mutex> lock(idle_wait_mutex_);
                 idle_wait_flag_.store(false, std::memory_order_relaxed);
@@ -2934,8 +2975,14 @@ namespace zrlog {
         static thread_local ThreadBufferDestroyer thread_buffer_destroyer_;
 
         Config config_;
-        // 生效日志级别（原子）：check_level 热路径读它，init/set_level 写它。
-        std::atomic<LogLevel> active_level_{ LogLevel::INFO };
+        // 热状态打包：一个 32 位原子量同时携带"生效日志级别"与"逐条通知开关"，
+        // 热路径一次 relaxed load 即可完成级别判断和通知判断，消除原先
+        // active_level_ 与 config_.notify_consumer_per_log 两次跨缓存行读。
+        // bits 0-2 = LogLevel (0-5)，bit 3 = notify_consumer_per_log。
+        static constexpr uint32_t kHotLevelMask = 0x7u;
+        static constexpr uint32_t kHotNotifyBit = 0x8u;
+        alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<uint32_t> hot_state_{
+            static_cast<uint32_t>(LogLevel::INFO) | kHotNotifyBit };
         SpinMutex log_metas_mutex_;
         std::vector<LogMeta> global_log_metas_;
         // DYN 格式串内容哈希 -> 候选 meta id 列表，加速 register_runtime_log_meta
@@ -3057,7 +3104,7 @@ namespace zrlog {
         (void)_check_literal;                                                                       \
                                                                                                     \
         zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                                  \
-        if (logger.check_level(level)) {                                                            \
+        {                                                                                           \
             static std::atomic<uint32_t> log_id{ 0 };                                               \
             struct FmtProvider {                                                                    \
                 static constexpr auto compile() {                                                   \
@@ -3084,7 +3131,7 @@ namespace zrlog {
 #define ZRLOG_DYN_BODY(level, format, ...)                                                          \
     do {                                                                                            \
         zrlog::NanoLogger &logger = zrlog::NanoLogger::instance();                                  \
-        if (logger.check_level(level)) {                                                            \
+        {                                                                                           \
             /* 高 32 位 log_id | 低 32 位格式串哈希，单原子量保证一致快照 */                            \
             static std::atomic<uint64_t> dyn_state{ 0 };                                            \
             std::string_view file { __FILE__, sizeof(__FILE__) - 1 };                               \

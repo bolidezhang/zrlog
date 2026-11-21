@@ -229,6 +229,11 @@ each, P-cores, 100 ms burn):
 | noinline Block/Retry slow path; Discard stays inline (30 paired samples) | p50 diff 0.00; p99.9 diff **-3.30** | kept: better tail, no p50/throughput cost |
 | `WriteReservation` value returned from `alloc` (30 paired samples) | p50 diff 0.00; p99.9 diff +1.35 | reverted |
 | **hoist `rdtsc` before `alloc`** (30 paired samples) | **p50 diff -1.30; p99 diff -3.30; p99.9 diff -6.70** (25/30 negative) | **kept: OPT FASTER; latency-throughput trade-off** |
+| **split wrap-around into noinline `alloc_wrap`, inline fast path** (30 paired samples) | min **30/30 negative**, avg -0.50, p90 -0.70, p999 -0.70, throughput **+19.8 M/s** (24/30 positive) | **kept: consistent win across every metric + throughput** |
+| **pack `active_level_` + `notify_consumer_per_log` into one `hot_state_` atomic** (30 paired samples) | p50 0.00 (24/30 identical), p99 -0.65 (17/30 negative) | kept: below resolution, assembly-verified one load; benefits contention |
+| **kitchen sink: hot_state + compile-time policy** (30 paired samples) | p50 0.00; p99 **+1.70** (19/30 positive = slower) | not stacked: both address the same notify-check cost; stacking hurts tail |
+| **notification throttle** (30 paired samples, `notify=true`, throttle 0 vs 50µs) | p50 **+6.70** (30/30 positive = slower), p99 **+11.40** | reverted: throttle overhead (rdtsc+TLS ≈ 10-15 cycles) exceeds flag-load savings (L1 hit ≈ 1-2 cycles) |
+| **`ZRLOG_COMPILE_TIME_POLICY` on top of all other opts** (30 paired samples) | p50 0.00 (27/30 identical), p99.9 -0.70, p99 +0.60, thr +3.4 | indistinguishable after rdtsc-hoist/alloc-split/hot-state; kept as opt-in |
 
 Key findings:
 
@@ -355,10 +360,100 @@ At this point the p50 delta is ~4 TSC ticks (0.67 ns/tick). The measured
 resolution of this harness is 1 tick, and the round-to-round IQR of the paired
 difference is 0.6-0.95 ns.
 
-**After hoisting `rdtsc` (the one change that broke the resolution floor), the
-p50 gap drops to ~1.4 ns** (17.4 - 1.3 = ~16.1 vs quill's 14.7). The remaining
-~1.4 ns is now below the 1-tick resolution floor in individual paired runs and
-is not attributable to any single instruction sequence that has been isolated.
+**After hoisting `rdtsc` and splitting `alloc` wrap-around (the two changes
+that produced measurable wins), the p50 gap drops to ~1.3 ns** (17.4 - 1.3 -
+0.35 ≈ 15.7 vs quill's 14.7). The remaining ~1.3 ns is now at or below the
+1-tick resolution floor in individual paired runs.
+
+### Splitting `alloc` wrap-around into a noinline cold path (kept)
+
+The previous `alloc forceinline` and `alloc cold-split` experiments both
+regressed because they either inlined *everything* (including wrap-around code,
+inflating register pressure) or split at the wrong boundary (empty-buffer
+handling). This experiment splits at the **wrap-around** boundary: the fast path
+(space check + mask + tail check + return pointer, ~12 instructions) is now
+small enough that MSVC naturally inlines it into `push_log_entry`, while the
+wrap-around code (padding + cursor advance + release store) moves to
+`ZRLOG_NOINLINE alloc_wrap()`.
+
+The assembly confirms the intent: `log_one` contains no `call alloc` — only
+`call alloc_wrap` on the rare wrap path (once per 8 MB). The fast path saves the
+`call` + `ret` + function prologue/epilogue (~5-8 cycles) and reuses registers
+already live in `push_log_entry`.
+
+30 paired samples:
+
+| metric | diff median | negative/zero/positive | note |
+|---|---|---|---|
+| min | **-0.70 ns** | **30/0/0** | impossible by chance (p = 2^-30) |
+| avg | -0.50 ns | 25/1/4 | consistent |
+| p90 | -0.70 ns | 20/8/2 | consistent |
+| p999 | -0.70 ns | 21/1/8 | consistent |
+| p50 | -0.35 ns | 15/13/2 | at resolution edge (IQR 0.70) |
+| throughput | **+19.8 M/s** | **24/0/6** | throughput also improved |
+
+This is the only experiment that improved **both** latency and throughput.
+The p50 delta (~0.5 cycle) is below the paired IQR, but the consistency across
+every other metric — especially min at 30/30 — rules out noise. Kept.
+
+Combined with the `rdtsc` hoist above, the p50 gap to quill drops from 2.7 ns
+to ~1.3 ns (17.4 - 1.3 - 0.35 ≈ 15.7 vs quill's 14.7), and the throughput cost
+of the rdtsc hoist is partially offset.
+
+### Packing `active_level_` + `notify_consumer_per_log` into one atomic (kept)
+
+The hot path reads two config fields from different cache lines:
+`active_level_` (offset 128) for the level check, and
+`config_.notify_consumer_per_log` (offset 56) for the notify check after
+commit. Packing both into a single `alignas(64) atomic<uint32_t> hot_state_`
+(bits 0-2 = level, bit 3 = notify) reduces this to **one load**. The assembly
+confirms: `mov esi, DWORD PTR logger+128` serves both `and al, 7; cmp al, 2`
+(level) and `test sil, 8` (notify) from the same register.
+
+30 paired samples: p50 difference 0.00 (24/30 rounds exactly zero — below the
+0.67 ns/tick measurement quantum), p99 -0.65 ns median (17/30 negative). The
+effect is below resolution on this single-threaded latency harness, but the
+mechanism is assembly-verified and the benefit grows under multi-threaded
+contention (the two fields were in different cache lines). Kept.
+
+### Notification throttle: the cost exceeds the saving (reverted)
+
+Throttling `notify_consumer()` with a TLS-cached TSC check (skip the
+`idle_wait_flag_` load if <50 µs since last check) was tested with
+`notify=true` (the default config). 30 paired samples:
+
+| metric | diff median | negative/zero/positive | |
+|---|---|---|---|
+| p50 | **+6.70 ns** | **0/0/30** | every round slower |
+| p99 | **+11.40 ns** | 1/0/29 | tail much worse |
+| p999 | **+12.65 ns** | 4/0/26 | |
+| throughput | -11.3 M/s | 20/0/10 | |
+
+p50 went from 16.7 → 23.4 ns (+40%). The mechanism is clear: the throttle's
+own overhead (~10-15 cycles for `rdtsc` + TLS access + comparison) exceeds the
+cost of the `idle_wait_flag_` load it skips (~1-2 cycles when the cache line is
+in L1, which it is in the benchmark — the consumer is busy processing and not
+writing the flag). The notification itself costs only ~0.7 ns (p50 16.0
+without notify → 16.7 with notify); the throttle costs 10× more than the thing
+it saves.
+
+**Lesson: do not throttle the notification.** The flag load is already cheap.
+The earlier finding ("disabling notification makes p99.9 2.4× worse") still
+holds — the notification is a net positive. But it is not worth optimizing
+further with throttling.
+
+### Sub-resolution improvements do not stack (kitchen sink test)
+
+Combining the hot-state packing with `ZRLOG_COMPILE_TIME_POLICY` (which
+compile-time eliminates the notify check) was tested as a 30-pair A/B against
+hot-state alone. Result: p50 identical, p99 **+1.70 ns slower** (19/30 rounds
+positive). The two optimisations address the same cost — the notify check — and
+once hot-state has already compressed it to one load + one `test`, the
+compile-time elimination only perturbs code layout and register allocation.
+Other sub-resolution candidates (call-site `FmtProvider` constants,
+`WriteReservation`) similarly measured zero individually; their sum is also
+below the 0.6-0.95 ns paired IQR. **Do not expect stacking sub-resolution
+optimisations to produce a visible combined effect on this harness.**
 
 ### The store-to-load chain that looks like it should matter but does not
 
