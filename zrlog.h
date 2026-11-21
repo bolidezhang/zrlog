@@ -77,14 +77,18 @@ constexpr size_t ZRLOG_CACHE_LINE_SIZE = 64; // 兼容老编译器的 Fallback
 // 行时，仍会互相触发 RFO。保守取 128；非 Intel 平台略增内存占用，无害。
 constexpr size_t ZRLOG_CROSS_THREAD_STRIDE = 128;
 
-// 跨平台分支预测宏
+// 跨平台分支预测与函数内联控制。热/冷拆分用 ZRLOG_NOINLINE 保留清晰边界，
+// 不让首次创建缓冲、分配失败等冷代码撑大热函数的寄存器分配与栈帧。
 #if defined(__GNUC__) || defined(__clang__)
 #define ZRLOG_LIKELY(x)   __builtin_expect(!!(x), 1)
 #define ZRLOG_UNLIKELY(x) __builtin_expect(!!(x), 0)
+#define ZRLOG_FORCEINLINE inline __attribute__((always_inline))
+#define ZRLOG_NOINLINE    __attribute__((noinline))
 #else
-// MSVC 或其他编译器不提供静态预测，直接返回表达式本身
 #define ZRLOG_LIKELY(x)   (x)
 #define ZRLOG_UNLIKELY(x) (x)
+#define ZRLOG_FORCEINLINE __forceinline
+#define ZRLOG_NOINLINE    __declspec(noinline)
 #endif
 
 // ---------------------------------------------------------------------------
@@ -917,15 +921,10 @@ namespace zrlog {
         uint32_t io_buffer_size = 1024 * 1024 * 4;      //io缓冲大小(也即日志格式化缓冲, 全局唯一)
         uint32_t thread_buffer_size = 1024 * 1024 * 1;  //每个线程的缓冲大小(前端二进制序列化缓冲 测试发现越大如16M,时延也变大)
         uint32_t per_thread_quota = 256;                //每个线程的格式化日志的配额(防止线程产生日志太快,公平处理每个线程日志)
-        // 前端热路径的两个可选开销，默认开启（保持原有语义与可观测性）。
-        // 关闭可换取更低的前端 p50，代价见各自说明：
-        //  - notify_consumer_per_log=false：不再每条日志检查空闲标志。消费者
-        //    完全依赖 idle_wait_interval_us 超时轮询，日志落盘延迟上限变为该
-        //    间隔（默认 1ms），稀疏日志场景更明显。
-        //  - producer_stats=false：不再累加生产统计（stat_produce_count_ /
-        //    stat_produce_valid_count_ 恒为 0），无法统计丢弃率。
+        // 前端热路径的可选开销，默认开启。关闭后不再每条日志检查空闲标志，
+        // 消费者完全依赖 idle_wait_interval_us 超时轮询，日志落盘延迟上限变为
+        // 该间隔（默认 1ms），稀疏日志场景更明显。
         bool     notify_consumer_per_log = true;
-        bool     producer_stats = true;
         uint32_t idle_wait_interval_us = 1000;          //空闲等待间隔(微秒)，自适应模式下为"空闲态上限"
         // 自适应空闲等待：开启后，有日志流量时把等待间隔压到 idle_busy_interval_us
         // （低延迟，落盘更及时），持续空闲时逐级放大回 idle_wait_interval_us（省 CPU）。
@@ -1331,6 +1330,19 @@ namespace zrlog {
 
     class NanoLogger {
     public:
+        // 极限前端的编译期策略。默认完全关闭，不改变现有运行时配置语义。
+        // benchmark 可定义 ZRLOG_COMPILE_TIME_POLICY 验证：确定使用 Discard
+        // 且不逐条通知时，让 MSVC 删除热函数中永远不会执行的策略分支。
+#ifdef ZRLOG_COMPILE_TIME_POLICY
+        static constexpr bool compile_time_policy = true;
+        static constexpr BufferFullPolicy frontend_full_policy = BufferFullPolicy::Discard;
+        static constexpr bool frontend_notify_per_log = false;
+#else
+        static constexpr bool compile_time_policy = false;
+        static constexpr BufferFullPolicy frontend_full_policy = BufferFullPolicy::Discard;
+        static constexpr bool frontend_notify_per_log = true;
+#endif
+
         class IOBuffer;
         // ThreadBuffer 是内部实现，前置声明放在 private 区（与定义同区，
         // 否则 GCC 报 "redeclared with different access"；MSVC 容忍该写法）。
@@ -1466,6 +1478,14 @@ namespace zrlog {
             // （幂等），避免改写 config_ 与后台线程读 config_、前端读缓冲配置构成
             // 数据竞争。需重新配置请先 fini() 再 init()；运行时调级用 set_level()。
             if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                if constexpr (compile_time_policy) {
+                    // 编译期策略承诺与运行时 Config 一致（见类头注释），不一致
+                    // 直接拒绝启动：静默忽略会按编译期分支丢日志，极难排查。
+                    if (config.buffer_full_policy != frontend_full_policy ||
+                        config.notify_consumer_per_log != frontend_notify_per_log) {
+                        return false;
+                    }
+                }
                 config_ = config;
                 active_level_.store(config_.level, std::memory_order_relaxed);
 
@@ -1508,8 +1528,6 @@ namespace zrlog {
                 }
                 appender_.reset();
             }
-            // 冲刷当前线程残留的本地生产计数（不足 1024 条的部分）
-            flush_local_produce_counter();
         }
 
         inline bool check_level(LogLevel level) const {
@@ -1634,124 +1652,111 @@ namespace zrlog {
 
         class ThreadBuffer;
 
-        // 生产者统计：热路径只累加 ThreadBuffer 内的生产者私有计数器（前端已持有
-        // buffer 指针，无额外 TLS 寻址），每 1024 次才汇总到全局原子量。直接在每条
-        // 日志上做 fetch_add（x86 的 lock xadd，~20+ 周期）会显著抬高前端 p50。
-        //
-        // producer_stats 开关在函数内部判断：调用点只写 note_produced(...) 一行，
-        // 不再每处重复 if (config_.producer_stats)。该开关 init 后不再变化，
-        // 分支预测稳定，开销与调用点判断相同。
-        inline void note_produced(ThreadBuffer* tb, bool accepted) {
-            if (ZRLOG_UNLIKELY(!config_.producer_stats)) {
-                return;
-            }
-            if (ZRLOG_UNLIKELY(nullptr == tb)) {
-                // 极罕见：缓冲创建失败（OOM）。直接计全局，避免丢失统计。
-                stat_produce_count_.fetch_add(1, std::memory_order_relaxed);
-                return;
-            }
-            ++tb->produce_attempts_;
-            if (accepted) {
-                ++tb->produce_accepted_;
-            }
-            if (ZRLOG_UNLIKELY((tb->produce_attempts_ & 1023u) == 0)) {
-                stat_produce_count_.fetch_add(tb->produce_attempts_, std::memory_order_relaxed);
-                stat_produce_valid_count_.fetch_add(tb->produce_accepted_, std::memory_order_relaxed);
-                tb->produce_attempts_ = 0;
-                tb->produce_accepted_ = 0;
-            }
-        }
-
-        // 把当前线程残留的本地计数冲刷到全局（fini / 线程退出前调用）。
-        inline void flush_local_produce_counter() {
-            ThreadBuffer* tb = thread_buffer_;
-            if (tb && (tb->produce_attempts_ != 0 || tb->produce_accepted_ != 0)) {
-                stat_produce_count_.fetch_add(tb->produce_attempts_, std::memory_order_relaxed);
-                stat_produce_valid_count_.fetch_add(tb->produce_accepted_, std::memory_order_relaxed);
-                tb->produce_attempts_ = 0;
-                tb->produce_accepted_ = 0;
-            }
-        }
-
         // ========================================================================
         // 公共的入队与序列化逻辑 (被 log 和 log_runtime 共同调用，完美转发)
         // ========================================================================
+        // 满缓冲慢路径（Block/Retry 自旋）拆到 noinline 冷函数；Discard 仍在
+        // 调用点原地返回，因为压测与丢日志模式下"满"是正常路径，不能多付调用。
+        // 这段慢代码体积大（两个 do-while + yield + config_ 读取），内联展开在
+        // push_log_entry 里会抬高快路径的寄存器压力与栈帧（TLS 拆分实验已证明
+        // MSVC 的帧成本是真实延迟来源）。快路径只剩"alloc 成功 -> 序列化 -> commit"。
+        ZRLOG_NOINLINE char* handle_full_buffer(ThreadBuffer* buffer, uint32_t aligned_len) {
+            if constexpr (compile_time_policy) {
+                // 编译期锁定满策略（当前仅支持 Discard，见类头常量声明）：
+                // 无 switch、无 config_ 读取，满即丢。定义
+                // ZRLOG_COMPILE_TIME_POLICY 即承诺运行时 Config 与此一致。
+                return nullptr;
+            }
+            switch (config_.buffer_full_policy) {
+            case BufferFullPolicy::Discard:
+                return nullptr;
+
+            case BufferFullPolicy::Block: {
+                notify_consumer();
+                // 修复：单条日志超过整个线程缓冲容量时永远无法入队（即使缓冲全空也放不下），
+                // 直接放弃，避免业务线程在此永久自旋（活锁）直到 fini()
+                if (aligned_len >= buffer->capacity()) {
+                    return nullptr;
+                }
+                uint32_t spin_count = 0;
+                do {
+                    if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                        return nullptr;
+                    }
+                    if (spin_count < 256) {
+                        ZRLOG_CPU_PAUSE();
+                    }
+                    else {
+                        std::this_thread::yield();
+                    }
+                    ++spin_count;
+                    char* p = buffer->alloc(aligned_len);
+                    if (p != nullptr) return p;
+                } while (true);
+            }
+
+            case BufferFullPolicy::Retry: {
+                notify_consumer();
+                // 同 Block：容量不够的条目永远放不下，快速放弃而非空转 256 次重试
+                if (aligned_len >= buffer->capacity()) {
+                    return nullptr;
+                }
+                uint32_t spin_count = 0;
+                do {
+                    if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                        return nullptr;
+                    }
+                    if (spin_count >= config_.buffer_full_retry_count) {
+                        return nullptr;
+                    }
+                    if (spin_count < 256) {
+                        ZRLOG_CPU_PAUSE();
+                    }
+                    else {
+                        std::this_thread::yield();
+                    }
+                    ++spin_count;
+                    char* p = buffer->alloc(aligned_len);
+                    if (p != nullptr) return p;
+                } while (true);
+            }
+
+            default:
+                return nullptr;
+            }
+        }
+
         template<typename... Args>
         inline bool push_log_entry(uint32_t log_id, Args&&... args) {
             ThreadBuffer *buffer = get_thread_buffer();
             if (ZRLOG_UNLIKELY(nullptr == buffer)) {
-                note_produced(nullptr, false);
                 return false;
             }
             uint32_t total_size = sizeof(LogEntryHeader) + calculate_args_size_all(args...);
             //为了内存地址对齐,所以将总长度向上对齐到 8 字节！
             uint32_t aligned_len = (total_size + 7) & ~7u;
 
+            // rdtsc 前置到 alloc() 之前：rdtsc 有 12-16 周期延迟，放在 alloc
+            // 返回之后（旧行为）会串行在关键路径上；前置后可与 call setup +
+            // alloc 函数体重叠。quill 的 log_statement 同样在队列预留之前取时间戳。
+            // 语义不变：仍记录"发起写入"时刻，与 quill 一致。
+            const uint64_t tsc = TscClock::rdtsc();
+
             char *ptr = buffer->alloc(aligned_len);
             if (ZRLOG_UNLIKELY(nullptr == ptr)) {
-                switch (config_.buffer_full_policy) {
-                case BufferFullPolicy::Discard:
-                    note_produced(buffer, false);
+                if constexpr (compile_time_policy) {
                     return false;
-
-                case BufferFullPolicy::Block: {
-                    notify_consumer();
-                    // 修复：单条日志超过整个线程缓冲容量时永远无法入队（即使缓冲全空也放不下），
-                    // 直接放弃，避免业务线程在此永久自旋（活锁）直到 fini()
-                    if (aligned_len >= buffer->capacity()) {
-                        note_produced(buffer, false);
+                }
+                else {
+                    // Discard 是压测与丢日志模式下的正常满路径，必须原地返回，
+                    // 不能为了一次永远失败的分配多付一次冷函数调用。
+                    if (ZRLOG_LIKELY(config_.buffer_full_policy == BufferFullPolicy::Discard)) {
                         return false;
                     }
-                    uint32_t spin_count = 0;
-                    do {
-                        if (!log_thread_running_.load(std::memory_order_relaxed)) {
-                            note_produced(buffer, false);
-                            return false;
-                        }
-                        if (spin_count < 256) {
-                            ZRLOG_CPU_PAUSE();
-                        }
-                        else {
-                            std::this_thread::yield();
-                        }
-                        ++spin_count;
-                        ptr = buffer->alloc(aligned_len);
-                    } while (ZRLOG_UNLIKELY(nullptr == ptr));
-                }
-                break;
-
-                case BufferFullPolicy::Retry: {
-                    notify_consumer();
-                    // 同 Block：容量不够的条目永远放不下，快速放弃而非空转 256 次重试
-                    if (aligned_len >= buffer->capacity()) {
-                        note_produced(buffer, false);
+                    ptr = handle_full_buffer(buffer, aligned_len);
+                    if (nullptr == ptr) {
                         return false;
                     }
-                    uint32_t spin_count = 0;
-                    do {
-                        if (!log_thread_running_.load(std::memory_order_relaxed)) {
-                            note_produced(buffer, false);
-                            return false;
-                        }
-                        if (spin_count >= config_.buffer_full_retry_count) {
-                            note_produced(buffer, false);
-                            return false;
-                        }
-                        if (spin_count < 256) {
-                            ZRLOG_CPU_PAUSE();
-                        }
-                        else {
-                            std::this_thread::yield();
-                        }
-                        ++spin_count;
-                        ptr = buffer->alloc(aligned_len);
-                    } while (ZRLOG_UNLIKELY(nullptr == ptr));
-                }
-                break;
-
-                default:
-                    note_produced(buffer, false);
-                    return false;
                 }
             }
 
@@ -1759,14 +1764,19 @@ namespace zrlog {
             LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
             header->total_size = aligned_len;
             header->log_id = log_id;
-            header->tsc = TscClock::rdtsc();
+            header->tsc = tsc;
             serialize_args_all(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
             buffer->commit(aligned_len);
 
-            if (ZRLOG_LIKELY(config_.notify_consumer_per_log)) {
-                notify_consumer();
+            if constexpr (compile_time_policy) {
+                // 编译期锁定"不逐条通知"：删除热函数里的 config_ 读取与分支。
+                // benchmark 用它测纯序列化+入队下限；消费者靠 idle 超时轮询。
             }
-            note_produced(buffer, true);
+            else {
+                if (ZRLOG_LIKELY(config_.notify_consumer_per_log)) {
+                    notify_consumer();
+                }
+            }
 
             return true;
         }
@@ -2168,7 +2178,10 @@ namespace zrlog {
             // 前端（生产者）接口
             // ------------------------------------------------------------------------
             char* alloc(uint32_t len) {
-                uint64_t w = write_index_.load(std::memory_order_relaxed);
+                // 生产者是 write_index_ 的唯一写者，本地游标即最新值，无需 load。
+                // 与普通条目不同：alloc() 本身绝不发布当前写位置，否则消费者会
+                // 读到尚未序列化的条目。发布只在 commit()（或下方绕回 padding）。
+                uint64_t w = local_write_index_;
 
                 // 【消除 P99 抖动】
                 // 使用非原子的本地缓存游标 `cached_read_index_` 判断空间。
@@ -2205,17 +2218,22 @@ namespace zrlog {
 
                 // 推进逻辑写下标，补齐到下一圈的物理 0 处
                 w += tail_free;
+                local_write_index_ = w;
 
-                // 提前发布 Padding，让消费者可以看到绕回动作
+                // 提前发布 Padding，让消费者可以看到绕回动作。这是一次独立于
+                // commit() 的发布：消费者必须先跳过尾部 padding，才能看到随后
+                // commit() 发布的新一圈条目，两次 store 的顺序不能合并/颠倒。
                 write_index_.store(w, std::memory_order_release);
 
                 return mem_block_.ptr;
             }
 
             inline void commit(uint32_t len) {
-                uint64_t w = write_index_.load(std::memory_order_relaxed);
-                w += len;
-                write_index_.store(w, std::memory_order_release);
+                // 前端热路径的唯一一次跨核写：推进本地游标并一次性发布。
+                // alloc() 与 commit() 不再各自 load(relaxed) write_index_；
+                // 既能少一条 load，也让编译器不必保守地假设中间有外部写者。
+                local_write_index_ += len;
+                write_index_.store(local_write_index_, std::memory_order_release);
             }
 
             // ------------------------------------------------------------------------
@@ -2324,9 +2342,6 @@ namespace zrlog {
             }
 
         private:
-            // 外层 NanoLogger 需直接读写生产统计计数（note_produced/flush）。
-            friend class NanoLogger;
-
             static const uint32_t PADDING_ID = 0xFFFFFFFF;
 
             // 归一化为 2 的幂，最小 1024，最大 2^30
@@ -2373,13 +2388,15 @@ namespace zrlog {
             // =========================================================================
 
             // --- 生产者独占 (写入端) ---
-            // 只有前端线程高频读写这里的变量
+            // write_index_ 是唯一的跨核发布点：只有 commit()（以及绕回时提前
+            // 发布 padding）才 store(release)，消费者据此判断条目可见。
             alignas(ZRLOG_CROSS_THREAD_STRIDE) std::atomic<uint64_t> write_index_{ 0 };
-            // cached_read_index_ 与 produce_* 都是生产者私有：消费者从不触碰，
-            // 故它们之间无需隔离，合并到同一行以节省空间。
+            // local_write_index_ / cached_read_index_ 都是生产者私有：消费者从不
+            // 触碰。前端在 alloc()/commit() 之间只读写 local_write_index_，不再
+            // 对 write_index_ 做两次 relaxed load；commit() 里把它一次性 store
+            // 到 write_index_ 完成发布。二者可共享生产者私有行，无需单独隔离。
+            uint64_t local_write_index_{ 0 };
             uint64_t cached_read_index_{ 0 };
-            uint64_t produce_attempts_{ 0 };
-            uint64_t produce_accepted_{ 0 };
 
             // --- 消费者独占 (读取端) ---
             // 与 write_index_ 至少隔 128 字节：两者分属不同核心的写者，是全库
@@ -2412,11 +2429,7 @@ namespace zrlog {
 
             ~ThreadBufferDestroyer() {
                 if (nullptr != NanoLogger::thread_buffer_) {
-                    // 先冲刷本线程残留的生产统计（不足 1024 条的部分），再标记
-                    // 待释放——否则工作线程退出后其残量永远无法汇总，统计少计。
-                    if (logger_) {
-                        logger_->flush_local_produce_counter();
-                    }
+                    // 标记缓冲区待释放，由后台线程排空后 delete。
                     NanoLogger::thread_buffer_->mark_deallocate();
                     if (logger_) {
                         logger_->notify_consumer();
@@ -2502,37 +2515,40 @@ namespace zrlog {
             return new_id;
         }
 
-        ThreadBuffer* get_thread_buffer() {
-            if (ZRLOG_UNLIKELY(nullptr == thread_buffer_)) {
-                // 已 shutdown（fini / 静态析构 / 崩溃抢救结束）：不再创建缓冲，日志
-                // 按丢弃处理。既避免向无人消费的缓冲入队造成泄漏，也避免在单例析构
-                // 后触碰已销毁的 config_（std::string）。冷路径判断，无热路径开销。
-                if (!log_thread_running_.load(std::memory_order_relaxed)) {
-                    return nullptr;
-                }
-                ThreadBuffer* tb = new ThreadBuffer(config_.thread_buffer_size, util::get_thread_id(), config_.enable_huge_page);
-                if (ZRLOG_UNLIKELY(!tb->valid())) {
-                    // 内存分配失败（OOM）：不注册、不入队，前端按丢弃处理。
-                    delete tb;
-                    return nullptr;
-                }
-                thread_buffer_ = tb;
-                thread_buffer_destroyer_.init(this);
-                std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
-                thread_buffers_.push_back(thread_buffer_);
-                buffer_count_hint_.store(buffer_count_hint_.load(std::memory_order_relaxed) + 1,
-                                         std::memory_order_release);
+        ZRLOG_FORCEINLINE ThreadBuffer* get_thread_buffer() {
+            // 热路径只读取 TLS 指针。把首次创建、OOM、注册等冷逻辑独立出去，
+            // 避免 MSVC 为它们保存大量寄存器并建立栈帧，拖累每条日志。
+            ThreadBuffer* tb = thread_buffer_;
+            if (ZRLOG_LIKELY(tb != nullptr)) {
+                return tb;
             }
-            return thread_buffer_;
+            return create_thread_buffer();
+        }
+
+        ZRLOG_NOINLINE ThreadBuffer* create_thread_buffer() {
+            // 已 shutdown（fini / 静态析构 / 崩溃抢救结束）：不再创建缓冲，日志
+            // 按丢弃处理。既避免向无人消费的缓冲入队造成泄漏，也避免在单例析构
+            // 后触碰已销毁的 config_（std::string）。冷路径判断，无热路径开销。
+            if (!log_thread_running_.load(std::memory_order_relaxed)) {
+                return nullptr;
+            }
+            ThreadBuffer* tb = new ThreadBuffer(config_.thread_buffer_size, util::get_thread_id(), config_.enable_huge_page);
+            if (ZRLOG_UNLIKELY(!tb->valid())) {
+                // 内存分配失败（OOM）：不注册、不入队，前端按丢弃处理。
+                delete tb;
+                return nullptr;
+            }
+            thread_buffer_ = tb;
+            thread_buffer_destroyer_.init(this);
+            std::lock_guard<SpinMutex> lock(thread_buffers_mutex_);
+            thread_buffers_.push_back(thread_buffer_);
+            buffer_count_hint_.store(buffer_count_hint_.load(std::memory_order_relaxed) + 1,
+                                     std::memory_order_release);
+            return tb;
         }
 
         size_t consume_buffers_round_robin(std::vector<LogMeta>& local_log_metas, IOBuffer& io_buf, bool full_drain = false) {
             size_t processed_count = 0;
-            // 消费侧统计：本轮在局部变量里累加，函数末尾一次性提交到原子量。
-            // 每条日志做两次 fetch_add（lock xadd，约 20 周期）在高吞吐下是
-            // 可观的开销，而消费者本来就是单线程，没有并发写者。
-            uint64_t local_consumed = 0;
-            uint64_t local_consumed_valid = 0;
             // 崩溃抢救路径：垂死线程可能正持有某把锁，此时强自旋会永久卡死，
             // 使抢救失败。故崩溃模式下改用 try_lock，抢不到就跳过本次同步，
             // 用已缓存的元数据/缓冲尽力输出剩余日志。
@@ -2621,7 +2637,6 @@ namespace zrlog {
                 // --- 业务消费逻辑开始 ---
                 while ((quota > 0) && (header = tb->try_read())) {
                     current_buffer_has_data = true; // 标记本轮读到了数据
-                    ++local_consumed;
                     ++processed_count;
                     --quota;
 
@@ -2671,9 +2686,9 @@ namespace zrlog {
                             // decoder 内部本应全量 catch；此处兜底确保异常不会
                             // 阻止下面的 consume（毒丸防护的最后一道防线）。
                         }
-                        ++local_consumed_valid;
                     }
-
+                    // 无论 meta 是否存在、decoder 是否抛出，游标都无条件前进，
+                    // 坏日志绝不重试（毒丸防护）。
                     tb->consume(entry_size);
                 }
 
@@ -2739,12 +2754,6 @@ namespace zrlog {
                 }
             } // end for
 
-            if (local_consumed != 0) {
-                stat_consume_count_.fetch_add(local_consumed, std::memory_order_relaxed);
-            }
-            if (local_consumed_valid != 0) {
-                stat_consume_valid_count_.fetch_add(local_consumed_valid, std::memory_order_relaxed);
-            }
             return processed_count;
         }
 
@@ -2957,12 +2966,6 @@ namespace zrlog {
         alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<bool> idle_wait_flag_{ false };
 
     public:
-        //statistics
-        std::atomic<uint64_t>  stat_produce_count_{ 0 };
-        std::atomic<uint64_t>  stat_produce_valid_count_{ 0 };
-        std::atomic<uint64_t>  stat_consume_count_{ 0 };
-        std::atomic<uint64_t>  stat_consume_valid_count_{ 0 };
-
         // 已注册的日志元数据条数（含 id=0 的占位项）。用于观测 DYN 格式串
         // 反复切换时元数据表是否收敛；只读、无副作用。
         size_t log_meta_count() const {

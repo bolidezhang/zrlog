@@ -220,7 +220,6 @@ TEST(config_defaults) {
     CHECK_EQ(c.idle_wait_interval_us, 1000u);
     CHECK_EQ(c.force_flush_interval_ms, 3000u);
     CHECK(c.notify_consumer_per_log);
-    CHECK(c.producer_stats);
     CHECK_EQ(c.tsc_sync_interval_s, 3600u);
     CHECK_EQ(c.crash_drain_wait_ms, 3000u);
     CHECK_EQ(c.buffer_full_retry_count, 256u);
@@ -358,15 +357,6 @@ TEST(e2e_file_logging) {
 
     const int year = std::atoi(head.substr(0, 4).c_str());
     CHECK(year >= 2020 && year <= 2100);
-
-    // 生产者统计（#7）：本轮共 kMtThreads*kMtPerThread + 5 条全部入队成功。
-    // 注意 stat_produce_* 是线程本地每 1024 条汇总一次，fini() 只冲刷调用线程
-    // 的残留计数；工作线程的残留无法跨线程冲刷，故只断言"有计数且有效数<=尝试数"。
-    const uint64_t produced = logger.stat_produce_count_.load(std::memory_order_relaxed);
-    const uint64_t produced_valid = logger.stat_produce_valid_count_.load(std::memory_order_relaxed);
-    CHECK(produced > 0);                       // 修复前恒为 0
-    CHECK(produced_valid <= produced);
-    CHECK(produced_valid > 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -901,6 +891,52 @@ TEST(force_flush_can_be_disabled) {
     CHECK(c.find("no_periodic_fsync 199") != std::string::npos);
     const size_t lines = static_cast<size_t>(std::count(c.begin(), c.end(), '\n'));
     CHECK_EQ(lines, static_cast<size_t>(200));
+}
+
+// ---------------------------------------------------------------------------
+// 环形缓冲绕回完整性：验证 alloc()/commit() 用生产者本地写游标（而不是每次
+// load write_index_）后，padding 发布与条目发布的时序仍然正确——消费者不得
+// 读到未序列化条目、不得撕裂、不得丢条。小缓冲 + Block 强制高频绕回。
+// ---------------------------------------------------------------------------
+TEST(ring_wraparound_integrity) {
+    const char* path = "zrlog_wrap_test.log";
+    std::remove(path);
+
+    zrlog::Config cfg;
+    cfg.appender = zrlog::AppenderType::File;
+    cfg.filename = path;
+    cfg.level = zrlog::LogLevel::INFO;
+    cfg.thread_buffer_size = 1024;   // 最小归一化缓冲，强制每几十条就绕回
+    cfg.io_buffer_size = 64 * 1024;
+    cfg.idle_wait_interval_us = 200;
+    cfg.buffer_full_policy = zrlog::BufferFullPolicy::Block;
+
+    auto& logger = zrlog::NanoLogger::instance();
+    CHECK(logger.init(cfg));
+
+    constexpr int kCount = 50000;
+    for (int i = 0; i < kCount; ++i) {
+        ZRLOG_INFO("wrap_sentinel {} end", i);
+    }
+    logger.fini();
+
+    std::ifstream in(path, std::ios::binary);
+    CHECK(in.good());
+    std::string line;
+    int seen = 0;
+    while (std::getline(in, line)) {
+        const size_t p = line.find("wrap_sentinel ");
+        if (p == std::string::npos) continue;
+        const size_t begin = p + strlen("wrap_sentinel ");
+        const size_t end = line.find(" end", begin);
+        CHECK(end != std::string::npos);              // 内容被截断/撕裂
+        const std::string num = line.substr(begin, end - begin);
+        const int value = std::atoi(num.c_str());
+        CHECK_EQ(value, seen);                        // 乱序、重复或丢失
+        ++seen;
+    }
+    std::remove(path);
+    CHECK_EQ(seen, kCount);
 }
 
 int main() {

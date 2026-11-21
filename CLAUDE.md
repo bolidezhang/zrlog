@@ -94,7 +94,7 @@ zrlog vs spdlog / fmtlog / NanoLog。**每个库编译成独立可执行文件**
 - **Block/Retry 策略对超大单条直接放弃**：单条日志 ≥ 线程缓冲容量时永远无法入队，`push_log_entry` 直接 return false，防止业务线程永久自旋（曾为活锁 bug）。
 - **先解码再推进游标 + 调用点兜底 catch（毒丸防护）**：消费循环里 `tb->consume()` 在 `meta.decoder()` **之后**调用。原因：解码参数是指向环形缓冲内部的零拷贝 `string_view`、header 按引用读取，若先 consume 发布 `read_index_`，生产者可能在 decoder 阻塞落盘期间绕回一整圈覆盖正在解码的条目（背压 + 慢盘下日志撕裂/时间戳跳变）。毒丸防护由"decoder 调用点包 try/catch(...) + 无论是否抛出都无条件 consume"保证——坏日志绝不重试（曾形成死循环卡死后台线程与 `fini()`，见 `a501692` 与 `zrlog_poison_test`）。改 decoder 或消费循环时务必同时保住这两点：解码期间游标不前进、consume 一定执行。
 - **解码错误限流**：`[FMT_ERROR]` 行只输出前 100 条（`kMaxDecodeErrorLines`），超出只计数，防止坏 formatter 淹没日志文件；总数经 `decode_error_count()` 观测。
-- **消费侧无锁提示 + 统计批量提交**：`meta_count_hint_`/`buffer_count_hint_` 让高频轮询先做无锁判断再决定是否抢自旋锁；消费统计在局部变量累加、每轮一次性 fetch_add。不要改回每条日志做原子加（x86 lock xadd ~20+ 周期，曾显著抬高开销，见 `d959794`）。前端生产统计同理：线程本地计数每 1024 条才汇总。
+- **消费侧无锁提示**：`meta_count_hint_`/`buffer_count_hint_` 让高频轮询先做无锁判断再决定是否抢自旋锁。生产/消费条数统计与 `producer_stats` 开关已在 `opt/frontend-latency` 分支整体删除（前端热路径不再有逐条计数与每 1024 条汇总）；历史上曾因每条日志做原子加（x86 lock xadd ~20+ 周期）显著抬高开销，见 `d959794`。
 - **`force_flush_interval_ms = 0` 关闭周期 fsync**：日志仍靠空闲/缓冲满/退出路径 write 到 page cache，只是不再定期强制刷盘；慢盘/网络存储应保持默认 3000ms。
 
 ## API 约定（修改宏或示例时必须遵守）
@@ -105,5 +105,5 @@ zrlog vs spdlog / fmtlog / NanoLog。**每个库编译成独立可执行文件**
 - 自定义类型参数必须"按值拷贝安全"（`detail::loggable_arg`：trivially copyable 或字符串类型）——前端逐位 memcpy 进缓冲，含堆内存的类型会在后端形成悬垂指针；确需支持时特化 `loggable_arg` 并自行保证安全
 - 格式串确需运行时确定时用 `ZRLOG_DYN_*` 宏（慢路径，`fmt::runtime`）。同一调用点的格式串**允许运行时更换**：调用点持有单个打包原子量 `dyn_state`（高 32 位 `log_id` | 低 32 位 FNV-1a 内容哈希），一次 load 取一致快照；哈希不一致时进锁内经 `runtime_meta_index_`（内容哈希→候选 id，O(1) 摊还）按 (file, line, 格式内容) 查重复用或追加新 `LogMeta`（旧 meta 保留供缓冲区中历史条目渲染）。**不要拆回两个独立原子量**——并发换格式串会交错出"id 与哈希错配"并持续按错格式渲染。取舍：哈希截断 32 位（碰撞 ~2^-32，慢路径全内容比对兜底）；每条日志仍算一次 O(len) 哈希；两线程同调用点并发用不同格式串时个别条目仍可能按对方格式渲染（fmt 抛 format_error，decoder 捕获输出 `[FMT_ERROR]` 行）
 - fmtlib 以 `FMT_HEADER_ONLY` 方式使用，头文件路径 `fmt/include`（submodule）
-- 生命周期：`init()` 只在启动 logging 前调一次，**运行中重复 init 为无操作**（幂等，避免改写 `config_` 与读线程竞争）；重新配置须先 `fini()` 再 `init()`，运行时调级用 `set_level()`（级别是原子量）。`fini()`/静态析构/崩溃抢救结束后日志按丢弃处理（`get_thread_buffer` 见停止标志不再建缓冲）。观测接口：`stat_produce_*`/`stat_consume_*`、`decode_error_count()`（formatter 抛错总数）、`io_drop_bytes()`（输出目的地写失败丢弃字节）、`log_meta_count()`
+- 生命周期：`init()` 只在启动 logging 前调一次，**运行中重复 init 为无操作**（幂等，避免改写 `config_` 与读线程竞争）；重新配置须先 `fini()` 再 `init()`，运行时调级用 `set_level()`（级别是原子量）。`fini()`/静态析构/崩溃抢救结束后日志按丢弃处理（`get_thread_buffer` 见停止标志不再建缓冲）。观测接口：`decode_error_count()`（formatter 抛错总数）、`io_drop_bytes()`（输出目的地写失败丢弃字节）、`log_meta_count()`（已注册元数据条数）；生产/消费条数统计已删除。
 - `zrlog::literal()` 只可包装**静态存储期**字符串（字面量/全局数组），包装栈局部数组会异步悬垂（C++17 无法编译期强制）；字面量优先用 `"..."_sl`

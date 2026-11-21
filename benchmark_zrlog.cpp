@@ -335,10 +335,6 @@ int main(int argc, char* argv[]) {
 
     std::cout << "\n=== Benchmark Complete ===" << std::endl;
     std::cout << "Log file: benchmark_zrlog.log" << std::endl;
-    std::cout << "stat_produce_count:" << logger.stat_produce_count_.load(std::memory_order_relaxed) << " stat_consumed_count:"
-        << logger.stat_consume_count_.load(std::memory_order_relaxed) << std::endl;
-    std::cout << "stat_produce_valid_count:" << logger.stat_produce_valid_count_.load(std::memory_order_relaxed)
-        << " stat_consume_valid_count:" << logger.stat_consume_valid_count_.load(std::memory_order_relaxed) << std::endl;
 
     return 0;
 }
