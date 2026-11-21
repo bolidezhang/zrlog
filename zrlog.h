@@ -47,6 +47,7 @@ SOFTWARE.
 #include <csignal>        // 用于崩溃信号捕获
 #include <filesystem>
 #include <vector>
+#include <deque>
 #include <list>
 #include <thread>
 #include <atomic>
@@ -1368,11 +1369,19 @@ namespace zrlog {
         // tsc 存的是前端读到的原始 TSC 计数（不是 ns）：前端只做 rdtsc，
         // 把 TSC->ns 的换算与锚点读取全部推迟到后端解码时完成。
         // 前提是 invariant TSC（跨核同步），已实测 P 核间偏移 <=1 tick。
+        // 16 字节 header：tag 合进 size_tag 高 8 位（[31:24]=tag, [23:0]=size），
+        // meta_id 为数组索引（0=PADDING, 1+=valid）。前端零额外开销。
+        static constexpr uint32_t kTagStatic  = 0;
+        static constexpr uint32_t kTagDyn     = 1;
+        static constexpr uint32_t kTagPadding = 2;
+        static constexpr uint32_t kSizeMask   = 0x00FFFFFF;
+        static constexpr uint32_t kTagShift   = 24;
         struct LogEntryHeader {
-            uint32_t total_size;
-            uint32_t log_id;
+            uint32_t size_tag;
+            uint32_t meta_id;
             uint64_t tsc;
         };
+        static_assert(sizeof(LogEntryHeader) == 16, "LogEntryHeader layout changed");
 
         class IOBuffer {
         public:
@@ -1589,7 +1598,7 @@ namespace zrlog {
                     log_id_atom, level, file, line, func);
             }
 
-            return push_log_entry(hs, log_id, std::forward<Args>(args)...);
+            return push_log_entry(hs, kTagStatic, log_id, std::forward<Args>(args)...);
         }
 
         // ========================================================================
@@ -1637,7 +1646,7 @@ namespace zrlog {
                 return false;
             }
 
-            return push_log_entry(hs, log_id, std::forward<Args>(args)...);
+            return push_log_entry(hs, kTagDyn, log_id, std::forward<Args>(args)...);
         }
 
         // 崩溃路径预热：在正常上下文缓存 ns/tick，供 emergency_flush() 在
@@ -1752,7 +1761,7 @@ namespace zrlog {
         }
 
         template<typename... Args>
-        inline bool push_log_entry(uint32_t hot_state, uint32_t log_id, Args&&... args) {
+        inline bool push_log_entry(uint32_t hot_state, uint32_t tag, uint64_t meta_or_id, Args&&... args) {
             ThreadBuffer *buffer = get_thread_buffer();
             if (ZRLOG_UNLIKELY(nullptr == buffer)) {
                 return false;
@@ -1787,8 +1796,8 @@ namespace zrlog {
 
             // 分配成功，进行真正的极速序列化
             LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(ptr);
-            header->total_size = aligned_len;
-            header->log_id = log_id;
+            header->size_tag = (tag << kTagShift) | (aligned_len & kSizeMask);
+            header->meta_id = static_cast<uint32_t>(meta_or_id);
             header->tsc = tsc;
             serialize_args_all(ptr + sizeof(LogEntryHeader), std::forward<Args>(args)...);
             buffer->commit(aligned_len);
@@ -1922,8 +1931,8 @@ namespace zrlog {
             uint32_t nano;
             // payload 末尾（不含）：total_size 含 16 字节 header 且已 8 字节对齐，
             // 故 args 区可用字节为 total_size - sizeof(LogEntryHeader)。
-            const char* args_end = buffer + (header.total_size >= sizeof(LogEntryHeader)
-                                             ? header.total_size - sizeof(LogEntryHeader) : 0);
+            const char* args_end = buffer + ((header.size_tag & kSizeMask) >= sizeof(LogEntryHeader)
+                                             ? (header.size_tag & kSizeMask) - sizeof(LogEntryHeader) : 0);
             const char *time_str = get_time_format_cache(
                 TscClock::instance().tsc_to_unix_ns_cached(header.tsc, consumer_anchor_cache()), nano);
 
@@ -1981,8 +1990,8 @@ namespace zrlog {
         static void generated_runtime_decoder(char*& buffer, const LogMeta& meta, const LogEntryHeader& header, uint64_t thread_id, IOBuffer& out) {
             uint32_t nano;
             // payload 末尾（不含），见 generated_decoder 中的说明。
-            const char* args_end = buffer + (header.total_size >= sizeof(LogEntryHeader)
-                                             ? header.total_size - sizeof(LogEntryHeader) : 0);
+            const char* args_end = buffer + ((header.size_tag & kSizeMask) >= sizeof(LogEntryHeader)
+                                             ? (header.size_tag & kSizeMask) - sizeof(LogEntryHeader) : 0);
             const char* time_str = get_time_format_cache(
                 TscClock::instance().tsc_to_unix_ns_cached(header.tsc, consumer_anchor_cache()), nano);
 
@@ -2309,8 +2318,8 @@ namespace zrlog {
                     LogEntryHeader *header = reinterpret_cast<LogEntryHeader *>(mem_block_.ptr + phys_r);
 
                     // 2. 显式 Padding
-                    if (ZRLOG_UNLIKELY(header->log_id == PADDING_ID)) {
-                        uint32_t claimed = header->total_size;
+                    if (ZRLOG_UNLIKELY((header->size_tag >> kTagShift) == kTagPadding)) {
+                        uint32_t claimed = (header->size_tag & kSizeMask);
                         if (ZRLOG_UNLIKELY(claimed < sizeof(LogEntryHeader) || claimed > tail_avail)) {
                             return nullptr;
                         }
@@ -2323,9 +2332,9 @@ namespace zrlog {
                     }
 
                     // 3. 拦截未完全 Commit 的块
-                    if (ZRLOG_UNLIKELY(r + header->total_size > cached_write_index_)) {
+                    if (ZRLOG_UNLIKELY(r + (header->size_tag & kSizeMask) > cached_write_index_)) {
                         cached_write_index_ = write_index_.load(std::memory_order_acquire);
-                        if (ZRLOG_UNLIKELY(r + header->total_size > cached_write_index_)) {
+                        if (ZRLOG_UNLIKELY(r + (header->size_tag & kSizeMask) > cached_write_index_)) {
                             return nullptr;
                         }
                     }
@@ -2381,8 +2390,6 @@ namespace zrlog {
             }
 
         private:
-            static const uint32_t PADDING_ID = 0xFFFFFFFF;
-
             // 归一化为 2 的幂，最小 1024，最大 2^30
             inline constexpr uint32_t normalize_size(uint32_t n) noexcept {
                 constexpr uint32_t MIN_SIZE = 1024;
@@ -2410,8 +2417,8 @@ namespace zrlog {
 
             inline void write_padding_local(uint32_t pos, uint32_t pad_size) {
                 LogEntryHeader *p = reinterpret_cast<LogEntryHeader *>(mem_block_.ptr + pos);
-                p->log_id = PADDING_ID;
-                p->total_size = pad_size;
+                p->size_tag = (kTagPadding << kTagShift) | (pad_size & kSizeMask);
+                p->meta_id = 0;
                 p->tsc = 0;
             }
 
@@ -2685,12 +2692,12 @@ namespace zrlog {
                     // 条目，造成日志内容撕裂/时间戳跳变（背压 + 慢盘场景）。
                     // 毒丸防护改由"调用点全量 catch + 无条件 consume"保证：即便
                     // decoder 意外抛出，游标也照样前进，绝不让坏日志被反复重试。
-                    const uint32_t entry_size = header->total_size;
-                    const uint32_t log_id = header->log_id;
+                    const uint32_t entry_size = header->size_tag & kSizeMask;
 
                     const LogMeta* meta = nullptr;
-                    if (log_id > 0 && log_id < local_log_metas.size()) {
-                        meta = &local_log_metas[log_id];
+                    const uint32_t meta_id = header->meta_id;
+                    if (meta_id > 0 && meta_id < local_log_metas.size()) {
+                        meta = &local_log_metas[meta_id];
                     }
                     else {
                         // log_id 尚未同步到本地：再拉取一次元数据。崩溃模式下用
@@ -2711,8 +2718,8 @@ namespace zrlog {
                             }
                             log_metas_mutex_.unlock();
                         }
-                        if (log_id > 0 && log_id < local_log_metas.size()) {
-                            meta = &local_log_metas[log_id];
+                        if (meta_id > 0 && meta_id < local_log_metas.size()) {
+                            meta = &local_log_metas[meta_id];
                         }
                     }
 
@@ -2962,10 +2969,8 @@ namespace zrlog {
             TscClock::instance();
             thread_buffers_.reserve(100);
             thread_buffers_bg_.reserve(100);
-            global_log_metas_.reserve(1000);
-
             //新增log_id为0的LogMeta项,保证有效log_id的序号从1开始
-            global_log_metas_.emplace_back(std::move(LogMeta()));
+            global_log_metas_.emplace_back(LogMeta());
         }
         ~NanoLogger() {
             fini();
@@ -2984,7 +2989,7 @@ namespace zrlog {
         alignas(ZRLOG_CACHE_LINE_SIZE) std::atomic<uint32_t> hot_state_{
             static_cast<uint32_t>(LogLevel::INFO) | kHotNotifyBit };
         SpinMutex log_metas_mutex_;
-        std::vector<LogMeta> global_log_metas_;
+        std::deque<LogMeta> global_log_metas_;
         // DYN 格式串内容哈希 -> 候选 meta id 列表，加速 register_runtime_log_meta
         // 查重（O(1) 摊还）。仅在 log_metas_mutex_ 锁内访问；碰撞由全内容比对兜底。
         std::unordered_map<uint64_t, std::vector<uint32_t>> runtime_meta_index_;

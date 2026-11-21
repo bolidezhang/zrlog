@@ -234,6 +234,9 @@ each, P-cores, 100 ms burn):
 | **kitchen sink: hot_state + compile-time policy** (30 paired samples) | p50 0.00; p99 **+1.70** (19/30 positive = slower) | not stacked: both address the same notify-check cost; stacking hurts tail |
 | **notification throttle** (30 paired samples, `notify=true`, throttle 0 vs 50µs) | p50 **+6.70** (30/30 positive = slower), p99 **+11.40** | reverted: throttle overhead (rdtsc+TLS ≈ 10-15 cycles) exceeds flag-load savings (L1 hit ≈ 1-2 cycles) |
 | **`ZRLOG_COMPILE_TIME_POLICY` on top of all other opts** (30 paired samples) | p50 0.00 (27/30 identical), p99.9 -0.70, p99 +0.60, thr +3.4 | indistinguishable after rdtsc-hoist/alloc-split/hot-state; kept as opt-in |
+| **self-describing header (24B, meta ptr direct encoding)** (30 paired samples) | p50 0.00; p99 **+3.00** (21/30 positive), thr -7.3 | superseded by Plan A |
+| **Plan A: 16B header, tag in size_tag high byte, meta_id array index** (30 paired samples) | p50 0.00; p99 **-2.70** (20/30 negative); thr -7.4 | **kept: only design with p99 improvement** |
+| **Plan B: 20B packed header, meta ptr direct encoding** (30 paired samples) | p50 0.00; p99 0.00; thr **-18.4** | rejected: unaligned access penalty offsets 4B saving |
 
 Key findings:
 
@@ -441,6 +444,31 @@ it saves.
 The earlier finding ("disabling notification makes p99.9 2.4× worse") still
 holds — the notification is a net positive. But it is not worth optimizing
 further with throttling.
+
+### Header design: three-way comparison (Plan A wins)
+
+Three header layouts were measured (each 30 paired samples vs the 24B
+self-describing baseline):
+
+| design | size | layout | self-describing | p50 diff | p99 diff | thr diff |
+|---|---|---|---|---|---|---|
+| 24B self-describing | 24 | `{size\|tag\|meta_ptr\|tsc}` | ✅ zero backend lookup | — | — | — |
+| **Plan A (chosen)** | **16** | `{size_tag\|meta_id\|tsc}` | ❌ array lookup | **0.00** | **-2.70** | -7.4 |
+| Plan B packed | 20 | `{size_tag\|meta_ptr\|tsc}` pack(1) | ✅ zero backend lookup | 0.00 | 0.00 | **-18.4** |
+
+**Plan A won** because it is the only design with a p99 improvement. The 16-byte
+entry gives better cache-line density (2 entries per 64B line vs 1.67 for 24B),
+which shows up in the tail. The backend array lookup costs ~5 cycles per decode
+but does not affect frontend latency. Plan B's `#pragma pack(1)` unaligned
+access penalty (~1-2 cycles on x86 per access) offsets the 4-byte saving.
+
+**The self-describing property (zero backend lookup) is architecturally correct
+but invisible in the frontend latency benchmark.** Its benefit lives in backend
+decode throughput. If backend throughput becomes a priority, revisit the 24B
+self-describing design — it is preserved in git history and `bench/bin/zrlog_24b.h`.
+
+A dedicated `selfdesc_header_mixed` test covers static+DYN interleaved through
+a 2KB buffer with wrap-around and padding (25/25 tests pass).
 
 ### Sub-resolution improvements do not stack (kitchen sink test)
 

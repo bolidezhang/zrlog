@@ -939,6 +939,71 @@ TEST(ring_wraparound_integrity) {
     CHECK_EQ(seen, kCount);
 }
 
+// ---------------------------------------------------------------------------
+// 自描述 Header 混合路径：静态 meta（直编码 LogMeta*）与 DYN meta（log_id 查表）
+// 共存于同一缓冲，交错写入并全部正确渲染。验证 tag 分派、meta_or_id 双语义、
+// 以及 24 字节 header 下的序列化/反序列化一致性。
+// ---------------------------------------------------------------------------
+TEST(selfdesc_header_mixed) {
+    const char* path = "zrlog_selfdesc_test.log";
+    std::remove(path);
+
+    zrlog::Config cfg;
+    cfg.appender = zrlog::AppenderType::File;
+    cfg.filename = path;
+    cfg.level = zrlog::LogLevel::INFO;
+    cfg.thread_buffer_size = 2048;   // 小缓冲，强制高频绕回 + padding
+    cfg.io_buffer_size = 64 * 1024;
+    cfg.idle_wait_interval_us = 200;
+    cfg.buffer_full_policy = zrlog::BufferFullPolicy::Block;
+
+    auto& logger = zrlog::NanoLogger::instance();
+    CHECK(logger.init(cfg));
+
+    constexpr int kCount = 3000;
+    for (int i = 0; i < kCount; ++i) {
+        if (i % 3 == 0) {
+            // DYN 路径：meta_or_id = log_id，后端查 local_log_metas
+            std::string fmt = (i % 2 == 0) ? "dynA {} end" : "dynB {} end";
+            ZRLOG_DYN_INFO(fmt, i);
+        }
+        else {
+            // 静态路径：meta_or_id = LogMeta*，后端直接解引用
+            ZRLOG_INFO("static_sentinel {} end", i);
+        }
+    }
+    logger.fini();
+
+    std::ifstream in(path, std::ios::binary);
+    CHECK(in.good());
+    std::string line;
+    int static_seen = 0, dyn_seen = 0;
+    while (std::getline(in, line)) {
+        size_t p = line.find("static_sentinel ");
+        if (p != std::string::npos) {
+            const size_t begin = p + strlen("static_sentinel ");
+            const size_t end = line.find(" end", begin);
+            CHECK(end != std::string::npos);      // 内容被截断/撕裂
+            const int value = std::atoi(line.substr(begin, end - begin).c_str());
+            CHECK_EQ(value, (static_seen + dyn_seen));  // 乱序/丢失
+            ++static_seen;
+        }
+        else if ((p = line.find("dynA ")) != std::string::npos) {
+            CHECK(line.find(" end", p) != std::string::npos);
+            ++dyn_seen;
+        }
+        else if ((p = line.find("dynB ")) != std::string::npos) {
+            CHECK(line.find(" end", p) != std::string::npos);
+            ++dyn_seen;
+        }
+    }
+    std::remove(path);
+    // 2/3 是 static，1/3 是 dyn
+    CHECK_EQ(static_seen, kCount - kCount / 3);
+    CHECK_EQ(dyn_seen, kCount / 3);
+    CHECK_EQ(static_seen + dyn_seen, kCount);
+}
+
 int main() {
     std::cout << "zrlog unit tests (" << zrt::registry().size() << " cases)\n";
     int failed = 0;
