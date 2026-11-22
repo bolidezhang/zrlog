@@ -1725,7 +1725,9 @@ namespace zrlog {
                     }
                     ++spin_count;
                     char* p = buffer->alloc(aligned_len);
-                    if (p != nullptr) return p;
+                    if (p != nullptr) {
+                        return p;
+                    }
                 } while (true);
             }
 
@@ -1751,7 +1753,9 @@ namespace zrlog {
                     }
                     ++spin_count;
                     char* p = buffer->alloc(aligned_len);
-                    if (p != nullptr) return p;
+                    if (p != nullptr) {
+                        return p;
+                    }
                 } while (true);
             }
 
@@ -3019,10 +3023,11 @@ namespace zrlog {
 
     public:
         // 已注册的日志元数据条数（含 id=0 的占位项）。用于观测 DYN 格式串
-        // 反复切换时元数据表是否收敛；只读、无副作用。
+        // 反复切换时元数据表是否收敛；只读、无副作用、无锁。
+        // meta_count_hint_ 由注册侧在 push_back 后 release store 更新，
+        // 与 global_log_metas_.size() 始终一致（最多滞后一次 push_back）。
         size_t log_meta_count() const {
-            std::lock_guard<SpinMutex> lock(const_cast<SpinMutex&>(log_metas_mutex_));
-            return global_log_metas_.size();
+            return meta_count_hint_.load(std::memory_order_relaxed);
         }
 
         // 解码失败总数（含因限流未输出到日志文件的部分）。
