@@ -62,16 +62,16 @@ zrlog vs spdlog / fmtlog / quill / NanoLog。**每个库编译成独立可执行
 
 ### 当前性能基线（v2.5.4，canonical run）
 
-数据目录 `bench/results_win_v254_pcore/`：9 轮中位数，Intel Core Ultra 5 125H，P 核 `0,10,12,14`，4 线程，100ms burn。
+数据目录 `bench/results_win_v254_pcore/` + `bench/results_win_v254_pcore_run2/`（两轮各 9 轮，合并取 18 轮中位数）：Intel Core Ultra 5 125H，P 核 `0,10,12,14`，4 线程，100ms burn。
 
 | 库 | Avg | Min | **P50** | P90 | P99 | P99.9 | 吞吐中位数 (M/s) |
 |---|---|---|---|---|---|---|---|
-| quill | 15.3 | 13.4 | **14.7** | 15.4 | 16.7 | 31.4 | 125.8（无界队列，全接受）|
-| **zrlog** | 17.3 | 15.4 | **16.7** | 17.4 | 27.4 | 32.7 | 282.0（Discard，尝试率）|
-| fmtlog | 18.5 | 15.4 | **16.0** | 17.4 | 81.5 | 90.1 | 287.6（Discard，尝试率）|
-| spdlog | 448.2 | 158.3 | 245.1 | 1055.0 | 2351.8 | 5647.0 | 1.9（overrun_oldest）|
+| quill | 15.4 | 13.4 | **14.7** | 15.4 | 19.7 | 31.4 | 127.1（无界队列，全接受）|
+| **zrlog** | 17.3 | 15.4 | **16.7** | 17.4 | 27.0 | 32.7 | 289.3（Discard，尝试率）|
+| fmtlog | 18.6 | 15.4 | **16.7** | 17.4 | 81.2 | 94.8 | 286.0（Discard，尝试率）|
+| spdlog | 447.8 | 158.3 | 244.1 | 1041.0 | 2409.6 | 5993.3 | 1.7（overrun_oldest）|
 
-要点：**P50 与 quill 基本持平（差 2ns），P99.9 尾部与 quill 相当（32.7 vs 31.4）；P50 与 fmtlog 持平但 P99/P99.9 约为其 1/3（尾部形态远好）**。吞吐跨库不可直接比（丢弃策略不同），仅 zrlog 与 fmtlog 同为 Discard 尝试率、量级相当。**跨运行绝对值不可比**——zrlog 相同代码 p50 曾在 20–49ns 间漂移，只信同轮内排名（详见 `bench/FINDINGS.md`）。
+要点：**P50 与 quill 基本持平（差 2ns），P99.9 尾部与 quill 相当（32.7 vs 31.4）；P50 与 fmtlog 打平但 P99/P99.9 约为其 1/3（尾部形态远好）**。吞吐跨库不可直接比（丢弃策略不同），仅 zrlog 与 fmtlog 同为 Discard 尝试率、量级相当。**跨运行绝对值不可比**——zrlog 相同代码 p50 曾在 20–49ns 间漂移，只信同轮内排名（详见 `bench/FINDINGS.md`）。两轮独立 9-round 会话的 zrlog P50/P99.9 完全一致（16.7 / 32.7），可复现性良好。
 
 前端热路径的历史优化（均已合入 main）：TLS 缓冲查找拆分（内联命中 + noinline 创建）、rdtsc 前置到 alloc 之前、删除生产/消费统计计数、hot_state 打包、alloc 绕回拆 noinline、`LogEntryHeader` 压到 16 字节（tag 合入 `size_tag` 高 8 位 + `meta_id` 数组索引）。18 组消融实验与死路记录见 `bench/FINDINGS.md`。
 
