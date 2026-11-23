@@ -4,13 +4,13 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-zrlog 是一个面向低延迟、高并发系统的 C++17 异步日志库，核心目标是纳秒级前端延迟与极高吞吐。整个库的实现都在单个头文件 `zrlog.h` 中（约 3060 行），无 .cpp 源文件。当前版本 2.5.1（`ZRLOG_VERSION`）。
+zrlog 是一个面向低延迟、高并发系统的 C++17 异步日志库，核心目标是纳秒级前端延迟与极高吞吐。整个库的实现都在单个头文件 `zrlog.h` 中（约 3060 行），无 .cpp 源文件。当前版本 2.5.4（`ZRLOG_VERSION` = 20504）。
 
 **版本分支注意**：仓库以两个不兼容的分支维护：
 - `v1.x`：单头文件、零第三方依赖、printf 风格（`%d`/`%s`）
-- `v2.x`（当前主线）：集成 fmtlib（header-only），使用 `{}` 占位符 + `FMT_COMPILE` 编译期格式化
+- `main`（当前主线，原 `v2.x`）：集成 fmtlib（header-only），使用 `{}` 占位符 + `FMT_COMPILE` 编译期格式化
 
-v2.x **不兼容** v1.x，所有格式串必须使用 fmt 语法。修改 `zrlog.h` 时需确认当前分支。
+主线**不兼容** v1.x，所有格式串必须使用 fmt 语法。修改 `zrlog.h` 时需确认当前分支。
 
 ## 构建与测试
 
@@ -37,7 +37,7 @@ g++ -O3 -march=native -flto -std=c++17 -pthread -I./fmt/include benchmark_zrlog.
 CMake 选项：`ZRLOG_BUILD_BENCHMARK`（默认 ON）、`ZRLOG_BUILD_TESTS`（默认 ON）、`ZRLOG_BUILD_CROSS_BENCH`（默认 OFF，配置时需联网克隆第三方库）。MSVC 下 `zrlog` INTERFACE target 自动带 `/utf-8`——fmt 12.x 的 Unicode 支持缺它会静态断言失败，手动编译时也要加。
 
 **测试套件**（`tests/`，自研轻量框架，无第三方依赖，`TEST(name)` + `CHECK`/`CHECK_EQ`，失败抛异常、main 汇总返回非 0）：
-- `zrlog_tests`（ctest 名 `zrlog_unit_tests`）：23 个功能用例，覆盖序列化/轮转/线程退出/DYN 等。新增用例直接在 `tests/zrlog_tests.cpp` 里加 `TEST()`
+- `zrlog_tests`（ctest 名 `zrlog_unit_tests`）：25 个功能用例，覆盖序列化/轮转/线程退出/DYN/环形绕回完整性/自描述头混合等。新增用例直接在 `tests/zrlog_tests.cpp` 里加 `TEST()`
 - `zrlog_exception_test`（`zrlog_exception_barrier`）：自定义 formatter 抛异常时进程须存活并输出 `[FMT_ERROR]`
 - `zrlog_poison_test`（`zrlog_poison_pill`）：decoder 抛异常不得卡死后台线程与 `fini()`
 - `zrlog_crash_test`（`zrlog_crash_flush`，**仅 Windows**）：CreateProcess 子进程触发 SIGSEGV，父进程校验崩溃前日志已落盘
@@ -50,7 +50,7 @@ benchmark 套件：前端延迟（Avg/P50/P99/P99.9）、单/多线程吞吐、�
 
 ## 跨库对比基准（bench/）
 
-zrlog vs spdlog / fmtlog / NanoLog。**每个库编译成独立可执行文件**——各库自带的 fmt 版本不同，混进一个二进制会 ODR 冲突；测量代码共用 `bench/bench_common.h` 保证口径一致。
+zrlog vs spdlog / fmtlog / quill / NanoLog。**每个库编译成独立可执行文件**——各库自带的 fmt 版本不同，混进一个二进制会 ODR 冲突；测量代码共用 `bench/bench_common.h` 保证口径一致。
 
 两条构建路线：
 - **CMake（需联网）**：`cmake -B build-bench -DZRLOG_BUILD_CROSS_BENCH=ON`，FetchContent 拉取 spdlog v1.17.0 / fmtlog main / NanoLog master。离线用 `-DZRLOG_BENCH_FETCH_DEPS=OFF -DZRLOG_BENCH_DEPS=/path/to/deps`（目录下含 `spdlog/`、`fmtlog/`、`nanolog/`），或 `-DFETCHCONTENT_SOURCE_DIR_<SPDLOG|FMTLOG|NANOLOG>=...` 逐个指定。GitHub 直连被重置时用 `-DZRLOG_BENCH_GIT_MIRROR=https://gh-proxy.com/` 等镜像前缀
@@ -59,6 +59,21 @@ zrlog vs spdlog / fmtlog / NanoLog。**每个库编译成独立可执行文件**
 运行与汇总：`bench/run_bench.sh [rounds] [threads] [per_thread]`（Windows：`run_win.ps1 -Rounds 7 -Threads 4 -Per 4000000`），`python bench/aggregate.py <results目录>` 取中位数。
 
 **测量方法学的刻意取舍（不要"顺手修"）**：延迟循环用自旋节流而非 sleep（睡眠唤醒的 C-state/缓存惩罚会制造微秒级假 p99.9 尾部）；时间戳用 TSC 校准，样本离线排序取百分位；吞吐循环不节流，数字是"接受条数/秒"而非无损速率；每轮轮转库顺序均摊冷缓存偏置。混合架构（P/E 核）上必须用 `BENCH_CPUS` 绑到 P 核，否则排名会被 E 核拉偏。对比结论必须对着**同一提交、同一空闲机器**构建的基线，并随结果记录 CPU/绑核/负载（各 results 目录的 `env.txt`）。
+
+### 当前性能基线（v2.5.4，canonical run）
+
+数据目录 `bench/results_win_v254_pcore/`：9 轮中位数，Intel Core Ultra 5 125H，P 核 `0,10,12,14`，4 线程，100ms burn。
+
+| 库 | Avg | Min | **P50** | P90 | P99 | P99.9 | 吞吐中位数 (M/s) |
+|---|---|---|---|---|---|---|---|
+| quill | 15.3 | 13.4 | **14.7** | 15.4 | 16.7 | 31.4 | 125.8（无界队列，全接受）|
+| **zrlog** | 17.3 | 15.4 | **16.7** | 17.4 | 27.4 | 32.7 | 282.0（Discard，尝试率）|
+| fmtlog | 18.5 | 15.4 | **16.0** | 17.4 | 81.5 | 90.1 | 287.6（Discard，尝试率）|
+| spdlog | 448.2 | 158.3 | 245.1 | 1055.0 | 2351.8 | 5647.0 | 1.9（overrun_oldest）|
+
+要点：**P50 与 quill 基本持平（差 2ns），P99.9 尾部与 quill 相当（32.7 vs 31.4）；P50 与 fmtlog 持平但 P99/P99.9 约为其 1/3（尾部形态远好）**。吞吐跨库不可直接比（丢弃策略不同），仅 zrlog 与 fmtlog 同为 Discard 尝试率、量级相当。**跨运行绝对值不可比**——zrlog 相同代码 p50 曾在 20–49ns 间漂移，只信同轮内排名（详见 `bench/FINDINGS.md`）。
+
+前端热路径的历史优化（均已合入 main）：TLS 缓冲查找拆分（内联命中 + noinline 创建）、rdtsc 前置到 alloc 之前、删除生产/消费统计计数、hot_state 打包、alloc 绕回拆 noinline、`LogEntryHeader` 压到 16 字节（tag 合入 `size_tag` 高 8 位 + `meta_id` 数组索引）。18 组消融实验与死路记录见 `bench/FINDINGS.md`。
 
 ## 架构
 
@@ -79,8 +94,8 @@ zrlog vs spdlog / fmtlog / NanoLog。**每个库编译成独立可执行文件**
 - `util` 命名空间（L617 起）：线程 ID、绑核、P-core 拓扑探测、HugePage 内存块
 - `LogLevel` / `AppenderType` / `BufferFullPolicy` / `Config`（L874-963）：公共配置接口
 - `ILogAppender` 及子类 `FileLogAppender` / `RotatingFileLogAppender` / `ConsoleLogAppender`（L965 起）：输出目的地；轮转采用 O(1) 滑动窗口 + 孤儿文件清理 + 写失败退避（硬错误关 fd 降级 stderr，软错误保留 fd 等恢复）
-- `NanoLogger`（L1318）：单例核心，内含 `IOBuffer`（L1346，支持大页 + 部分写保留/丢弃统计）、`LogMeta`、`LogEntryHeader`（16 字节，存原始 TSC 而非 ns）；后台消费线程、崩溃应急 flush（`emergency_flush`，有界 rdtsc 预算兜底）都在这里
-- `NanoLogger::ThreadBuffer`（L2108）：每线程 SPSC 环形缓冲；生产者/消费者游标 `alignas(CACHE_LINE_SIZE)` 隔离防伪共享；生产者用本地缓存游标 `cached_read_index_` 避免跨核通信，消费者 4KB 批量提交游标；生产统计计数也放在生产者私有缓存行
+- `NanoLogger`（L1318）：单例核心，内含 `IOBuffer`（L1346，支持大页 + 部分写保留/丢弃统计）、`LogMeta`、`LogEntryHeader`（16 字节：`size_tag` 高 8 位存 tag、低 24 位存 size，`meta_id` 为 `global_log_metas_` 数组索引，`tsc` 存原始 TSC；`static_assert` 锁定布局）；后台消费线程、崩溃应急 flush（`emergency_flush`，有界 rdtsc 预算兜底）都在这里
+- `NanoLogger::ThreadBuffer`（L2145）：每线程 SPSC 环形缓冲；生产者/消费者游标 `alignas(ZRLOG_CROSS_THREAD_STRIDE)`（128B）隔离防伪共享；生产者用本地缓存游标 `cached_read_index_` 避免跨核通信；`alloc()` 快路径只做空间检查 + mask + tail 判断，绕回（padding + 游标推进 + release store）拆到 noinline `alloc_wrap()`；生产/消费统计计数已删除，前端热路径不再有逐条计数
 - `ThreadBufferDestroyer`（L2373）：线程退出时冲刷统计、标记缓冲区待释放并置空 TLS 指针，后台线程排空后才 delete——不丢日志不泄漏不复用已释放内存
 - L3010 起为公共宏层：`ZRLOG_INIT_CONF` / `ZRLOG_FINI` / `ZRLOG_INFO` / `ZRLOG_DYN_*` 等
 
@@ -94,7 +109,7 @@ zrlog vs spdlog / fmtlog / NanoLog。**每个库编译成独立可执行文件**
 - **Block/Retry 策略对超大单条直接放弃**：单条日志 ≥ 线程缓冲容量时永远无法入队，`push_log_entry` 直接 return false，防止业务线程永久自旋（曾为活锁 bug）。
 - **先解码再推进游标 + 调用点兜底 catch（毒丸防护）**：消费循环里 `tb->consume()` 在 `meta.decoder()` **之后**调用。原因：解码参数是指向环形缓冲内部的零拷贝 `string_view`、header 按引用读取，若先 consume 发布 `read_index_`，生产者可能在 decoder 阻塞落盘期间绕回一整圈覆盖正在解码的条目（背压 + 慢盘下日志撕裂/时间戳跳变）。毒丸防护由"decoder 调用点包 try/catch(...) + 无论是否抛出都无条件 consume"保证——坏日志绝不重试（曾形成死循环卡死后台线程与 `fini()`，见 `a501692` 与 `zrlog_poison_test`）。改 decoder 或消费循环时务必同时保住这两点：解码期间游标不前进、consume 一定执行。
 - **解码错误限流**：`[FMT_ERROR]` 行只输出前 100 条（`kMaxDecodeErrorLines`），超出只计数，防止坏 formatter 淹没日志文件；总数经 `decode_error_count()` 观测。
-- **消费侧无锁提示**：`meta_count_hint_`/`buffer_count_hint_` 让高频轮询先做无锁判断再决定是否抢自旋锁。生产/消费条数统计与 `producer_stats` 开关已在 `opt/frontend-latency` 分支整体删除（前端热路径不再有逐条计数与每 1024 条汇总）；历史上曾因每条日志做原子加（x86 lock xadd ~20+ 周期）显著抬高开销，见 `d959794`。
+- **消费侧无锁提示**：`meta_count_hint_`/`buffer_count_hint_` 让高频轮询先做无锁判断再决定是否抢自旋锁；`log_meta_count()` 也直接读 `meta_count_hint_`（无锁），不再持 `log_metas_mutex_`。生产/消费条数统计与 `producer_stats` 开关已整体删除（前端热路径不再有逐条计数与每 1024 条汇总）；历史上曾因每条日志做原子加（x86 lock xadd ~20+ 周期）显著抬高开销，见 `d959794`。
 - **`force_flush_interval_ms = 0` 关闭周期 fsync**：日志仍靠空闲/缓冲满/退出路径 write 到 page cache，只是不再定期强制刷盘；慢盘/网络存储应保持默认 3000ms。
 
 ## API 约定（修改宏或示例时必须遵守）

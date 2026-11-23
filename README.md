@@ -190,9 +190,31 @@ zrlog provides three policies via `zrlog::BufferFullPolicy` to handle this scena
 
 zrlog has been rigorously tested against industry-standard logging libraries. It sits comfortably in the absolute top tier of low-latency loggers:
 
-*   **Beats `fmtlog`**: Consistently outperforms `fmtlog` in frontend latency (delivering lower **Average**, **P50**, and **MIN** latency). Moreover, its maximum **throughput is significantly higher** than `fmtlog`.
-*   **Top-Tier Class**: Belongs to the same nanosecond-level elite tier as `nanolog` and `fmtlog` and `quill`.
-*   **Decimates Traditional Loggers**: Achieves **10x - 50x higher performance** (latency and throughput) compared to mainstream loggers like `spdlog`. It is an ideal replacement for High-Frequency Trading (HFT) and extreme low-latency backends.
+*   **Close to `quill`**: frontend **P50 within ~2 ns** of quill (16.7 vs 14.7 ns), and zrlog's **P99.9 tail is competitive** (32.7 vs 31.4 ns) thanks to its smooth distribution — it stays well-behaved under bursts.
+*   **Far better tail than `fmtlog`**: P50 is essentially tied (16.7 vs 16.0 ns) but zrlog's **P99 is ~3x lower** (27.4 vs 81.5 ns) and P99.9 ~3x lower (32.7 vs 90.1 ns); throughput is on par (~282 vs ~288 M/s). fmtlog's queue drains in bursts that hurt the tail.
+*   **Decimates Traditional Loggers**: **~26x lower P50** (16.7 ns vs 245 ns) and **~150x higher throughput** (~282 vs ~1.9 M/s) than `spdlog`. An ideal replacement for High-Frequency Trading (HFT) and extreme low-latency backends.
+
+### 📈 Measured Results
+
+Frontend latency in nanoseconds (median of 9 rounds; Intel Core Ultra 5 125H, pinned to P-cores `0,10,12,14`, 4 worker threads, 100 ms warm-up burn). Lower is better:
+
+| Library  | Avg   | Min   | **P50** | P90   | P99   | P99.9 | Max     |
+|----------|-------|-------|---------|-------|-------|-------|---------|
+| quill    | 15.3  | 13.4  | **14.7**| 15.4  | 16.7  | 31.4  | 13106   |
+| **zrlog**| 17.3  | 15.4  | **16.7**| 17.4  | 27.4  | 32.7  | 6104    |
+| fmtlog   | 18.5  | 15.4  | **16.0**| 17.4  | 81.5  | 90.1  | 4773    |
+| spdlog   | 448.2 | 158.3 | 245.1   | 1055.0| 2351.8| 5647.0| 166481  |
+
+Throughput in million logs/sec (median of 9 rounds). **Not directly comparable across libraries** — zrlog/fmtlog discard when the ring is full (attempt rate), quill's queue is unbounded (every log accepted), spdlog uses `overrun_oldest`:
+
+| Library  | Median | Range         | Queue policy        |
+|----------|--------|---------------|---------------------|
+| fmtlog   | 287.6  | 267.5 – 322.3 | Discard (attempt)   |
+| **zrlog**| 282.0  | 267.0 – 354.8 | Discard (attempt)   |
+| quill    | 125.8  | 61.9 – 134.2  | Unbounded (all)     |
+| spdlog   | 1.9    | 1.6 – 2.3     | overrun_oldest      |
+
+> Numbers are host-dependent and only meaningful **within a single run** — see `bench/FINDINGS.md` for the full methodology, the cross-run variance caveats, and the assembly-level ablation series behind zrlog's frontend.
 
 ### 📊 Running the Benchmark
 
