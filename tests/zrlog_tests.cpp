@@ -226,7 +226,7 @@ TEST(config_defaults) {
     CHECK_EQ(c.rotating_file_size, 100u * 1024u * 1024u);
     CHECK_EQ(c.rotating_max_files, 5u);
 
-    CHECK_EQ(static_cast<uint32_t>(ZRLOG_VERSION), 20504u);
+    CHECK_EQ(static_cast<uint32_t>(ZRLOG_VERSION), 20505u);
 }
 
 // ---------------------------------------------------------------------------

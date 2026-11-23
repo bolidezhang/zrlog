@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## 项目概述
 
-zrlog 是一个面向低延迟、高并发系统的 C++17 异步日志库，核心目标是纳秒级前端延迟与极高吞吐。整个库的实现都在单个头文件 `zrlog.h` 中（约 3060 行），无 .cpp 源文件。当前版本 2.5.4（`ZRLOG_VERSION` = 20504）。
+zrlog 是一个面向低延迟、高并发系统的 C++17 异步日志库，核心目标是纳秒级前端延迟与极高吞吐。整个库的实现都在单个头文件 `zrlog.h` 中（约 3060 行），无 .cpp 源文件。当前版本 2.5.5（`ZRLOG_VERSION` = 20505）。
 
 **版本分支注意**：仓库以两个不兼容的分支维护：
 - `v1.x`：单头文件、零第三方依赖、printf 风格（`%d`/`%s`）
@@ -60,7 +60,7 @@ zrlog vs spdlog / fmtlog / quill / NanoLog。**每个库编译成独立可执行
 
 **测量方法学的刻意取舍（不要"顺手修"）**：延迟循环用自旋节流而非 sleep（睡眠唤醒的 C-state/缓存惩罚会制造微秒级假 p99.9 尾部）；时间戳用 TSC 校准，样本离线排序取百分位；吞吐循环不节流，数字是"接受条数/秒"而非无损速率；每轮轮转库顺序均摊冷缓存偏置。混合架构（P/E 核）上必须用 `BENCH_CPUS` 绑到 P 核，否则排名会被 E 核拉偏。对比结论必须对着**同一提交、同一空闲机器**构建的基线，并随结果记录 CPU/绑核/负载（各 results 目录的 `env.txt`）。
 
-### 当前性能基线（v2.5.4，canonical run）
+### 当前性能基线（v2.5.5，canonical run）
 
 数据目录 `bench/results_win_v254_pcore/` + `bench/results_win_v254_pcore_run2/`（两轮各 9 轮，合并取 18 轮中位数）：Intel Core Ultra 5 125H，P 核 `0,10,12,14`，4 线程，100ms burn。
 
